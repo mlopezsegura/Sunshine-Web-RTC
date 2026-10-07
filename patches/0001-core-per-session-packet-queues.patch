@@ -1,0 +1,101 @@
+diff --git a/src/audio.cpp b/src/audio.cpp
+index 28a3d810..add54a75 100644
+--- a/src/audio.cpp
++++ b/src/audio.cpp
+@@ -103,11 +103,11 @@ namespace audio {
+    * @brief Encode captured PCM samples into Opus packets on the audio worker thread.
+    *
+    * @param samples Queue of captured PCM sample buffers to encode.
++   * @param packets Queue that receives the encoded packets.
+    * @param config Audio stream settings negotiated with the client.
+    * @param channel_data Platform-specific audio capture context passed to packet metadata.
+    */
+-  void encodeThread(sample_queue_t samples, config_t config, void *channel_data) {
+-    auto packets = mail::man->queue<packet_t>(mail::audio_packets);
++  void encodeThread(sample_queue_t samples, safe::mail_raw_t::queue_t<packet_t> packets, config_t config, void *channel_data) {
+     auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
+     if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
+       apply_surround_params(stream, config.customStreamParams);
+@@ -234,7 +234,7 @@ namespace audio {
+     platf::adjust_thread_priority(platf::thread_priority_e::critical);
+ 
+     auto samples = std::make_shared<sample_queue_t::element_type>(30);
+-    std::jthread thread {encodeThread, samples, config, channel_data};
++    std::jthread thread {encodeThread, samples, mail::packet_queue<packet_t>(mail, mail::audio_packets), config, channel_data};
+ 
+     auto fg = util::fail_guard([&]() {
+       samples->stop();
+diff --git a/src/globals.h b/src/globals.h
+index 2c7ee9b1..f3983c9d 100644
+--- a/src/globals.h
++++ b/src/globals.h
+@@ -61,4 +61,23 @@ namespace mail {
+   MAIL(hdr);  ///< HDR.
+ #undef MAIL
+ 
++  /**
++   * @brief Select the queue that receives a session's encoded packets.
++   *
++   * A session that registers its own queue under @p id in its mailbox consumes its packets
++   * itself, as the WebRTC stream does. Every other session publishes to the process-wide queue
++   * drained by the GameStream broadcast threads.
++   *
++   * @param session_mail Mailbox of the session producing the packets.
++   * @param id Queue identifier, such as @ref video_packets or @ref audio_packets.
++   * @return The session's own queue when it registered one, otherwise the process-wide queue.
++   */
++  template<class T>
++  safe::mail_raw_t::queue_t<T> packet_queue(const safe::mail_t &session_mail, std::string_view id) {
++    if (session_mail && session_mail->has(id)) {
++      return session_mail->queue<T>(id);
++    }
++    return man->queue<T>(id);
++  }
++
+ }  // namespace mail
+diff --git a/src/thread_safe.h b/src/thread_safe.h
+index f3061e2b..de5fe110 100644
+--- a/src/thread_safe.h
++++ b/src/thread_safe.h
+@@ -854,6 +854,19 @@ namespace safe {
+       return post;
+     }
+ 
++    /**
++     * @brief Check whether a live event or queue is registered under an identifier.
++     *
++     * @param id Identifier for the controller, session, display, or resource.
++     * @return True when an event or queue for @p id exists and is still referenced.
++     */
++    bool has(const std::string_view &id) {
++      std::lock_guard lg {mutex};
++
++      auto it = id_to_post.find(id);
++      return it != std::end(id_to_post) && !it->second.expired();
++    }
++
+     /**
+      * @brief Run cleanup for completed asynchronous work.
+      */
+diff --git a/src/video.cpp b/src/video.cpp
+index 58535864..c0298e88 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -2438,7 +2438,7 @@ namespace video {
+     BOOST_LOG(info) << "Minimum FPS target set to ~"sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
+ 
+     auto shutdown_event = mail->event<bool>(mail::shutdown);
+-    auto packets = mail::man->queue<packet_t>(mail::video_packets);
++    auto packets = mail::packet_queue<packet_t>(mail, mail::video_packets);
+     auto idr_events = mail->event<bool>(mail::idr);
+     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+ 
+@@ -2983,7 +2983,7 @@ namespace video {
+       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
+         &join_event,
+         mail->event<bool>(mail::shutdown),
+-        mail::man->queue<packet_t>(mail::video_packets),
++        mail::packet_queue<packet_t>(mail, mail::video_packets),
+         std::move(idr_events),
+         mail->event<hdr_info_t>(mail::hdr),
+         mail->event<input::touch_port_t>(mail::touch_port),

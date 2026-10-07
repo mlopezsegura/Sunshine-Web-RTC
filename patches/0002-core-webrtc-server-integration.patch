@@ -1,0 +1,223 @@
+diff --git a/src/config.cpp b/src/config.cpp
+index ad44a29d..b2f7a8d5 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -824,6 +824,14 @@ namespace config {
+     0,  // packetsize
+   };
+ 
++  /**
++   * @brief Default Moonlight WebRTC TV server values used before file and CLI overrides.
++   */
++  webrtc_t webrtc {
++    true,  // enabled
++    8000,  // port, the Moonlight WebRTC TV client's default
++  };
++
+   /**
+    * @brief Default NVHTTP server configuration values used before file and CLI overrides.
+    */
+@@ -1804,6 +1812,9 @@ namespace config {
+ 
+     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+ 
++    bool_f(vars, "webrtc_enabled", webrtc.enabled);
++    int_between_f(vars, "webrtc_port", webrtc.port, {1024, 65535});
++
+     map_int_int_f(vars, "keybindings"s, input.keybindings);
+ 
+     // This config option will only be used by the UI
+diff --git a/src/config.h b/src/config.h
+index 76176e00..695c8db4 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -264,6 +264,14 @@ namespace config {
+     int packetsize;  ///< Maximum payload size for network packets.
+   };
+ 
++  /**
++   * @brief Settings of the Moonlight WebRTC TV server.
++   */
++  struct webrtc_t {
++    bool enabled;  ///< Whether Sunshine serves Moonlight WebRTC TVs directly.
++    int port;  ///< TCP port of the TV signaling WebSocket.
++  };
++
+   /**
+    * @brief HTTP and HTTPS settings used by the GameStream pairing server.
+    */
+@@ -398,6 +406,7 @@ namespace config {
+   extern video_t video;
+   extern audio_t audio;
+   extern stream_t stream;
++  extern webrtc_t webrtc;
+   extern nvhttp_t nvhttp;
+   extern input_t input;
+   extern sunshine_t sunshine;
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index 4e6ba138..e5033eb7 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -62,6 +62,7 @@
+ #include "system_tray.h"
+ #include "utility.h"
+ #include "uuid.h"
++#include "webrtc/webrtc_stream.h"
+ 
+ using namespace std::literals;
+ 
+@@ -1465,6 +1466,93 @@ namespace confighttp {
+     send_response(response, output_tree);
+   }
+ 
++  /**
++   * @brief List the TVs paired for Moonlight WebRTC and the TV pairing state.
++   * @param response The HTTP response object.
++   * @param request The HTTP request object.
++   *
++   * @api_examples{/api/webrtc/tvs|:| GET|:| null}
++   */
++  void getWebrtcTvs(const resp_https_t &response, const req_https_t &request) {
++    if (!authenticate(response, request)) {
++      return;
++    }
++
++    print_req(request);
++
++    nlohmann::json output_tree;
++    output_tree["tvs"] = nlohmann::json::array();
++    for (const auto &tv : webrtc_stream::paired_tvs()) {
++      output_tree["tvs"].push_back({{"id", tv.id}, {"name", tv.name}});
++    }
++    output_tree["pairing"] = webrtc_stream::tv_pairing_status();
++    output_tree["enabled"] = config::webrtc.enabled;
++    output_tree["port"] = config::webrtc.port;
++    output_tree["status"] = true;
++    send_response(response, output_tree);
++  }
++
++  /**
++   * @brief Open a two-minute window in which one TV may pair, returning its PIN.
++   * @param response The HTTP response object.
++   * @param request The HTTP request object.
++   *
++   * @api_examples{/api/webrtc/pair|:| POST|:| null}
++   */
++  void pairWebrtcTv(const resp_https_t &response, const req_https_t &request) {
++    if (!authenticate(response, request)) {
++      return;
++    }
++
++    std::string client_id = get_client_id(request);
++    if (!validate_csrf_token(response, request, client_id)) {
++      return;
++    }
++
++    print_req(request);
++
++    const auto pairing = webrtc_stream::open_tv_pairing();
++    nlohmann::json output_tree;
++    output_tree["status"] = pairing.ok;
++    output_tree["message"] = pairing.message;
++    if (pairing.ok) {
++      output_tree["pin"] = pairing.pin;
++    }
++    send_response(response, output_tree);
++  }
++
++  /**
++   * @brief Forget every TV paired for Moonlight WebRTC and disconnect the connected one.
++   * @param response The HTTP response object.
++   * @param request The HTTP request object.
++   *
++   * @api_examples{/api/webrtc/unpair-all|:| POST|:| null}
++   */
++  void unpairAllWebrtcTvs(const resp_https_t &response, const req_https_t &request) {
++    if (!authenticate(response, request)) {
++      return;
++    }
++
++    std::string client_id = get_client_id(request);
++    if (!validate_csrf_token(response, request, client_id)) {
++      return;
++    }
++
++    print_req(request);
++
++    nlohmann::json output_tree;
++    try {
++      const auto removed = webrtc_stream::unpair_all_tvs();
++      output_tree["status"] = removed.has_value();
++      output_tree["removed"] = removed.value_or(0);
++    } catch (const std::exception &e) {
++      BOOST_LOG(warning) << "UnpairAllWebrtcTvs: "sv << e.what();
++      output_tree["status"] = false;
++      output_tree["error"] = "Paired TVs could not be removed";
++    }
++    send_response(response, output_tree);
++  }
++
+   /**
+    * @brief Get the configuration settings.
+    * @param response The HTTP response object.
+@@ -2511,6 +2599,9 @@ namespace confighttp {
+     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
+     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
+     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
++    server.resource["^/api/webrtc/pair$"]["POST"] = pairWebrtcTv;
++    server.resource["^/api/webrtc/tvs$"]["GET"] = getWebrtcTvs;
++    server.resource["^/api/webrtc/unpair-all$"]["POST"] = unpairAllWebrtcTvs;
+ 
+     // static/dynamic resources
+     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
+diff --git a/src/main.cpp b/src/main.cpp
+index fb525548..6adc9375 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -45,6 +45,7 @@
+ #include "system_tray.h"
+ #include "upnp.h"
+ #include "video.h"
++#include "webrtc/webrtc_stream.h"
+ 
+ using namespace std::literals;
+ 
+@@ -495,6 +496,7 @@ int main(int argc, char *argv[]) {
+   std::jthread httpThread {nvhttp::start};
+   std::jthread configThread {confighttp::start};
+   std::jthread rtspThread {rtsp_stream::start};
++  std::jthread webrtcThread {webrtc_stream::start};
+ 
+ #ifdef _WIN32
+   // If we're using the default port and GameStream is enabled, warn the user
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index 98f59f90..7540d0f7 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -38,6 +38,7 @@
+ #include "utility.h"
+ #include "uuid.h"
+ #include "video.h"
++#include "webrtc/webrtc_stream.h"
+ 
+ using namespace std::literals;
+ 
+@@ -1385,7 +1386,8 @@ namespace nvhttp {
+     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+     auto launch_session = make_launch_session(host_audio, args);
+ 
+-    if (rtsp_stream::session_count() == 0) {
++    // A TV streaming over WebRTC owns the display as much as a Moonlight session does.
++    if (rtsp_stream::session_count() == 0 && webrtc_stream::session_count() == 0) {
+       // The display should be restored in case something fails as there are no other sessions.
+       revert_display_configuration = true;
+ 
+@@ -1494,7 +1496,7 @@ namespace nvhttp {
+     // Newer Moonlight clients send localAudioPlayMode on /resume too,
+     // so we should use it if it's present in the args and there are
+     // no active sessions we could be interfering with.
+-    const bool no_active_sessions {rtsp_stream::session_count() == 0};
++    const bool no_active_sessions {rtsp_stream::session_count() == 0 && webrtc_stream::session_count() == 0};
+     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
+       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+     }

@@ -1,0 +1,878 @@
+diff --git a/tests/unit/webrtc/test_webrtc_input_bridge.cpp b/tests/unit/webrtc/test_webrtc_input_bridge.cpp
+new file mode 100644
+index 00000000..d4d98269
+--- /dev/null
++++ b/tests/unit/webrtc/test_webrtc_input_bridge.cpp
+@@ -0,0 +1,258 @@
++/**
++ * @file tests/unit/webrtc/test_webrtc_input_bridge.cpp
++ * @brief Tests for translating TV gamepad messages into Sunshine input.
++ */
++// standard includes
++#include <algorithm>
++#include <cstring>
++#include <mutex>
++#include <span>
++#include <thread>
++#include <vector>
++
++// lib includes
++#include <gtest/gtest.h>
++#include <nlohmann/json.hpp>
++
++// moonlight-common-c includes
++extern "C" {
++#include <moonlight-common-c/src/Input.h>
++#include <moonlight-common-c/src/Limelight.h>
++}
++
++// local includes
++#include "src/globals.h"
++#include "src/input.h"
++#include "src/utility.h"
++#include "src/webrtc/input_bridge.h"
++
++using namespace webrtc_stream;
++
++namespace {
++  /**
++   * @brief Records what the bridge emits.
++   */
++  struct recorder_t {
++    struct arrival_t {
++      std::uint8_t slot;
++      std::uint8_t type;
++      std::uint16_t capabilities;
++    };
++
++    struct state_t {
++      std::uint8_t slot;
++      std::uint16_t mask;
++      controller_state_t state;
++    };
++
++    std::mutex mutex;
++    std::vector<arrival_t> arrivals;
++    std::vector<state_t> states;
++    std::vector<std::pair<bool, std::uint8_t>> mouse_buttons;
++    std::vector<std::string> control_messages;
++
++    input_api_t api() {
++      input_api_t api;
++      api.controller_arrival = [this](std::uint8_t slot, std::uint16_t, std::uint8_t type, std::uint32_t, std::uint16_t capabilities) {
++        std::lock_guard lock(mutex);
++        arrivals.push_back({slot, type, capabilities});
++      };
++      api.controller_state = [this](std::uint8_t slot, std::uint16_t mask, const controller_state_t &state) {
++        std::lock_guard lock(mutex);
++        states.push_back({slot, mask, state});
++      };
++      api.mouse_move = [](std::int16_t, std::int16_t) {
++      };
++      api.mouse_button = [this](bool pressed, std::uint8_t button) {
++        std::lock_guard lock(mutex);
++        mouse_buttons.emplace_back(pressed, button);
++      };
++      api.scroll = [](std::int8_t) {
++      };
++      api.horizontal_scroll = [](std::int8_t) {
++      };
++      return api;
++    }
++
++    input_bridge_t::control_sender_t sender() {
++      return [this](const std::string &message) {
++        std::lock_guard lock(mutex);
++        control_messages.push_back(message);
++      };
++    }
++  };
++
++  constexpr auto CONNECTED = R"json({"v":2,"type":"gamepad-connected","controllerId":5,"id":"Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e)","mapping":"standard","buttons":17,"axes":4,"dualRumble":true})json";
++
++  std::string gamepad_state(std::uint64_t sequence, std::uint32_t buttons, double left_stick_y = 0.0, double right_trigger = 0.0) {
++    return nlohmann::json {
++      {"v", 2},
++      {"type", "gamepad-state"},
++      {"controllerId", 5},
++      {"seq", sequence},
++      {"timestampMs", 1},
++      {"buttons", buttons},
++      {"leftTrigger", 0},
++      {"rightTrigger", right_trigger},
++      {"leftStickX", 0},
++      {"leftStickY", left_stick_y},
++      {"rightStickX", 0},
++      {"rightStickY", 0},
++    }
++      .dump();
++  }
++
++  template<class T>
++  T packet_as(const std::vector<std::uint8_t> &bytes) {
++    T packet;
++    EXPECT_EQ(bytes.size(), sizeof(T));
++    std::memcpy(&packet, bytes.data(), sizeof(T));
++    return packet;
++  }
++}  // namespace
++
++TEST(WebrtcInputBridgeTest, BuildsPacketsSunshineAccepts) {
++  std::vector<std::vector<std::uint8_t>> packets;
++  auto api = make_packet_input_api([&packets](std::vector<std::uint8_t> &&packet) {
++    packets.push_back(std::move(packet));
++  });
++  controller_state_t state;
++  state.button_flags = A_FLAG | SPECIAL_FLAG;
++  state.right_trigger = 200;
++  state.left_stick_y = -1234;
++  api.controller_arrival(2, 0x4, LI_CTYPE_PS, A_FLAG, LI_CCAP_RUMBLE);
++  api.controller_state(2, 0x4, state);
++  api.mouse_move(3, -4);
++  api.mouse_button(true, BUTTON_RIGHT);
++  api.scroll(-1);
++  api.horizontal_scroll(1);
++  ASSERT_EQ(packets.size(), 6);
++  for (const auto &packet : packets) {
++    EXPECT_TRUE(input::testing::is_valid_input_packet(packet));
++  }
++
++  const auto arrival = packet_as<SS_CONTROLLER_ARRIVAL_PACKET>(packets[0]);
++  EXPECT_EQ(util::endian::little(arrival.header.magic), SS_CONTROLLER_ARRIVAL_MAGIC);
++  EXPECT_EQ(arrival.controllerNumber, 2);
++  EXPECT_EQ(arrival.type, LI_CTYPE_PS);
++  EXPECT_EQ(util::endian::little(arrival.capabilities), LI_CCAP_RUMBLE);
++
++  const auto controller = packet_as<NV_MULTI_CONTROLLER_PACKET>(packets[1]);
++  EXPECT_EQ(util::endian::little(controller.header.magic), MULTI_CONTROLLER_MAGIC_GEN5);
++  EXPECT_EQ(util::endian::little(controller.activeGamepadMask), 0x4);
++  EXPECT_EQ(util::endian::little(controller.buttonFlags), A_FLAG | SPECIAL_FLAG);
++  EXPECT_EQ(controller.rightTrigger, 200);
++  EXPECT_EQ(util::endian::little(controller.leftStickY), -1234);
++
++  const auto mouse = packet_as<NV_REL_MOUSE_MOVE_PACKET>(packets[2]);
++  EXPECT_EQ(util::endian::big(mouse.deltaX), 3);
++  EXPECT_EQ(util::endian::big(mouse.deltaY), -4);
++
++  const auto button = packet_as<NV_MOUSE_BUTTON_PACKET>(packets[3]);
++  EXPECT_EQ(util::endian::little(button.header.magic), MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5);
++  EXPECT_EQ(button.button, BUTTON_RIGHT);
++
++  EXPECT_EQ(util::endian::big(packet_as<NV_SCROLL_PACKET>(packets[4]).scrollAmt1), -120);
++  EXPECT_EQ(util::endian::big(packet_as<SS_HSCROLL_PACKET>(packets[5]).scrollAmount), 120);
++}
++
++TEST(WebrtcInputBridgeTest, AnnouncesControllersOnceTheStreamIsActive) {
++  recorder_t recorder;
++  input_bridge_t bridge(recorder.api(), recorder.sender());
++  ASSERT_TRUE(bridge.handle_control_message(CONNECTED));
++  EXPECT_TRUE(recorder.arrivals.empty());
++
++  bridge.set_stream_active(true);
++  ASSERT_EQ(recorder.arrivals.size(), 1);
++  EXPECT_EQ(recorder.arrivals[0].slot, 0);
++  EXPECT_EQ(recorder.arrivals[0].type, LI_CTYPE_XBOX);
++  EXPECT_EQ(recorder.arrivals[0].capabilities, LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_RUMBLE);
++
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(1, static_cast<std::uint32_t>(gamepad_button_e::a), 1.0, 0.5)));
++  ASSERT_EQ(recorder.states.size(), 1);
++  EXPECT_EQ(recorder.states[0].mask, 0x1);
++  EXPECT_EQ(recorder.states[0].state.button_flags, A_FLAG);
++  // The Gamepad API reports down as positive; Moonlight expects up as positive.
++  EXPECT_EQ(recorder.states[0].state.left_stick_y, -32767);
++  EXPECT_EQ(recorder.states[0].state.right_trigger, 128);
++}
++
++TEST(WebrtcInputBridgeTest, DropsStaleSnapshots) {
++  recorder_t recorder;
++  input_bridge_t bridge(recorder.api(), recorder.sender());
++  bridge.set_stream_active(true);
++  ASSERT_TRUE(bridge.handle_control_message(CONNECTED));
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(5, 0)));
++  EXPECT_FALSE(bridge.handle_gamepad_message(gamepad_state(4, 1)));
++  EXPECT_FALSE(bridge.handle_gamepad_message(gamepad_state(5, 1)));
++  EXPECT_FALSE(bridge.handle_gamepad_message(R"({"v":2,"type":"gamepad-state","controllerId":5})"));
++  EXPECT_EQ(recorder.states.size(), 1);
++}
++
++TEST(WebrtcInputBridgeTest, TogglesMouseModeWithALongStartPress) {
++  recorder_t recorder;
++  input_bridge_t bridge(recorder.api(), recorder.sender());
++  bridge.set_stream_active(true);
++  ASSERT_TRUE(bridge.handle_control_message(CONNECTED));
++
++  const auto start = input_bridge_t::clock::now();
++  const auto start_button = static_cast<std::uint32_t>(gamepad_button_e::start);
++  const auto a_button = static_cast<std::uint32_t>(gamepad_button_e::a);
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(1, start_button), start));
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(2, 0), start + MOUSE_EMULATION_LONG_PRESS_TIME + std::chrono::milliseconds(1)));
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(3, a_button), start + std::chrono::seconds(2)));
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(4, 0), start + std::chrono::seconds(3)));
++
++  ASSERT_EQ(recorder.mouse_buttons.size(), 2);
++  EXPECT_EQ(recorder.mouse_buttons[0], std::make_pair(true, static_cast<std::uint8_t>(BUTTON_LEFT)));
++  EXPECT_EQ(recorder.mouse_buttons[1], std::make_pair(false, static_cast<std::uint8_t>(BUTTON_LEFT)));
++}
++
++TEST(WebrtcInputBridgeTest, NeutralizesControllersWhenTheTransportCloses) {
++  recorder_t recorder;
++  input_bridge_t bridge(recorder.api(), recorder.sender());
++  bridge.set_stream_active(true);
++  ASSERT_TRUE(bridge.handle_control_message(CONNECTED));
++  ASSERT_TRUE(bridge.handle_gamepad_message(gamepad_state(1, static_cast<std::uint32_t>(gamepad_button_e::b))));
++  bridge.on_transport_closed();
++
++  ASSERT_EQ(recorder.states.size(), 3);
++  EXPECT_EQ(recorder.states[1].state.button_flags, 0);
++  EXPECT_EQ(recorder.states[1].mask, 0x1);
++  EXPECT_EQ(recorder.states[2].mask, 0x0);
++  EXPECT_FALSE(bridge.handle_gamepad_message(gamepad_state(2, 0)));
++}
++
++TEST(WebrtcInputBridgeTest, RelaysRumbleOnlyToControllersThatCanRumble) {
++  recorder_t recorder;
++  {
++    input_bridge_t bridge(recorder.api(), recorder.sender());
++    bridge.set_stream_active(true);
++    ASSERT_TRUE(bridge.handle_control_message(CONNECTED));
++    bridge.handle_rumble(0, 65535, 0);
++    bridge.handle_trigger_rumble(0, 65535, 65535);
++    bridge.handle_rumble(7, 65535, 65535);
++    std::this_thread::sleep_for(std::chrono::milliseconds(200));
++  }
++  std::lock_guard lock(recorder.mutex);
++  const auto rumble = std::ranges::count_if(recorder.control_messages, [](const std::string &message) {
++    return message.find(R"("type":"rumble")") != std::string::npos && message.find(R"("strongMagnitude":1.0)") != std::string::npos;
++  });
++  EXPECT_EQ(rumble, 1);
++}
++
++TEST(WebrtcInputBridgeTest, DetectsControllerTypes) {
++  EXPECT_EQ(input_bridge_t::detect_controller_type("DualSense Wireless Controller (Vendor: 054c Product: 0ce6)"), LI_CTYPE_PS);
++  EXPECT_EQ(input_bridge_t::detect_controller_type("Pro Controller (Vendor: 057e)"), LI_CTYPE_NINTENDO);
++  EXPECT_EQ(input_bridge_t::detect_controller_type("Generic USB Joystick"), LI_CTYPE_UNKNOWN);
++}
++
++TEST(WebrtcPacketRoutingTest, DeliversToTheSessionQueueWhenItRegisteredOne) {
++  auto session_mail = std::make_shared<safe::mail_raw_t>();
++  {
++    auto global = mail::packet_queue<int>(session_mail, "webrtc_test_packets");
++    EXPECT_EQ(global, mail::man->queue<int>("webrtc_test_packets"));
++  }
++  auto own = session_mail->queue<int>("webrtc_test_packets");
++  EXPECT_EQ(mail::packet_queue<int>(session_mail, "webrtc_test_packets"), own);
++}
+diff --git a/tests/unit/webrtc/test_webrtc_protocol.cpp b/tests/unit/webrtc/test_webrtc_protocol.cpp
+new file mode 100644
+index 00000000..29403155
+--- /dev/null
++++ b/tests/unit/webrtc/test_webrtc_protocol.cpp
+@@ -0,0 +1,131 @@
++/**
++ * @file tests/unit/webrtc/test_webrtc_protocol.cpp
++ * @brief Tests for the Moonlight WebRTC TV protocol.
++ */
++// lib includes
++#include <gtest/gtest.h>
++
++// local includes
++#include "src/webrtc/protocol.h"
++
++using namespace webrtc_stream::protocol;
++
++namespace {
++  stream_settings_t settings(int width, int height, video_codec_e codec, bool hdr = false, int bitrate = 20000) {
++    stream_settings_t value;
++    value.width = width;
++    value.height = height;
++    value.codec = codec;
++    value.hdr = hdr;
++    value.bitrate_kbps = bitrate;
++    return value;
++  }
++
++  const nlohmann::json *find_mode(const nlohmann::json &capabilities, int width) {
++    for (const auto &mode : capabilities.at("videoModes")) {
++      if (mode.at("width") == width) {
++        return &mode;
++      }
++    }
++    return nullptr;
++  }
++
++  std::string protocol_error_code(std::string_view text) {
++    try {
++      parse_client_message(text);
++    } catch (const protocol_error_t &e) {
++      return e.code();
++    }
++    return {};
++  }
++}  // namespace
++
++TEST(WebrtcProtocolTest, AcceptsEverySupportedModeAndCodec) {
++  EXPECT_FALSE(validate_stream_settings(settings(1280, 720, video_codec_e::h264)));
++  EXPECT_FALSE(validate_stream_settings(settings(1920, 1080, video_codec_e::hevc, true)));
++  EXPECT_FALSE(validate_stream_settings(settings(2560, 1440, video_codec_e::av1, true)));
++  EXPECT_FALSE(validate_stream_settings(settings(3840, 2160, video_codec_e::hevc, true, 50000)));
++}
++
++TEST(WebrtcProtocolTest, RejectsUnsupportedCombinations) {
++  EXPECT_EQ(validate_stream_settings(settings(3840, 2160, video_codec_e::h264)), "Unsupported resolution and codec combination");
++  EXPECT_TRUE(validate_stream_settings(settings(1280, 720, video_codec_e::hevc, true)));
++  EXPECT_TRUE(validate_stream_settings(settings(1920, 1080, video_codec_e::h264, true)));
++  EXPECT_EQ(validate_stream_settings(settings(1600, 900, video_codec_e::h264)), "Unsupported resolution");
++  EXPECT_EQ(validate_stream_settings(settings(1920, 1080, video_codec_e::h264, false, 21000)), "Unsupported bitrate");
++
++  auto surround = settings(1920, 1080, video_codec_e::h264);
++  surround.audio_channels = 6;
++  EXPECT_EQ(validate_stream_settings(surround), "Only stereo audio is supported");
++
++  auto fps = settings(1920, 1080, video_codec_e::h264);
++  fps.fps = 120;
++  EXPECT_EQ(validate_stream_settings(fps), "Unsupported frame rate");
++}
++
++TEST(WebrtcProtocolTest, ParsesStartSession) {
++  const auto message = parse_client_message(
++    R"({"version":2,"type":"start-session","appId":"7",)"
++    R"("video":{"width":3840,"height":2160,"fps":60,"codec":"hevc","bitrateKbps":50000,"hdr":true},)"
++    R"("audio":{"channels":2}})"
++  );
++  const auto &start = std::get<start_session_t>(message.payload);
++  EXPECT_EQ(message.type, "start-session");
++  EXPECT_EQ(start.app_id, "7");
++  EXPECT_EQ(start.settings, settings(3840, 2160, video_codec_e::hevc, true, 50000));
++}
++
++TEST(WebrtcProtocolTest, RejectsVersionOneAndMalformedMessages) {
++  EXPECT_EQ(protocol_error_code(R"({"version":1,"type":"get-apps"})"), "unsupported-version");
++  EXPECT_EQ(protocol_error_code("{"), "invalid-json");
++  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"candidate","sessionId":0,"candidate":"a","mid":"0"})"), "invalid-message");
++  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"get-app-artwork","appId":7})"), "invalid-message");
++  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"reboot"})"), "unsupported-message");
++}
++
++TEST(WebrtcProtocolTest, ParsesAuthenticationAndPairing) {
++  const auto authenticate = parse_client_message(R"({"version":2,"type":"authenticate","clientId":"ab","proof":"cd"})");
++  EXPECT_EQ(std::get<authenticate_t>(authenticate.payload).client_id, "ab");
++
++  const auto pair = parse_client_message(R"({"version":2,"type":"pair-client","pin":"0421","clientName":"Samsung TV"})");
++  EXPECT_EQ(std::get<pair_client_t>(pair.payload).pin, "0421");
++  EXPECT_EQ(std::get<pair_client_t>(pair.payload).client_name, "Samsung TV");
++}
++
++TEST(WebrtcProtocolTest, OffersAv1OnlyWhenTheEncoderSupportsIt) {
++  const auto without_av1 = make_capabilities({false, false});
++  EXPECT_EQ(without_av1.at("codecs"), nlohmann::json::array({"h264", "hevc"}));
++  EXPECT_EQ(find_mode(without_av1, 3840)->at("codecs"), nlohmann::json::array({"hevc"}));
++
++  const auto av1_sdr = make_capabilities({true, false});
++  EXPECT_EQ(find_mode(av1_sdr, 1920)->at("codecs"), nlohmann::json::array({"h264", "hevc", "av1"}));
++  EXPECT_EQ(find_mode(av1_sdr, 1920)->at("hdrCodecs"), nlohmann::json::array({"hevc"}));
++
++  const auto av1_hdr = make_capabilities({true, true});
++  EXPECT_EQ(find_mode(av1_hdr, 3840)->at("hdrCodecs"), nlohmann::json::array({"hevc", "av1"}));
++  EXPECT_EQ(find_mode(av1_hdr, 1280)->at("hdrCodecs"), nlohmann::json::array());
++  EXPECT_EQ(av1_hdr.at("frameRates"), nlohmann::json::array({60}));
++}
++
++TEST(WebrtcProtocolTest, ReportsSunshineAsDetectedAndPaired) {
++  gateway_status_t status;
++  status.gateway_name = "Gaming-PC";
++  status.running_app_id = "7";
++  status.mac_address = "2C:F0:5D:7B:E6:D0";
++  const auto message = make_gateway_status(status);
++  EXPECT_EQ(message.at("version"), 2);
++  EXPECT_EQ(message.at("type"), "gateway-status");
++  EXPECT_TRUE(message.at("sunshineDetected"));
++  EXPECT_TRUE(message.at("sunshinePaired"));
++  EXPECT_FALSE(message.at("sessionActive"));
++  EXPECT_EQ(message.at("runningAppId"), "7");
++  EXPECT_EQ(message.at("macAddress"), "2C:F0:5D:7B:E6:D0");
++}
++
++TEST(WebrtcProtocolTest, IncludesSettingsInSessionStatus) {
++  const auto message = make_session_status("streaming", 3, settings(1920, 1080, video_codec_e::av1, true));
++  EXPECT_EQ(message.at("sessionId"), 3);
++  EXPECT_EQ(message.at("video").at("codec"), "av1");
++  EXPECT_TRUE(message.at("video").at("hdr"));
++  EXPECT_EQ(message.at("audio").at("sampleRate"), 48000);
++}
+diff --git a/tests/unit/webrtc/test_webrtc_sdp.cpp b/tests/unit/webrtc/test_webrtc_sdp.cpp
+new file mode 100644
+index 00000000..ce49ec1c
+--- /dev/null
++++ b/tests/unit/webrtc/test_webrtc_sdp.cpp
+@@ -0,0 +1,68 @@
++/**
++ * @file tests/unit/webrtc/test_webrtc_sdp.cpp
++ * @brief Tests for the Samsung Tizen SDP helpers.
++ */
++// lib includes
++#include <gtest/gtest.h>
++
++// local includes
++#include "src/webrtc/sdp.h"
++
++using namespace webrtc_stream;
++
++namespace {
++  protocol::stream_settings_t settings(int width, int height, protocol::video_codec_e codec, bool hdr) {
++    protocol::stream_settings_t value;
++    value.width = width;
++    value.height = height;
++    value.codec = codec;
++    value.hdr = hdr;
++    return value;
++  }
++
++  std::string offer(std::string_view video_lines) {
++    return "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n" + std::string(video_lines) + "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n";
++  }
++}  // namespace
++
++TEST(WebrtcSdpTest, BuildsTheGameModeImageAttribute) {
++  EXPECT_EQ(sdp::game_mode_image_attribute(settings(1920, 1080, protocol::video_codec_e::h264, false)), "imageattr:96 send [x=[1920:1920],y=[1080:1080],fps=[60:60]]");
++}
++
++TEST(WebrtcSdpTest, AcceptsOneImageAttributeInTheVideoSection) {
++  const auto value = settings(1920, 1080, protocol::video_codec_e::h264, false);
++  const auto attribute = "a=" + sdp::game_mode_image_attribute(value) + "\r\n";
++  EXPECT_TRUE(sdp::has_valid_game_mode_image_attribute(offer("a=rtpmap:96 H264/90000\r\n" + attribute), value));
++  EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer(attribute + attribute), value));
++  EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer("a=rtpmap:96 H264/90000\r\n"), value));
++  EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer(attribute) + "a=bare\n", value));
++}
++
++TEST(WebrtcSdpTest, RequiresTheRequestedCodecAlone) {
++  EXPECT_TRUE(sdp::has_expected_video_codec(offer("a=rtpmap:96 H265/90000\r\n"), protocol::video_codec_e::hevc));
++  EXPECT_FALSE(sdp::has_expected_video_codec(offer("a=rtpmap:96 H265/90000\r\na=rtpmap:97 H264/90000\r\n"), protocol::video_codec_e::hevc));
++  EXPECT_FALSE(sdp::has_expected_video_codec(offer("a=rtpmap:96 H264/90000\r\n"), protocol::video_codec_e::av1));
++  EXPECT_TRUE(sdp::has_expected_video_codec(offer("a=rtpmap:96 AV1/90000\r\n"), protocol::video_codec_e::av1));
++}
++
++TEST(WebrtcSdpTest, RequestsHevcMain10AtTheLevelOfTheResolution) {
++  EXPECT_FALSE(sdp::hevc_format_parameters(settings(1920, 1080, protocol::video_codec_e::hevc, false)));
++  EXPECT_FALSE(sdp::hevc_format_parameters(settings(1920, 1080, protocol::video_codec_e::av1, true)));
++  EXPECT_EQ(sdp::hevc_format_parameters(settings(1920, 1080, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=123");
++  EXPECT_EQ(sdp::hevc_format_parameters(settings(2560, 1440, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=150");
++  EXPECT_EQ(sdp::hevc_format_parameters(settings(3840, 2160, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=153");
++}
++
++TEST(WebrtcSdpTest, ChecksThatTheAnswerKeepsMain10) {
++  const auto hdr = settings(3840, 2160, protocol::video_codec_e::hevc, true);
++  EXPECT_TRUE(sdp::has_expected_hevc_format_parameters(offer("a=fmtp:96 level-id=150; profile-id=2;tier-flag=0\r\n"), hdr));
++  EXPECT_FALSE(sdp::has_expected_hevc_format_parameters(offer("a=fmtp:96 profile-id=1;tier-flag=0\r\n"), hdr));
++  EXPECT_TRUE(sdp::has_expected_hevc_format_parameters(offer(""), settings(1920, 1080, protocol::video_codec_e::hevc, false)));
++  EXPECT_EQ(sdp::hevc_level_id(offer("a=fmtp:96 profile-id=2;level-id=150\r\n")), 150);
++  EXPECT_FALSE(sdp::hevc_level_id(offer("a=fmtp:96 profile-id=2;level-id=15x\r\n")));
++}
++
++TEST(WebrtcSdpTest, DetectsTheDataChannelSection) {
++  EXPECT_TRUE(sdp::has_data_channel_section(offer("")));
++  EXPECT_FALSE(sdp::has_data_channel_section("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"));
++}
+diff --git a/tests/unit/webrtc/test_webrtc_tv_auth.cpp b/tests/unit/webrtc/test_webrtc_tv_auth.cpp
+new file mode 100644
+index 00000000..4b686599
+--- /dev/null
++++ b/tests/unit/webrtc/test_webrtc_tv_auth.cpp
+@@ -0,0 +1,114 @@
++/**
++ * @file tests/unit/webrtc/test_webrtc_tv_auth.cpp
++ * @brief Tests for pairing and authenticating Moonlight WebRTC TVs.
++ */
++// standard includes
++#include <filesystem>
++#include <fstream>
++
++// lib includes
++#include <gtest/gtest.h>
++
++// local includes
++#include "src/webrtc/tv_auth.h"
++
++using namespace webrtc_stream::tv_auth;
++
++namespace {
++  std::filesystem::path temporary_store(std::string_view name) {
++    auto path = std::filesystem::temp_directory_path() / ("sunshine-webrtc-" + std::string(name) + ".json");
++    std::filesystem::remove(path);
++    return path;
++  }
++}  // namespace
++
++TEST(WebrtcTvAuthTest, ComputesTheProofTheTvComputes) {
++  // The same vector is checked against the TV's JavaScript implementation.
++  EXPECT_EQ(authentication_proof("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"), "a8daa311fff071e004bcdf679a27d61367025038036ed95f4ff96691000053d5");
++}
++
++TEST(WebrtcTvAuthTest, ComparesInConstantTimeAndChecksHex) {
++  EXPECT_TRUE(constant_time_equals("abc", "abc"));
++  EXPECT_FALSE(constant_time_equals("abc", "abd"));
++  EXPECT_FALSE(constant_time_equals("abc", "abcd"));
++  EXPECT_TRUE(is_hex(random_hex(NONCE_BYTES), NONCE_BYTES));
++  EXPECT_FALSE(is_hex("ABCD", 2));
++}
++
++TEST(WebrtcTvAuthTest, SanitizesTvNames) {
++  EXPECT_EQ(sanitize_client_name("  Living room\n TV "), "Living room TV");
++  EXPECT_EQ(sanitize_client_name("\x01\x02"), "Samsung TV");
++  EXPECT_EQ(sanitize_client_name(std::string(100, 'a')).size(), MAXIMUM_CLIENT_NAME_LENGTH);
++}
++
++TEST(WebrtcTvAuthTest, PersistsAndForgetsPairedTvs) {
++  const auto path = temporary_store("persist");
++  tv_client_t client;
++  {
++    tv_client_store_t store(path);
++    client = store.add("Bedroom");
++    EXPECT_TRUE(is_hex(client.id, CLIENT_ID_BYTES));
++    EXPECT_TRUE(is_hex(client.secret, CLIENT_SECRET_BYTES));
++  }
++  {
++    tv_client_store_t store(path);
++    const auto found = store.find(client.id);
++    ASSERT_TRUE(found);
++    EXPECT_EQ(found->secret, client.secret);
++    EXPECT_EQ(found->name, "Bedroom");
++    EXPECT_TRUE(store.list().front().secret.empty());
++    EXPECT_EQ(store.remove_all(), 1);
++  }
++  EXPECT_EQ(tv_client_store_t(path).count(), 0);
++  std::filesystem::remove(path);
++}
++
++TEST(WebrtcTvAuthTest, KeepsTheNewestTvsAtCapacity) {
++  const auto path = temporary_store("capacity");
++  tv_client_store_t store(path);
++  const auto first = store.add("first");
++  for (std::size_t index = 0; index < MAXIMUM_CLIENTS; ++index) {
++    store.add("tv");
++  }
++  EXPECT_EQ(store.count(), MAXIMUM_CLIENTS);
++  EXPECT_FALSE(store.find(first.id));
++  std::filesystem::remove(path);
++}
++
++TEST(WebrtcTvAuthTest, TrustsNobodyFromAnUnreadableStore) {
++  const auto path = temporary_store("corrupt");
++  std::ofstream(path) << "{not json";
++  EXPECT_EQ(tv_client_store_t(path).count(), 0);
++  std::filesystem::remove(path);
++}
++
++TEST(WebrtcTvAuthTest, AcceptsTheShownPinOnce) {
++  tv_pairing_window_t window;
++  const auto now = tv_pairing_window_t::clock::now();
++  EXPECT_EQ(window.attempt("0000", now), pairing_attempt_e::not_open);
++  const auto pin = window.open(now);
++  EXPECT_EQ(window.state(now), pairing_state_e::waiting);
++  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::accepted);
++  EXPECT_EQ(window.state(now), pairing_state_e::paired);
++  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::not_open);
++}
++
++TEST(WebrtcTvAuthTest, LocksAfterThreeWrongPins) {
++  tv_pairing_window_t window;
++  const auto now = tv_pairing_window_t::clock::now();
++  const auto pin = window.open(now);
++  const auto *wrong = pin == "0000" ? "1111" : "0000";
++  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::incorrect_pin);
++  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::incorrect_pin);
++  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::too_many_attempts);
++  EXPECT_EQ(window.state(now), pairing_state_e::failed);
++  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::not_open);
++}
++
++TEST(WebrtcTvAuthTest, ExpiresAfterTwoMinutes) {
++  tv_pairing_window_t window;
++  const auto now = tv_pairing_window_t::clock::now();
++  const auto pin = window.open(now);
++  EXPECT_EQ(window.attempt(pin, now + PAIRING_WINDOW_LIFETIME), pairing_attempt_e::not_open);
++  EXPECT_EQ(window.state(now + PAIRING_WINDOW_LIFETIME), pairing_state_e::expired);
++}
+diff --git a/tests/webrtc_e2e/README.md b/tests/webrtc_e2e/README.md
+new file mode 100644
+index 00000000..475d596e
+--- /dev/null
++++ b/tests/webrtc_e2e/README.md
+@@ -0,0 +1,15 @@
++# Moonlight WebRTC end-to-end test
++
++`driver.mjs` checks the Moonlight WebRTC TV server of a running Sunshine from end to end. It opens a
++pairing window through the Web UI API, then loads `client.html` in headless Edge, which plays the TV:
++it pairs with the PIN (after a wrong one), reconnects and authenticates, lists the applications, fetches
++artwork, starts a stream, announces a gamepad, measures the decoded video and audio through `getStats()`,
++and finally stops the stream and the application. The driver prints the steps and statistics.
++
++```sh
++NODE_TLS_REJECT_UNAUTHORIZED=0 node driver.mjs --creds=user:password --webui=https://127.0.0.1:47990 \
++  --ws=ws://127.0.0.1:8000 --codec=h264 --width=1920 --height=1080 --bitrate=20000 --summary=1
++```
++
++Headless Edge decodes H.264 and AV1 8-bit. It has no HEVC or AV1 10-bit WebRTC decoder, so those
++streams are established but their frames are only received, not decoded; a Samsung TV decodes them.
+diff --git a/tests/webrtc_e2e/client.html b/tests/webrtc_e2e/client.html
+new file mode 100644
+index 00000000..88aa8811
+--- /dev/null
++++ b/tests/webrtc_e2e/client.html
+@@ -0,0 +1,175 @@
++<!doctype html>
++<html>
++<head><meta charset="utf-8"><title>WebRTC TV E2E</title></head>
++<body>
++<video id="video" autoplay muted playsinline></video>
++<script>
++const params = new URLSearchParams(location.search);
++const wsUrl = params.get("ws");
++const pin = params.get("pin");
++const codec = params.get("codec") || "h264";
++const width = Number(params.get("width") || 1280);
++const height = Number(params.get("height") || 720);
++const bitrate = Number(params.get("bitrate") || 12000);
++const hdr = params.get("hdr") === "1";
++const log = [];
++const result = { codec, width, height, hdr, steps: [], errors: [] };
++const t0 = performance.now();
++function note(step, extra) {
++  const entry = { t: Math.round(performance.now() - t0), step, ...(extra || {}) };
++  result.steps.push(entry);
++}
++async function finish() {
++  result.log = log.slice(-80);
++  await fetch("/result", { method: "POST", body: JSON.stringify(result) });
++}
++setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000);
++
++let ws, pc, sessionId, control, gamepad, phase = "auth", credentials = null, appId = null;
++const send = (m) => { log.push(">> " + m.type); ws.send(JSON.stringify(Object.assign({ version: 2 }, m))); };
++
++async function hmacHex(secretHex, text) {
++  const key = await crypto.subtle.importKey("raw", new Uint8Array(secretHex.match(/../g).map(h => parseInt(h, 16))),
++    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
++  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
++  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
++}
++
++function connect() {
++  ws = new WebSocket(wsUrl);
++  ws.onmessage = async (event) => {
++    const m = JSON.parse(event.data);
++    log.push("<< " + m.type + (m.state ? ":" + m.state : "") + (m.code ? ":" + m.code : ""));
++    try { await handle(m); } catch (e) { result.errors.push(String(e)); finish(); }
++  };
++  ws.onclose = () => { log.push("ws closed"); if (phase === "reconnect") { phase = "auth2"; connect(); } };
++}
++
++async function handle(m) {
++  if (m.type === "auth-required") {
++    note("auth-required", { sunshineAvailable: m.sunshineAvailable, mac: m.macAddress || null });
++    if (credentials) {
++      send({ type: "authenticate", clientId: credentials.clientId,
++             proof: await hmacHex(credentials.clientSecret, "moonlight-webrtc-tv-auth-v1:" + m.nonce) });
++    } else {
++      // An unauthenticated request must be refused before pairing.
++      send({ type: "get-apps" });
++      send({ type: "pair-client", pin: "9999" === pin ? "0000" : "9999", clientName: "E2E Edge" });
++      send({ type: "pair-client", pin, clientName: "E2E Edge" });
++    }
++  } else if (m.type === "error") {
++    note("error", { requestType: m.requestType, code: m.code });
++  } else if (m.type === "paired") {
++    note("paired");
++    credentials = { clientId: m.clientId, clientSecret: m.clientSecret };
++  } else if (m.type === "authenticated") {
++    note("authenticated");
++  } else if (m.type === "gateway-status") {
++    note("gateway-status", { name: m.gatewayName, detected: m.sunshineDetected, paired: m.sunshinePaired, running: m.runningAppId || null });
++  } else if (m.type === "capabilities") {
++    note("capabilities", { codecs: m.codecs, hdr4k: m.videoModes.find(v => v.width === 3840).hdrCodecs });
++  } else if (m.type === "session-status" && m.state === "idle" && phase === "auth") {
++    // Reconnect once to prove the issued credentials authenticate a new connection.
++    phase = "reconnect";
++    ws.close();
++  } else if (m.type === "session-status" && m.state === "idle" && phase === "auth2") {
++    phase = "apps";
++    send({ type: "get-apps" });
++  } else if (m.type === "apps") {
++    note("apps", { titles: m.apps.map(a => a.title + "#" + a.id + (a.running ? "*" : "")) });
++    if (phase !== "apps") return;
++    const app = m.apps.find(a => a.title === "Desktop") || m.apps[0];
++    appId = app.id;
++    phase = "artwork";
++    send({ type: "get-app-artwork", appId });
++  } else if (m.type === "app-artwork") {
++    note("app-artwork", { available: m.available, mime: m.mimeType || null, bytes: m.data ? Math.floor(m.data.length * 3 / 4) : 0 });
++    if (phase !== "artwork") return;
++    phase = "start";
++    send({ type: "start-session", appId,
++           video: { width, height, fps: 60, codec, bitrateKbps: bitrate, hdr }, audio: { channels: 2 } });
++  } else if (m.type === "session-status") {
++    note("session-" + m.state, m.message ? { message: m.message } : undefined);
++    if (m.sessionId) sessionId = m.sessionId;
++    if (m.state === "streaming") setTimeout(measure, 8000);
++    if (m.state === "error") { result.errors.push("session error: " + m.message); finish(); }
++    if (m.state === "idle" && phase === "stopping") {
++      phase = "host-stop";
++      send({ type: "stop-host-session" });
++    }
++  } else if (m.type === "host-session-status") {
++    note("host-" + m.state, { running: m.runningAppId || null });
++    if (m.state === "stopped" || m.state === "failed") finish();
++  } else if (m.type === "offer") {
++    note("offer", { imageattr: /a=imageattr:96 send/.test(m.sdp), rtpmap: (m.sdp.match(/a=rtpmap:96 [^\r]+/) || [""])[0] });
++    pc = new RTCPeerConnection();
++    pc.onicecandidate = (e) => { if (e.candidate) send({ type: "candidate", sessionId, candidate: e.candidate.candidate, mid: e.candidate.sdpMid }); };
++    pc.ontrack = (e) => { if (e.track.kind === "video") document.getElementById("video").srcObject = e.streams[0] || new MediaStream([e.track]); };
++    pc.ondatachannel = (e) => {
++      const channel = e.channel;
++      if (channel.label === "control") {
++        control = channel;
++        channel.onmessage = (x) => log.push("ctl " + x.data.slice(0, 90));
++        channel.onopen = () => {
++          note("control-open");
++          channel.send(JSON.stringify({ v: 2, type: "gamepad-connected", controllerId: 1, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard", buttons: 17, axes: 4, dualRumble: true, triggerRumble: false }));
++        };
++      } else if (channel.label === "gamepad") {
++        gamepad = channel;
++        channel.onopen = () => note("gamepad-open");
++      }
++    };
++    pc.onconnectionstatechange = () => note("pc-" + pc.connectionState);
++    await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
++    const answer = await pc.createAnswer();
++    await pc.setLocalDescription(answer);
++    send({ type: "answer", sessionId, sdp: pc.localDescription.sdp });
++  } else if (m.type === "candidate") {
++    if (pc) await pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid });
++  }
++}
++
++async function measure() {
++  // Neutral gamepad snapshots exercise the unreliable channel without pressing anything.
++  for (let seq = 1; seq <= 20; seq++) {
++    if (gamepad && gamepad.readyState === "open") {
++      gamepad.send(JSON.stringify({ v: 2, type: "gamepad-state", controllerId: 1, seq, timestampMs: performance.now(), buttons: 0,
++        leftTrigger: 0, rightTrigger: 0, leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0 }));
++    }
++  }
++  const sample = async () => {
++    const stats = await pc.getStats();
++    const out = {};
++    stats.forEach((s) => {
++      if (s.type === "inbound-rtp" && s.kind === "video") {
++        out.video = { framesDecoded: s.framesDecoded, framesReceived: s.framesReceived, framesDropped: s.framesDropped, keyFramesDecoded: s.keyFramesDecoded,
++          frameWidth: s.frameWidth, frameHeight: s.frameHeight, fps: s.framesPerSecond, bytes: s.bytesReceived, packetsLost: s.packetsLost,
++          nack: s.nackCount, pli: s.pliCount, decoder: s.decoderImplementation,
++          jitterBufferMs: s.jitterBufferEmittedCount ? Math.round(1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount * 10) / 10 : null,
++          decodeMs: s.framesDecoded ? Math.round(1000 * s.totalDecodeTime / s.framesDecoded * 100) / 100 : null };
++      }
++      if (s.type === "inbound-rtp" && s.kind === "audio") {
++        out.audio = { packets: s.packetsReceived, lost: s.packetsLost, bytes: s.bytesReceived };
++      }
++      if (s.type === "codec") { (out.codecs = out.codecs || []).push(s.mimeType + (s.sdpFmtpLine ? " " + s.sdpFmtpLine : "")); }
++      if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") out.rttMs = s.currentRoundTripTime * 1000;
++    });
++    return out;
++  };
++  const first = await sample();
++  await new Promise(r => setTimeout(r, 2000));
++  const second = await sample();
++  result.stats = second;
++  if (first.video && second.video) {
++    result.measuredFps = (second.video.framesDecoded - first.video.framesDecoded) / 2;
++    result.measuredKbps = Math.round((second.video.bytes - first.video.bytes) * 8 / 2 / 1000);
++  }
++  note("measured");
++  phase = "stopping";
++  send({ type: "stop-session" });
++}
++
++connect();
++</script>
++</body>
++</html>
+diff --git a/tests/webrtc_e2e/driver.mjs b/tests/webrtc_e2e/driver.mjs
+new file mode 100644
+index 00000000..7751e399
+--- /dev/null
++++ b/tests/webrtc_e2e/driver.mjs
+@@ -0,0 +1,75 @@
++// Drives one end-to-end run against a running Sunshine: pairs through the Web UI API, serves the
++// TV stand-in page to a headless Chromium browser, and prints what the page measured.
++//
++//   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
++//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --bitrate=20000 --hdr=1]
++//                   [--summary=1] [--unpair=0] [--browser=path/to/msedge.exe]
++//
++// Sunshine's Web UI uses a self-signed certificate: run with NODE_TLS_REJECT_UNAUTHORIZED=0.
++import { spawn } from "node:child_process";
++import { readFileSync, mkdtempSync } from "node:fs";
++import http from "node:http";
++import https from "node:https";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, "").split("=")));
++const webUi = args.webui || "https://127.0.0.1:50001";
++const auth = "Basic " + Buffer.from(args.creds || "e2e:e2e-password").toString("base64");
++
++function api(method, route) {
++  return new Promise((resolve, reject) => {
++    const request = https.request(webUi + route, { method, headers: { Authorization: auth }, rejectUnauthorized: false }, (response) => {
++      let body = "";
++      response.on("data", (chunk) => (body += chunk));
++      response.on("end", () => resolve({ status: response.statusCode, body: body ? JSON.parse(body) : null }));
++    });
++    request.on("error", reject);
++    request.end();
++  });
++}
++
++const before = await api("GET", "/api/webrtc/tvs");
++const pairing = await api("POST", "/api/webrtc/pair");
++console.log("API tvs:", JSON.stringify(before.body), "pair:", pairing.status, pairing.body.status, "pin length", (pairing.body.pin || "").length);
++
++const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin: pairing.body.pin, codec: args.codec || "h264",
++  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0" });
++let edge;
++const server = http.createServer((request, response) => {
++  if (request.method === "POST" && request.url === "/result") {
++    let body = "";
++    request.on("data", (chunk) => (body += chunk));
++    request.on("end", async () => {
++      response.end("ok");
++      const result = JSON.parse(body);
++      if (args.summary === "1") {
++        console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, hdr: result.hdr, errors: result.errors,
++          states: result.steps.filter((s) => s.step.startsWith("session-") || s.step.startsWith("host-") || s.step === "offer").map((s) => s.step + (s.message ? "(" + s.message + ")" : "") + (s.rtpmap ? "[" + s.rtpmap + "]" : "")),
++          video: result.stats?.video, audio: result.stats?.audio, codecs: result.stats?.codecs, measuredFps: result.measuredFps, measuredKbps: result.measuredKbps }, null, 1));
++      } else {
++        console.log(JSON.stringify(result, null, 1));
++      }
++      const after = await api("GET", "/api/webrtc/tvs");
++      console.log("API tvs after:", JSON.stringify(after.body));
++      if (args.unpair !== "0") {
++        console.log("API unpair-all:", JSON.stringify((await api("POST", "/api/webrtc/unpair-all")).body));
++      }
++      edge.kill();
++      server.close();
++      process.exit(0);
++    });
++    return;
++  }
++  response.setHeader("Content-Type", "text/html");
++  response.end(readFileSync(path.join(here, "client.html")));
++});
++server.listen(8099, "127.0.0.1", () => {
++  const profile = mkdtempSync(path.join(tmpdir(), "edge-e2e-"));
++  edge = spawn(args.browser || "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", [
++    "--headless=new", "--no-first-run", "--user-data-dir=" + profile, "--autoplay-policy=no-user-gesture-required",
++    "--remote-debugging-port=0", "--enable-features=WebRtcAllowH265Receive,PlatformHEVCDecoderSupport", "http://127.0.0.1:8099/?" + query], { stdio: "ignore" });
++});
++setTimeout(() => { console.log("driver timeout"); edge?.kill(); process.exit(2); }, 90000);

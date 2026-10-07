@@ -1,0 +1,4510 @@
+diff --git a/src/webrtc/input_bridge.cpp b/src/webrtc/input_bridge.cpp
+new file mode 100644
+index 00000000..493ffb2f
+--- /dev/null
++++ b/src/webrtc/input_bridge.cpp
+@@ -0,0 +1,784 @@
++/**
++ * @file src/webrtc/input_bridge.cpp
++ * @brief Definitions for translating TV gamepad messages into Sunshine input.
++ */
++// standard includes
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++
++// lib includes
++#include <moonlight-common-c/src/Input.h>
++#include <moonlight-common-c/src/Limelight.h>
++#include <nlohmann/json.hpp>
++
++// local includes
++#include "input_bridge.h"
++#include "src/logging.h"
++#include "src/utility.h"
++
++namespace webrtc_stream {
++  namespace {
++    using json = nlohmann::json;
++    using namespace std::literals;
++
++    /**
++     * @brief Every bit the TV may set in its button mask.
++     */
++    constexpr std::uint32_t ALL_PROTOCOL_BUTTONS = (1U << 15) - 1;
++    constexpr int WHEEL_DELTA_UNITS = 120;  ///< One wheel click in Moonlight scroll units.
++
++    /**
++     * @brief Return the bit of a button.
++     * @param button Button.
++     * @return Its bit in the TV button mask.
++     */
++    constexpr std::uint32_t mask(gamepad_button_e button) {
++      return static_cast<std::uint32_t>(button);
++    }
++
++    /**
++     * @brief Buttons that act as mouse buttons in mouse mode.
++     */
++    constexpr std::array MOUSE_BUTTONS {gamepad_button_e::a, gamepad_button_e::b, gamepad_button_e::x, gamepad_button_e::left_bumper, gamepad_button_e::right_bumper};
++    /**
++     * @brief Bits of the buttons that act as mouse buttons.
++     */
++    constexpr std::uint32_t MOUSE_BUTTON_MASK = mask(gamepad_button_e::a) | mask(gamepad_button_e::b) | mask(gamepad_button_e::x) | mask(gamepad_button_e::left_bumper) | mask(gamepad_button_e::right_bumper);
++
++    /**
++     * @brief Check whether a button is pressed.
++     * @param flags TV button mask.
++     * @param button Button.
++     * @return True when it is pressed.
++     */
++    bool has_button(std::uint32_t flags, gamepad_button_e button) {
++      return (flags & mask(button)) != 0;
++    }
++
++    /**
++     * @brief Return the mouse button a gamepad button stands for in mouse mode.
++     * @param button Gamepad button.
++     * @return The Moonlight mouse button, or 0.
++     */
++    std::uint8_t moonlight_mouse_button(gamepad_button_e button) {
++      switch (button) {
++        case gamepad_button_e::a:
++          return BUTTON_LEFT;
++        case gamepad_button_e::b:
++          return BUTTON_RIGHT;
++        case gamepad_button_e::x:
++          return BUTTON_MIDDLE;
++        case gamepad_button_e::left_bumper:
++          return BUTTON_X1;
++        case gamepad_button_e::right_bumper:
++          return BUTTON_X2;
++        default:
++          return 0;
++      }
++    }
++
++    /**
++     * @brief Check the version and type of a gamepad message.
++     * @param message Parsed message.
++     * @param expected_type Expected type.
++     * @return True when both match.
++     */
++    bool has_envelope(const json &message, std::string_view expected_type) {
++      return message.is_object() && message.contains("v") && message["v"].is_number_unsigned() && message["v"].get<std::uint32_t>() == GAMEPAD_PROTOCOL_VERSION && message.contains("type") && message["type"].is_string() && message["type"].get<std::string_view>() == expected_type;
++    }
++
++    /**
++     * @brief Read an unsigned member no larger than a maximum.
++     * @param message Parsed message.
++     * @param name Member name.
++     * @param maximum Largest accepted value.
++     * @param output Receives the value.
++     * @return True when the member is valid.
++     */
++    bool read_bounded_size(const json &message, const char *name, std::size_t maximum, std::size_t &output) {
++      if (!message.contains(name) || !message[name].is_number_unsigned()) {
++        return false;
++      }
++      const auto value = message[name].get<std::uint64_t>();
++      if (value > maximum) {
++        return false;
++      }
++      output = static_cast<std::size_t>(value);
++      return true;
++    }
++
++    /**
++     * @brief Read a finite number.
++     * @param message Parsed message.
++     * @param name Member name.
++     * @param output Receives the value.
++     * @return True when the member is valid.
++     */
++    bool read_finite_number(const json &message, const char *name, double &output) {
++      if (!message.contains(name) || !message[name].is_number()) {
++        return false;
++      }
++      output = message[name].get<double>();
++      return std::isfinite(output);
++    }
++
++    /**
++     * @brief Read the TV controller ID.
++     * @param message Parsed message.
++     * @param output Receives the ID.
++     * @return True when the member is valid.
++     */
++    bool read_controller_id(const json &message, std::uint32_t &output) {
++      if (!message.contains("controllerId") || !message["controllerId"].is_number_unsigned()) {
++        return false;
++      }
++      const auto value = message["controllerId"].get<std::uint64_t>();
++      if (value > std::numeric_limits<std::uint32_t>::max()) {
++        return false;
++      }
++      output = static_cast<std::uint32_t>(value);
++      return true;
++    }
++
++    /**
++     * @brief Read an optional boolean, false when absent.
++     * @param message Parsed message.
++     * @param name Member name.
++     * @param output Receives the value.
++     * @return True when the member is absent or valid.
++     */
++    bool read_optional_boolean(const json &message, const char *name, bool &output) {
++      output = false;
++      if (!message.contains(name)) {
++        return true;
++      }
++      if (!message[name].is_boolean()) {
++        return false;
++      }
++      output = message[name].get<bool>();
++      return true;
++    }
++
++    /**
++     * @brief Convert a Moonlight motor speed to the Gamepad API range.
++     * @param value Motor speed, 0-65535.
++     * @return Magnitude, 0-1.
++     */
++    double rumble_magnitude(std::uint32_t value) {
++      return static_cast<double>(std::min<std::uint32_t>(value, 65535U)) / 65535.0;
++    }
++
++    /**
++     * @brief Fill in a Moonlight input header and copy the packet out.
++     * @param packet Packet whose header is completed.
++     * @param magic Packet type.
++     * @return The serialized packet.
++     */
++    template<class T>
++    std::vector<std::uint8_t> serialize(T &packet, std::uint32_t magic) {
++      packet.header.size = util::endian::big<std::uint32_t>(sizeof(T) - sizeof(std::uint32_t));
++      packet.header.magic = util::endian::little<std::uint32_t>(magic);
++      std::vector<std::uint8_t> bytes(sizeof(T));
++      std::memcpy(bytes.data(), &packet, sizeof(T));
++      return bytes;
++    }
++  }  // namespace
++
++  input_api_t make_packet_input_api(std::function<void(std::vector<std::uint8_t> &&)> sink) {
++    input_api_t api;
++    api.controller_arrival = [sink](std::uint8_t slot, std::uint16_t, std::uint8_t type, std::uint32_t supported_buttons, std::uint16_t capabilities) {
++      SS_CONTROLLER_ARRIVAL_PACKET packet {};
++      packet.controllerNumber = slot;
++      packet.type = type;
++      packet.capabilities = util::endian::little(capabilities);
++      packet.supportedButtonFlags = util::endian::little(supported_buttons);
++      sink(serialize(packet, SS_CONTROLLER_ARRIVAL_MAGIC));
++    };
++    api.controller_state = [sink](std::uint8_t slot, std::uint16_t active_mask, const controller_state_t &state) {
++      NV_MULTI_CONTROLLER_PACKET packet {};
++      packet.headerB = util::endian::little<std::int16_t>(MC_HEADER_B);
++      packet.controllerNumber = util::endian::little<std::int16_t>(slot);
++      packet.activeGamepadMask = util::endian::little(static_cast<std::int16_t>(active_mask));
++      packet.midB = util::endian::little<std::int16_t>(MC_MID_B);
++      packet.buttonFlags = util::endian::little(static_cast<std::int16_t>(state.button_flags));
++      packet.leftTrigger = state.left_trigger;
++      packet.rightTrigger = state.right_trigger;
++      packet.leftStickX = util::endian::little(state.left_stick_x);
++      packet.leftStickY = util::endian::little(state.left_stick_y);
++      packet.rightStickX = util::endian::little(state.right_stick_x);
++      packet.rightStickY = util::endian::little(state.right_stick_y);
++      packet.tailA = util::endian::little<std::int16_t>(MC_TAIL_A);
++      packet.buttonFlags2 = util::endian::little(static_cast<std::int16_t>(state.button_flags >> 16));
++      packet.tailB = util::endian::little<std::int16_t>(MC_TAIL_B);
++      sink(serialize(packet, MULTI_CONTROLLER_MAGIC_GEN5));
++    };
++    api.mouse_move = [sink](std::int16_t delta_x, std::int16_t delta_y) {
++      NV_REL_MOUSE_MOVE_PACKET packet {};
++      packet.deltaX = util::endian::big(delta_x);
++      packet.deltaY = util::endian::big(delta_y);
++      sink(serialize(packet, MOUSE_MOVE_REL_MAGIC_GEN5));
++    };
++    api.mouse_button = [sink](bool pressed, std::uint8_t button) {
++      NV_MOUSE_BUTTON_PACKET packet {};
++      packet.button = button;
++      sink(serialize(packet, pressed ? MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 : MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5));
++    };
++    api.scroll = [sink](std::int8_t clicks) {
++      NV_SCROLL_PACKET packet {};
++      packet.scrollAmt1 = util::endian::big(static_cast<std::int16_t>(clicks * WHEEL_DELTA_UNITS));
++      packet.scrollAmt2 = packet.scrollAmt1;
++      sink(serialize(packet, SCROLL_MAGIC_GEN5));
++    };
++    api.horizontal_scroll = [sink](std::int8_t clicks) {
++      SS_HSCROLL_PACKET packet {};
++      packet.scrollAmount = util::endian::big(static_cast<std::int16_t>(clicks * WHEEL_DELTA_UNITS));
++      sink(serialize(packet, SS_HSCROLL_MAGIC));
++    };
++    return api;
++  }
++
++  input_bridge_t::input_bridge_t(input_api_t api, control_sender_t control_sender):
++      _api(std::move(api)),
++      _control_sender(std::move(control_sender)) {
++    if (!_api.controller_arrival || !_api.controller_state || !_api.mouse_move || !_api.mouse_button || !_api.scroll || !_api.horizontal_scroll) {
++      throw std::invalid_argument("Every input callback is required");
++    }
++    _worker = std::jthread([this](std::stop_token stop_token) {
++      worker_loop(stop_token);
++    });
++  }
++
++  input_bridge_t::~input_bridge_t() {
++    shutdown();
++  }
++
++  bool input_bridge_t::handle_control_message(std::string_view text) {
++    try {
++      const json message = json::parse(text);
++      std::uint32_t client_controller_id = 0;
++      if (has_envelope(message, "gamepad-connected")) {
++        if (!read_controller_id(message, client_controller_id) || !message.contains("id") || !message["id"].is_string() || !message.contains("mapping") || !message["mapping"].is_string()) {
++          return false;
++        }
++        const auto id = message["id"].get<std::string>();
++        const auto mapping = message["mapping"].get<std::string>();
++        std::size_t button_count = 0;
++        std::size_t axis_count = 0;
++        bool dual_rumble = false;
++        bool trigger_rumble = false;
++        if (id.size() > 512 || mapping.size() > 128 || !read_bounded_size(message, "buttons", 64, button_count) || !read_bounded_size(message, "axes", 16, axis_count) || !read_optional_boolean(message, "dualRumble", dual_rumble) || !read_optional_boolean(message, "triggerRumble", trigger_rumble)) {
++          return false;
++        }
++
++        std::lock_guard lock(_mutex);
++        if (_shutdown) {
++          return false;
++        }
++        remove_controller_locked(client_controller_id);
++        const auto slot = allocate_slot_locked();
++        if (!slot) {
++          BOOST_LOG(warning) << "WebRTC: gamepad rejected, all 16 controller slots are occupied"sv;
++          return false;
++        }
++
++        controller_t controller;
++        controller.client_controller_id = client_controller_id;
++        controller.slot = *slot;
++        controller.id = id;
++        controller.button_count = button_count;
++        controller.type = detect_controller_type(id);
++        if (button_count > 7) {
++          controller.capabilities |= LI_CCAP_ANALOG_TRIGGERS;
++        }
++        if (dual_rumble) {
++          controller.capabilities |= LI_CCAP_RUMBLE;
++        }
++        if (trigger_rumble) {
++          controller.capabilities |= LI_CCAP_TRIGGER_RUMBLE;
++        }
++
++        _slot_to_controller[*slot] = client_controller_id;
++        _active_gamepad_mask |= static_cast<std::uint16_t>(1U << *slot);
++        auto [entry, inserted] = _controllers.emplace(client_controller_id, std::move(controller));
++        BOOST_LOG(info) << "WebRTC: gamepad connected, slot "sv << (int) *slot << ": "sv << id;
++        announce_controller_locked(entry->second);
++        return inserted;
++      }
++
++      if (has_envelope(message, "gamepad-disconnected")) {
++        if (!read_controller_id(message, client_controller_id)) {
++          return false;
++        }
++        std::lock_guard lock(_mutex);
++        if (_shutdown) {
++          return false;
++        }
++        const bool existed = _controllers.contains(client_controller_id);
++        remove_controller_locked(client_controller_id);
++        return existed;
++      }
++    } catch (const json::exception &) {
++      return false;
++    }
++    return false;
++  }
++
++  bool input_bridge_t::handle_gamepad_message(std::string_view text, clock::time_point received_at) {
++    std::uint32_t client_controller_id = 0;
++    std::uint64_t sequence = 0;
++    std::uint32_t buttons = 0;
++    double timestamp = 0.0;
++    double left_trigger = 0.0;
++    double right_trigger = 0.0;
++    double left_stick_x = 0.0;
++    double left_stick_y = 0.0;
++    double right_stick_x = 0.0;
++    double right_stick_y = 0.0;
++
++    try {
++      const json message = json::parse(text);
++      if (!has_envelope(message, "gamepad-state") || !read_controller_id(message, client_controller_id) || !message.contains("seq") || !message["seq"].is_number_unsigned() || !message.contains("buttons") || !message["buttons"].is_number_unsigned()) {
++        return false;
++      }
++      sequence = message["seq"].get<std::uint64_t>();
++      const auto raw_buttons = message["buttons"].get<std::uint64_t>();
++      if (raw_buttons > ALL_PROTOCOL_BUTTONS || !read_finite_number(message, "timestampMs", timestamp) || timestamp < 0.0 || !read_finite_number(message, "leftTrigger", left_trigger) || !read_finite_number(message, "rightTrigger", right_trigger) || !read_finite_number(message, "leftStickX", left_stick_x) || !read_finite_number(message, "leftStickY", left_stick_y) || !read_finite_number(message, "rightStickX", right_stick_x) || !read_finite_number(message, "rightStickY", right_stick_y)) {
++        return false;
++      }
++      buttons = static_cast<std::uint32_t>(raw_buttons);
++    } catch (const json::exception &) {
++      return false;
++    }
++
++    controller_state_t state;
++    state.button_flags = map_standard_buttons(buttons);
++    state.left_trigger = map_trigger(left_trigger);
++    state.right_trigger = map_trigger(right_trigger);
++    state.left_stick_x = map_stick(left_stick_x, false);
++    state.left_stick_y = map_stick(left_stick_y, true);
++    state.right_stick_x = map_stick(right_stick_x, false);
++    state.right_stick_y = map_stick(right_stick_y, true);
++
++    std::lock_guard lock(_mutex);
++    const auto entry = _controllers.find(client_controller_id);
++    if (_shutdown || entry == _controllers.end()) {
++      return false;
++    }
++    auto &controller = entry->second;
++    // Snapshots travel on an unordered, unreliable channel; an older one must not undo a newer one.
++    if (controller.last_sequence && sequence <= *controller.last_sequence) {
++      ++controller.stale_states;
++      return false;
++    }
++    if (controller.last_sequence && sequence > *controller.last_sequence + 1) {
++      controller.sequence_gaps += sequence - *controller.last_sequence - 1;
++    }
++    controller.last_sequence = sequence;
++    update_diagnostics_locked(controller, received_at);
++    controller.latest_state = state;
++
++    const bool start_pressed = has_button(buttons, gamepad_button_e::start);
++    const bool start_was_pressed = has_button(controller.previous_buttons, gamepad_button_e::start);
++    if (start_pressed && !start_was_pressed) {
++      controller.start_pressed_at = received_at;
++    }
++
++    bool mouse_mode_toggled = false;
++    if (!start_pressed && start_was_pressed && controller.start_pressed_at && received_at - *controller.start_pressed_at > MOUSE_EMULATION_LONG_PRESS_TIME) {
++      if (!controller.mouse_mode && _stream_active && controller.announced) {
++        _api.controller_state(controller.slot, _active_gamepad_mask, state);
++      }
++      if (controller.mouse_mode) {
++        release_mouse_buttons_locked(controller);
++      }
++      controller.mouse_mode = !controller.mouse_mode;
++      controller.suppressed_mouse_buttons = controller.mouse_mode ? buttons & MOUSE_BUTTON_MASK : 0;
++      queue_mouse_mode_status_locked(controller);
++      BOOST_LOG(info) << "WebRTC: gamepad mouse mode "sv << (controller.mouse_mode ? "enabled"sv : "disabled"sv) << ", slot "sv << (int) controller.slot;
++      mouse_mode_toggled = true;
++    }
++    if (!start_pressed) {
++      controller.start_pressed_at.reset();
++    }
++
++    if (_stream_active && controller.announced) {
++      if (controller.mouse_mode) {
++        const auto effective = buttons & ~controller.suppressed_mouse_buttons;
++        const auto previous_effective = controller.previous_buttons & ~controller.suppressed_mouse_buttons;
++        if (!mouse_mode_toggled) {
++          for (const auto button : MOUSE_BUTTONS) {
++            const bool pressed = has_button(effective, button);
++            if (pressed != has_button(previous_effective, button)) {
++              _api.mouse_button(pressed, moonlight_mouse_button(button));
++            }
++          }
++          const auto rising = [&](gamepad_button_e button) {
++            return has_button(buttons, button) && !has_button(controller.previous_buttons, button);
++          };
++          if (rising(gamepad_button_e::dpad_up)) {
++            _api.scroll(1);
++          }
++          if (rising(gamepad_button_e::dpad_down)) {
++            _api.scroll(-1);
++          }
++          if (rising(gamepad_button_e::dpad_right)) {
++            _api.horizontal_scroll(1);
++          }
++          if (rising(gamepad_button_e::dpad_left)) {
++            _api.horizontal_scroll(-1);
++          }
++        }
++        controller.suppressed_mouse_buttons &= buttons;
++        controller.simulated_mouse_buttons = effective & MOUSE_BUTTON_MASK;
++      } else {
++        _api.controller_state(controller.slot, _active_gamepad_mask, state);
++      }
++    }
++    controller.previous_buttons = buttons;
++    return true;
++  }
++
++  void input_bridge_t::handle_rumble(std::uint16_t controller_number, std::uint16_t low_frequency_motor, std::uint16_t high_frequency_motor) {
++    std::lock_guard lock(_mutex);
++    if (_shutdown || controller_number >= _slot_to_controller.size() || !_slot_to_controller[controller_number]) {
++      return;
++    }
++    auto &controller = _controllers.at(*_slot_to_controller[controller_number]);
++    if ((controller.capabilities & LI_CCAP_RUMBLE) == 0) {
++      return;
++    }
++    controller.strong_magnitude = rumble_magnitude(low_frequency_motor);
++    controller.weak_magnitude = rumble_magnitude(high_frequency_motor);
++    queue_rumble_state_locked(controller);
++  }
++
++  void input_bridge_t::handle_trigger_rumble(std::uint16_t controller_number, std::uint16_t left_trigger_motor, std::uint16_t right_trigger_motor) {
++    std::lock_guard lock(_mutex);
++    if (_shutdown || controller_number >= _slot_to_controller.size() || !_slot_to_controller[controller_number]) {
++      return;
++    }
++    auto &controller = _controllers.at(*_slot_to_controller[controller_number]);
++    if ((controller.capabilities & LI_CCAP_TRIGGER_RUMBLE) == 0) {
++      return;
++    }
++    controller.left_trigger_magnitude = rumble_magnitude(left_trigger_motor);
++    controller.right_trigger_magnitude = rumble_magnitude(right_trigger_motor);
++    queue_rumble_state_locked(controller);
++  }
++
++  void input_bridge_t::set_stream_active(bool active) {
++    std::lock_guard lock(_mutex);
++    if (_shutdown || _stream_active == active) {
++      return;
++    }
++    if (active) {
++      _stream_active = true;
++      for (auto &[client_controller_id, controller] : _controllers) {
++        announce_controller_locked(controller);
++      }
++    } else {
++      clear_controllers_locked();
++      _stream_active = false;
++    }
++  }
++
++  void input_bridge_t::on_transport_closed() {
++    std::lock_guard lock(_mutex);
++    if (!_shutdown) {
++      clear_controllers_locked();
++    }
++  }
++
++  void input_bridge_t::shutdown() {
++    {
++      std::lock_guard lock(_mutex);
++      if (_shutdown) {
++        return;
++      }
++      clear_controllers_locked();
++      _stream_active = false;
++      _shutdown = true;
++    }
++    _worker.request_stop();
++    _worker_condition.notify_all();
++    if (_worker.joinable() && _worker.get_id() != std::this_thread::get_id()) {
++      _worker.join();
++    }
++  }
++
++  int input_bridge_t::map_standard_buttons(std::uint32_t protocol_buttons) {
++    int flags = 0;
++    const auto map = [&](gamepad_button_e input, int output) {
++      if (has_button(protocol_buttons, input)) {
++        flags |= output;
++      }
++    };
++    map(gamepad_button_e::a, A_FLAG);
++    map(gamepad_button_e::b, B_FLAG);
++    map(gamepad_button_e::x, X_FLAG);
++    map(gamepad_button_e::y, Y_FLAG);
++    map(gamepad_button_e::left_bumper, LB_FLAG);
++    map(gamepad_button_e::right_bumper, RB_FLAG);
++    map(gamepad_button_e::back, BACK_FLAG);
++    map(gamepad_button_e::start, PLAY_FLAG);
++    map(gamepad_button_e::left_stick, LS_CLK_FLAG);
++    map(gamepad_button_e::right_stick, RS_CLK_FLAG);
++    map(gamepad_button_e::dpad_up, UP_FLAG);
++    map(gamepad_button_e::dpad_down, DOWN_FLAG);
++    map(gamepad_button_e::dpad_left, LEFT_FLAG);
++    map(gamepad_button_e::dpad_right, RIGHT_FLAG);
++    map(gamepad_button_e::guide, SPECIAL_FLAG);
++    return flags;
++  }
++
++  std::uint8_t input_bridge_t::map_trigger(double value) {
++    return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
++  }
++
++  std::int16_t input_bridge_t::map_stick(double value, bool invert) {
++    double clamped = std::clamp(value, -1.0, 1.0);
++    if (invert) {
++      clamped = -clamped;
++    }
++    return static_cast<std::int16_t>(std::lround(clamped * 32767.0));
++  }
++
++  std::uint32_t input_bridge_t::standard_supported_button_flags(std::size_t button_count) {
++    std::uint32_t flags = 0;
++    const auto include = [&](std::size_t index, std::uint32_t flag) {
++      if (button_count > index) {
++        flags |= flag;
++      }
++    };
++    include(0, A_FLAG);
++    include(1, B_FLAG);
++    include(2, X_FLAG);
++    include(3, Y_FLAG);
++    include(4, LB_FLAG);
++    include(5, RB_FLAG);
++    include(8, BACK_FLAG);
++    include(9, PLAY_FLAG);
++    include(10, LS_CLK_FLAG);
++    include(11, RS_CLK_FLAG);
++    include(12, UP_FLAG);
++    include(13, DOWN_FLAG);
++    include(14, LEFT_FLAG);
++    include(15, RIGHT_FLAG);
++    include(16, SPECIAL_FLAG);
++    return flags;
++  }
++
++  std::uint8_t input_bridge_t::detect_controller_type(std::string_view id) {
++    std::string normalized(id);
++    std::ranges::transform(normalized, normalized.begin(), [](unsigned char character) {
++      return static_cast<char>(std::tolower(character));
++    });
++    const auto contains = [&normalized](std::initializer_list<std::string_view> needles) {
++      return std::ranges::any_of(needles, [&normalized](std::string_view needle) {
++        return normalized.find(needle) != std::string::npos;
++      });
++    };
++    if (contains({"vendor: 045e", "vendor 045e", "xbox", "microsoft"})) {
++      return LI_CTYPE_XBOX;
++    }
++    if (contains({"vendor: 054c", "vendor 054c", "dualshock", "dualsense", "playstation", "sony"})) {
++      return LI_CTYPE_PS;
++    }
++    if (contains({"vendor: 057e", "vendor 057e", "nintendo", "joy-con", "switch pro"})) {
++      return LI_CTYPE_NINTENDO;
++    }
++    return LI_CTYPE_UNKNOWN;
++  }
++
++  std::pair<std::int16_t, std::int16_t> input_bridge_t::mouse_delta(const controller_state_t &state) {
++    const int left_y = -static_cast<int>(state.left_stick_y);
++    const int right_y = -static_cast<int>(state.right_stick_y);
++    const bool use_left = std::abs(static_cast<int>(state.left_stick_x)) + std::abs(left_y) > std::abs(static_cast<int>(state.right_stick_x)) + std::abs(right_y);
++    const int raw_x = use_left ? state.left_stick_x : state.right_stick_x;
++    const int raw_y = use_left ? left_y : right_y;
++    const auto accelerate = [](int raw) {
++      double delta = std::pow(raw / 32766.0 * MOUSE_EMULATION_MOTION_MULTIPLIER, 3);
++      delta = std::abs(delta) > MOUSE_EMULATION_DEADZONE ? delta - MOUSE_EMULATION_DEADZONE : 0.0;
++      return static_cast<std::int16_t>(std::clamp<long>(std::lround(delta), std::numeric_limits<std::int16_t>::min(), std::numeric_limits<std::int16_t>::max()));
++    };
++    return {accelerate(raw_x), accelerate(raw_y)};
++  }
++
++  std::optional<std::uint8_t> input_bridge_t::allocate_slot_locked() const {
++    for (std::size_t index = 0; index < _slot_to_controller.size(); ++index) {
++      if (!_slot_to_controller[index]) {
++        return static_cast<std::uint8_t>(index);
++      }
++    }
++    return std::nullopt;
++  }
++
++  void input_bridge_t::announce_controller_locked(controller_t &controller) {
++    if (!_stream_active || controller.announced) {
++      return;
++    }
++    _api.controller_arrival(controller.slot, _active_gamepad_mask, controller.type, standard_supported_button_flags(controller.button_count), controller.capabilities);
++    controller.announced = true;
++    queue_control_message_locked(json {
++      {"v", GAMEPAD_PROTOCOL_VERSION},
++      {"type", "controller-status"},
++      {"controllerId", controller.client_controller_id},
++      {"controllerSlot", controller.slot},
++      {"activeGamepadMask", _active_gamepad_mask},
++      {"controllerType", controller.type},
++      {"capabilities", controller.capabilities},
++    }
++                                   .dump());
++  }
++
++  void input_bridge_t::neutralize_controller_locked(controller_t &controller) {
++    release_mouse_buttons_locked(controller);
++    if (controller.mouse_mode) {
++      controller.mouse_mode = false;
++      queue_mouse_mode_status_locked(controller);
++    }
++    controller.strong_magnitude = 0.0;
++    controller.weak_magnitude = 0.0;
++    controller.left_trigger_magnitude = 0.0;
++    controller.right_trigger_magnitude = 0.0;
++    queue_rumble_state_locked(controller);
++
++    const auto slot_bit = static_cast<std::uint16_t>(1U << controller.slot);
++    if (_stream_active && controller.announced) {
++      // Release everything first, then drop the slot from the mask so the host unplugs it.
++      _api.controller_state(controller.slot, _active_gamepad_mask, controller_state_t {});
++      _active_gamepad_mask &= static_cast<std::uint16_t>(~slot_bit);
++      _api.controller_state(controller.slot, _active_gamepad_mask, controller_state_t {});
++    } else {
++      _active_gamepad_mask &= static_cast<std::uint16_t>(~slot_bit);
++    }
++    controller.announced = false;
++  }
++
++  void input_bridge_t::release_mouse_buttons_locked(controller_t &controller) {
++    for (const auto button : MOUSE_BUTTONS) {
++      if (has_button(controller.simulated_mouse_buttons, button)) {
++        _api.mouse_button(false, moonlight_mouse_button(button));
++      }
++    }
++    controller.simulated_mouse_buttons = 0;
++    controller.suppressed_mouse_buttons = 0;
++  }
++
++  void input_bridge_t::remove_controller_locked(std::uint32_t client_controller_id) {
++    const auto entry = _controllers.find(client_controller_id);
++    if (entry == _controllers.end()) {
++      return;
++    }
++    const auto slot = entry->second.slot;
++    neutralize_controller_locked(entry->second);
++    _slot_to_controller[slot].reset();
++    _controllers.erase(entry);
++    BOOST_LOG(info) << "WebRTC: gamepad disconnected, slot "sv << (int) slot;
++  }
++
++  void input_bridge_t::clear_controllers_locked() {
++    while (!_controllers.empty()) {
++      remove_controller_locked(_controllers.begin()->first);
++    }
++    _active_gamepad_mask = 0;
++  }
++
++  void input_bridge_t::update_diagnostics_locked(controller_t &controller, clock::time_point received_at) {
++    if (!controller.rate_window_start) {
++      controller.rate_window_start = received_at;
++    }
++    ++controller.states_in_rate_window;
++    const double elapsed = std::chrono::duration<double>(received_at - *controller.rate_window_start).count();
++    if (elapsed < 1.0) {
++      return;
++    }
++    queue_control_message_locked(json {
++      {"v", GAMEPAD_PROTOCOL_VERSION},
++      {"type", "input-diagnostics"},
++      {"controllerId", controller.client_controller_id},
++      {"controllerSlot", controller.slot},
++      {"messagesPerSecond", static_cast<double>(controller.states_in_rate_window) / elapsed},
++      {"lastSequence", controller.last_sequence.value_or(0)},
++      {"sequenceGaps", controller.sequence_gaps},
++      {"staleStates", controller.stale_states},
++    }
++                                   .dump());
++    controller.rate_window_start = received_at;
++    controller.states_in_rate_window = 0;
++  }
++
++  void input_bridge_t::queue_control_message_locked(std::string message) {
++    if (!_control_sender) {
++      return;
++    }
++    _pending_control_messages.push_back(std::move(message));
++    _worker_condition.notify_all();
++  }
++
++  void input_bridge_t::queue_mouse_mode_status_locked(const controller_t &controller) {
++    queue_control_message_locked(json {
++      {"v", GAMEPAD_PROTOCOL_VERSION},
++      {"type", "mouse-mode"},
++      {"controllerId", controller.client_controller_id},
++      {"controllerSlot", controller.slot},
++      {"active", controller.mouse_mode},
++    }
++                                   .dump());
++  }
++
++  void input_bridge_t::queue_rumble_state_locked(const controller_t &controller) {
++    queue_control_message_locked(json {
++      {"v", GAMEPAD_PROTOCOL_VERSION},
++      {"type", "rumble"},
++      {"controllerId", controller.client_controller_id},
++      {"controllerSlot", controller.slot},
++      {"strongMagnitude", controller.strong_magnitude},
++      {"weakMagnitude", controller.weak_magnitude},
++      {"leftTrigger", controller.left_trigger_magnitude},
++      {"rightTrigger", controller.right_trigger_magnitude},
++    }
++                                   .dump());
++  }
++
++  void input_bridge_t::worker_loop(std::stop_token stop_token) {
++    auto next_mouse_tick = clock::now() + MOUSE_EMULATION_POLLING_INTERVAL;
++    while (!stop_token.stop_requested()) {
++      std::vector<std::string> messages;
++      std::vector<std::pair<std::int16_t, std::int16_t>> movements;
++      {
++        std::unique_lock lock(_mutex);
++        _worker_condition.wait_until(lock, next_mouse_tick, [&] {
++          return _shutdown || !_pending_control_messages.empty() || stop_token.stop_requested();
++        });
++        if (_shutdown || stop_token.stop_requested()) {
++          break;
++        }
++        messages.swap(_pending_control_messages);
++        const auto now = clock::now();
++        if (now >= next_mouse_tick) {
++          for (const auto &[client_controller_id, controller] : _controllers) {
++            if (_stream_active && controller.announced && controller.mouse_mode) {
++              const auto delta = mouse_delta(controller.latest_state);
++              if (delta.first != 0 || delta.second != 0) {
++                movements.push_back(delta);
++              }
++            }
++          }
++          next_mouse_tick = now + MOUSE_EMULATION_POLLING_INTERVAL;
++        }
++      }
++      // Sent outside the lock: the DataChannel may block, and rumble arrives on other threads.
++      for (const auto &message : messages) {
++        _control_sender(message);
++      }
++      for (const auto &[delta_x, delta_y] : movements) {
++        _api.mouse_move(delta_x, delta_y);
++      }
++    }
++  }
++}  // namespace webrtc_stream
+diff --git a/src/webrtc/input_bridge.h b/src/webrtc/input_bridge.h
+new file mode 100644
+index 00000000..6acae118
+--- /dev/null
++++ b/src/webrtc/input_bridge.h
+@@ -0,0 +1,297 @@
++/**
++ * @file src/webrtc/input_bridge.h
++ * @brief Declarations for translating TV gamepad messages into Sunshine input.
++ */
++#pragma once
++
++// standard includes
++#include <array>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace webrtc_stream {
++  constexpr std::uint32_t GAMEPAD_PROTOCOL_VERSION = 2;  ///< Version of the gamepad DataChannel protocol.
++  constexpr std::size_t MAXIMUM_GAMEPADS = 16;  ///< Controller slots in Moonlight's active gamepad mask.
++  constexpr auto MOUSE_EMULATION_LONG_PRESS_TIME = std::chrono::milliseconds(750);  ///< Start hold that toggles mouse mode.
++  constexpr auto MOUSE_EMULATION_POLLING_INTERVAL = std::chrono::milliseconds(50);  ///< Mouse emulation update period.
++  constexpr double MOUSE_EMULATION_MOTION_MULTIPLIER = 4.0;  ///< Stick-to-pointer speed factor.
++  constexpr double MOUSE_EMULATION_DEADZONE = 2.0;  ///< Pointer deadzone in pixels per update.
++
++  /**
++   * @brief Standard Gamepad API buttons as bits of the TV's button mask.
++   */
++  enum class gamepad_button_e : std::uint32_t {
++    a = 1U << 0,  ///< A / Cross.
++    b = 1U << 1,  ///< B / Circle.
++    x = 1U << 2,  ///< X / Square.
++    y = 1U << 3,  ///< Y / Triangle.
++    left_bumper = 1U << 4,  ///< Left bumper.
++    right_bumper = 1U << 5,  ///< Right bumper.
++    back = 1U << 6,  ///< Back / Select.
++    start = 1U << 7,  ///< Start.
++    left_stick = 1U << 8,  ///< Left stick click.
++    right_stick = 1U << 9,  ///< Right stick click.
++    dpad_up = 1U << 10,  ///< D-pad up.
++    dpad_down = 1U << 11,  ///< D-pad down.
++    dpad_left = 1U << 12,  ///< D-pad left.
++    dpad_right = 1U << 13,  ///< D-pad right.
++    guide = 1U << 14,  ///< Guide / Home.
++  };
++
++  /**
++   * @brief Controller state in Moonlight's representation.
++   */
++  struct controller_state_t {
++    int button_flags = 0;  ///< Moonlight button flags.
++    std::uint8_t left_trigger = 0;  ///< Left trigger, 0-255.
++    std::uint8_t right_trigger = 0;  ///< Right trigger, 0-255.
++    std::int16_t left_stick_x = 0;  ///< Left stick X.
++    std::int16_t left_stick_y = 0;  ///< Left stick Y, up positive.
++    std::int16_t right_stick_x = 0;  ///< Right stick X.
++    std::int16_t right_stick_y = 0;  ///< Right stick Y, up positive.
++  };
++
++  /**
++   * @brief Moonlight input events the bridge emits.
++   */
++  struct input_api_t {
++    std::function<void(std::uint8_t, std::uint16_t, std::uint8_t, std::uint32_t, std::uint16_t)> controller_arrival;  ///< Slot, mask, type, supported buttons, capabilities.
++    std::function<void(std::uint8_t, std::uint16_t, const controller_state_t &)> controller_state;  ///< Slot, mask, state.
++    std::function<void(std::int16_t, std::int16_t)> mouse_move;  ///< Relative pointer motion.
++    std::function<void(bool, std::uint8_t)> mouse_button;  ///< Press flag and Moonlight button.
++    std::function<void(std::int8_t)> scroll;  ///< Vertical wheel clicks.
++    std::function<void(std::int8_t)> horizontal_scroll;  ///< Horizontal wheel clicks.
++  };
++
++  /**
++   * @brief Build an input API that feeds Moonlight input packets to a sink.
++   * @param sink Receives each serialized Moonlight input packet.
++   * @return The input API.
++   */
++  input_api_t make_packet_input_api(std::function<void(std::vector<std::uint8_t> &&)> sink);
++
++  /**
++   * @brief Translates the TV's gamepad DataChannel messages into Moonlight controller input.
++   *
++   * Controllers announced by the TV get a Moonlight slot each. Holding Start toggles mouse
++   * emulation. Rumble from the host is relayed to the TV through the control channel.
++   */
++  class input_bridge_t {
++  public:
++    using clock = std::chrono::steady_clock;  ///< Clock for timing and diagnostics.
++    using control_sender_t = std::function<void(const std::string &)>;  ///< Sends a control message to the TV.
++
++    /**
++     * @brief Create a bridge.
++     * @param api Input events to emit.
++     * @param control_sender Sends control messages to the TV.
++     */
++    input_bridge_t(input_api_t api, control_sender_t control_sender);
++
++    /**
++     * @brief Stop the bridge.
++     */
++    ~input_bridge_t();
++
++    input_bridge_t(const input_bridge_t &) = delete;
++    input_bridge_t &operator=(const input_bridge_t &) = delete;
++
++    /**
++     * @brief Handle a control-channel message (controller connected or disconnected).
++     * @param text JSON message.
++     * @return True when the message was valid and applied.
++     */
++    bool handle_control_message(std::string_view text);
++
++    /**
++     * @brief Handle a gamepad snapshot.
++     * @param text JSON message.
++     * @param received_at Arrival time.
++     * @return True when the snapshot was valid, current and applied.
++     */
++    bool handle_gamepad_message(std::string_view text, clock::time_point received_at = clock::now());
++
++    /**
++     * @brief Start or stop forwarding input to the host.
++     * @param active Whether the host stream is running.
++     */
++    void set_stream_active(bool active);
++
++    /**
++     * @brief Neutralize and forget every controller after the TV's channels closed.
++     */
++    void on_transport_closed();
++
++    /**
++     * @brief Neutralize every controller and stop the worker thread.
++     */
++    void shutdown();
++
++    /**
++     * @brief Relay rumble for a Moonlight controller slot to the TV.
++     * @param controller_number Moonlight slot.
++     * @param low_frequency_motor Strong motor, 0-65535.
++     * @param high_frequency_motor Weak motor, 0-65535.
++     */
++    void handle_rumble(std::uint16_t controller_number, std::uint16_t low_frequency_motor, std::uint16_t high_frequency_motor);
++
++    /**
++     * @brief Relay trigger rumble for a Moonlight controller slot to the TV.
++     * @param controller_number Moonlight slot.
++     * @param left_trigger_motor Left trigger motor, 0-65535.
++     * @param right_trigger_motor Right trigger motor, 0-65535.
++     */
++    void handle_trigger_rumble(std::uint16_t controller_number, std::uint16_t left_trigger_motor, std::uint16_t right_trigger_motor);
++
++    /**
++     * @brief Map the TV's button mask to Moonlight button flags.
++     * @param protocol_buttons TV button mask.
++     * @return Moonlight button flags.
++     */
++    static int map_standard_buttons(std::uint32_t protocol_buttons);
++
++    /**
++     * @brief Map a trigger value to Moonlight's range.
++     * @param value Trigger value, 0-1.
++     * @return Trigger value, 0-255.
++     */
++    static std::uint8_t map_trigger(double value);
++
++    /**
++     * @brief Map a stick axis to Moonlight's range.
++     * @param value Axis value, -1 to 1.
++     * @param invert Whether to invert the axis (Gamepad API Y is down positive).
++     * @return Axis value, -32767 to 32767.
++     */
++    static std::int16_t map_stick(double value, bool invert);
++
++    /**
++     * @brief Moonlight buttons a controller supports, from its Gamepad API button count.
++     * @param button_count Number of buttons reported by the TV.
++     * @return Moonlight button flags.
++     */
++    static std::uint32_t standard_supported_button_flags(std::size_t button_count);
++
++    /**
++     * @brief Guess the Moonlight controller type from a Gamepad API ID.
++     * @param id Gamepad API ID string.
++     * @return Moonlight controller type.
++     */
++    static std::uint8_t detect_controller_type(std::string_view id);
++
++    /**
++     * @brief Pointer motion for one mouse-emulation update.
++     * @param state Controller state.
++     * @return Relative X and Y motion.
++     */
++    static std::pair<std::int16_t, std::int16_t> mouse_delta(const controller_state_t &state);
++
++  private:
++    /**
++     * @brief State of one TV controller.
++     */
++    struct controller_t {
++      std::uint32_t client_controller_id = 0;  ///< ID assigned by the TV.
++      std::uint8_t slot = 0;  ///< Moonlight slot.
++      std::string id;  ///< Gamepad API ID.
++      std::size_t button_count = 0;  ///< Gamepad API button count.
++      std::uint8_t type = 0;  ///< Moonlight controller type.
++      std::uint16_t capabilities = 0;  ///< Moonlight controller capabilities.
++      bool announced = false;  ///< Whether the host knows the controller.
++      controller_state_t latest_state;  ///< Latest state.
++      std::uint32_t previous_buttons = 0;  ///< Button mask of the previous snapshot.
++      std::optional<std::uint64_t> last_sequence;  ///< Sequence of the latest accepted snapshot.
++      std::uint64_t sequence_gaps = 0;  ///< Snapshots lost so far.
++      std::uint64_t stale_states = 0;  ///< Out-of-order snapshots dropped so far.
++      std::optional<clock::time_point> start_pressed_at;  ///< When Start was pressed.
++      bool mouse_mode = false;  ///< Whether the controller drives the pointer.
++      std::uint32_t suppressed_mouse_buttons = 0;  ///< Buttons held while toggling mouse mode.
++      std::uint32_t simulated_mouse_buttons = 0;  ///< Mouse buttons currently pressed.
++      double strong_magnitude = 0.0;  ///< Strong rumble motor.
++      double weak_magnitude = 0.0;  ///< Weak rumble motor.
++      double left_trigger_magnitude = 0.0;  ///< Left trigger motor.
++      double right_trigger_magnitude = 0.0;  ///< Right trigger motor.
++      std::optional<clock::time_point> rate_window_start;  ///< Start of the rate measurement window.
++      std::uint64_t states_in_rate_window = 0;  ///< Snapshots in the rate window.
++    };
++
++    /**
++     * @brief Find a free controller slot.
++     * @return The slot, or nothing when all are taken.
++     */
++    std::optional<std::uint8_t> allocate_slot_locked() const;
++    /**
++     * @brief Announce a controller to the host once the stream is active.
++     * @param controller Controller.
++     */
++    void announce_controller_locked(controller_t &controller);
++    /**
++     * @brief Release everything a controller holds and unplug it from the host.
++     * @param controller Controller.
++     */
++    void neutralize_controller_locked(controller_t &controller);
++    /**
++     * @brief Release the mouse buttons a controller holds in mouse mode.
++     * @param controller Controller.
++     */
++    void release_mouse_buttons_locked(controller_t &controller);
++    /**
++     * @brief Neutralize and forget a controller.
++     * @param client_controller_id TV controller ID.
++     */
++    void remove_controller_locked(std::uint32_t client_controller_id);
++    /**
++     * @brief Neutralize and forget every controller.
++     */
++    void clear_controllers_locked();
++    /**
++     * @brief Count a snapshot and report the rate to the TV once a second.
++     * @param controller Controller.
++     * @param received_at Arrival time.
++     */
++    void update_diagnostics_locked(controller_t &controller, clock::time_point received_at);
++    /**
++     * @brief Queue a message for the control channel.
++     * @param message JSON message.
++     */
++    void queue_control_message_locked(std::string message);
++    /**
++     * @brief Tell the TV whether a controller is in mouse mode.
++     * @param controller Controller.
++     */
++    void queue_mouse_mode_status_locked(const controller_t &controller);
++    /**
++     * @brief Send a controller's rumble state to the TV.
++     * @param controller Controller.
++     */
++    void queue_rumble_state_locked(const controller_t &controller);
++    /**
++     * @brief Send queued control messages and emulated mouse motion.
++     * @param stop_token Stops the loop.
++     */
++    void worker_loop(std::stop_token stop_token);
++
++    input_api_t _api;  ///< Input events to emit.
++    control_sender_t _control_sender;  ///< Sends control messages to the TV.
++    mutable std::mutex _mutex;  ///< Protects the state below.
++    std::condition_variable _worker_condition;  ///< Wakes the worker.
++    std::jthread _worker;  ///< Sends control messages and mouse motion.
++    std::vector<std::string> _pending_control_messages;  ///< Control messages not sent yet.
++    std::unordered_map<std::uint32_t, controller_t> _controllers;  ///< Controllers by TV ID.
++    std::array<std::optional<std::uint32_t>, MAXIMUM_GAMEPADS> _slot_to_controller;  ///< TV ID by slot.
++    std::uint16_t _active_gamepad_mask = 0;  ///< Moonlight active gamepad mask.
++    bool _stream_active = false;  ///< Whether input reaches the host.
++    bool _shutdown = false;  ///< Whether the bridge stopped.
++  };
++}  // namespace webrtc_stream
+diff --git a/src/webrtc/protocol.cpp b/src/webrtc/protocol.cpp
+new file mode 100644
+index 00000000..36a3f4f4
+--- /dev/null
++++ b/src/webrtc/protocol.cpp
+@@ -0,0 +1,421 @@
++/**
++ * @file src/webrtc/protocol.cpp
++ * @brief Definitions for the Moonlight WebRTC TV protocol (version 2).
++ */
++// standard includes
++#include <algorithm>
++#include <cctype>
++
++// local includes
++#include "protocol.h"
++
++namespace webrtc_stream::protocol {
++  namespace {
++    using json = nlohmann::json;
++
++    /**
++     * @brief Every codec, in the order the TV lists them.
++     */
++    constexpr std::array ALL_CODECS {video_codec_e::h264, video_codec_e::hevc, video_codec_e::av1};
++
++    /**
++     * @brief Start a message with the protocol version and type.
++     * @param type Message type.
++     * @return The message.
++     */
++    json envelope(std::string_view type) {
++      return {{"version", VERSION}, {"type", type}};
++    }
++
++    /**
++     * @brief Reject a message that is not protocol version 2.
++     * @param message Parsed message.
++     */
++    void require_version(const json &message) {
++      if (!message.contains("version") || !message.at("version").is_number_integer() || message.at("version").get<int>() != VERSION) {
++        throw protocol_error_t("unsupported-version", "Protocol version 2 is required");
++      }
++    }
++
++    /**
++     * @brief Read a positive session ID.
++     * @param message Parsed message.
++     * @return The session ID.
++     */
++    std::uint64_t session_id(const json &message) {
++      if (!message.contains("sessionId") || !message.at("sessionId").is_number_unsigned()) {
++        throw protocol_error_t("invalid-message", "A positive sessionId is required");
++      }
++      const auto value = message.at("sessionId").get<std::uint64_t>();
++      if (value == 0) {
++        throw protocol_error_t("invalid-message", "A positive sessionId is required");
++      }
++      return value;
++    }
++
++    /**
++     * @brief Read a non-empty application ID string.
++     * @param message Parsed message.
++     * @return The application ID.
++     */
++    std::string app_id(const json &message) {
++      if (!message.at("appId").is_string()) {
++        throw protocol_error_t("invalid-message", "appId must be a string");
++      }
++      auto value = message.at("appId").get<std::string>();
++      if (value.empty()) {
++        throw protocol_error_t("invalid-message", "appId must not be empty");
++      }
++      return value;
++    }
++
++    /**
++     * @brief Read and validate the settings of a start or switch request.
++     * @param message Parsed message.
++     * @return Validated settings.
++     */
++    stream_settings_t parse_settings(const json &message) {
++      try {
++        const auto &video = message.at("video");
++        const auto &audio = message.at("audio");
++        const auto codec = parse_codec(video.at("codec").get<std::string>());
++        if (!codec) {
++          throw protocol_error_t("unsupported-settings", "Unsupported video codec");
++        }
++
++        stream_settings_t settings;
++        settings.width = video.at("width").get<int>();
++        settings.height = video.at("height").get<int>();
++        settings.fps = video.at("fps").get<int>();
++        settings.codec = *codec;
++        settings.bitrate_kbps = video.at("bitrateKbps").get<int>();
++        settings.hdr = video.at("hdr").get<bool>();
++        settings.audio_channels = audio.at("channels").get<int>();
++        if (const auto error = validate_stream_settings(settings)) {
++          throw protocol_error_t("unsupported-settings", *error);
++        }
++        return settings;
++      } catch (const protocol_error_t &) {
++        throw;
++      } catch (const std::exception &) {
++        throw protocol_error_t("invalid-message", "Invalid start-session settings");
++      }
++    }
++
++    /**
++     * @brief Describe stream settings as the TV expects them.
++     * @param settings Stream settings.
++     * @return The video and audio members.
++     */
++    json settings_json(const stream_settings_t &settings) {
++      return {
++        {"video",
++         {{"width", settings.width},
++          {"height", settings.height},
++          {"fps", settings.fps},
++          {"codec", codec_name(settings.codec)},
++          {"bitrateKbps", settings.bitrate_kbps},
++          {"hdr", settings.hdr}}},
++        {"audio", {{"channels", settings.audio_channels}, {"sampleRate", 48000}}},
++      };
++    }
++
++    /**
++     * @brief Describe one selectable mode, offering only what the encoder supports.
++     * @param mode Supported mode.
++     * @param encoders Encoders available beyond H.264 and HEVC.
++     * @return The mode.
++     */
++    json video_mode_json(const video_mode_t &mode, const encoder_support_t &encoders) {
++      json codecs = json::array();
++      json hdr_codecs = json::array();
++      for (const auto codec : ALL_CODECS) {
++        if (!mode_supports_codec(mode, codec) || (codec == video_codec_e::av1 && !encoders.av1)) {
++          continue;
++        }
++        codecs.push_back(codec_name(codec));
++        if (mode_supports_hdr(mode, codec) && (codec != video_codec_e::av1 || encoders.av1_hdr)) {
++          hdr_codecs.push_back(codec_name(codec));
++        }
++      }
++      return {
++        {"width", mode.width},
++        {"height", mode.height},
++        {"fps", mode.fps},
++        {"codecs", std::move(codecs)},
++        {"hdrCodecs", std::move(hdr_codecs)},
++        {"defaultCodec", codec_name(mode.default_codec)},
++        {"defaultBitrateKbps", mode.default_bitrate_kbps},
++        {"experimental", mode.experimental},
++        {"hdrSupported", mode.supports_hdr},
++        {"hdrExperimental", mode.supports_hdr},
++      };
++    }
++  }  // namespace
++
++  const video_mode_t *find_video_mode(int width, int height, int fps) {
++    const auto mode = std::ranges::find_if(SUPPORTED_VIDEO_MODES, [=](const video_mode_t &candidate) {
++      return candidate.width == width && candidate.height == height && candidate.fps == fps;
++    });
++    return mode == SUPPORTED_VIDEO_MODES.end() ? nullptr : &*mode;
++  }
++
++  bool mode_supports_codec(const video_mode_t &mode, video_codec_e codec) {
++    switch (codec) {
++      case video_codec_e::h264:
++        return mode.supports_h264;
++      case video_codec_e::hevc:
++        return mode.supports_hevc;
++      case video_codec_e::av1:
++        return mode.supports_av1;
++    }
++    return false;
++  }
++
++  bool mode_supports_hdr(const video_mode_t &mode, video_codec_e codec) {
++    return mode.supports_hdr && (codec == video_codec_e::hevc || codec == video_codec_e::av1);
++  }
++
++  std::optional<std::string> validate_stream_settings(const stream_settings_t &settings) {
++    const auto *mode = find_video_mode(settings.width, settings.height, settings.fps);
++    if (!mode) {
++      return settings.fps != 60 ? "Unsupported frame rate" : "Unsupported resolution";
++    }
++    if (!mode_supports_codec(*mode, settings.codec)) {
++      return "Unsupported resolution and codec combination";
++    }
++    if (settings.hdr && !mode_supports_hdr(*mode, settings.codec)) {
++      return "HDR is supported only with HEVC or AV1 at 1080p60, 1440p60, or 4K60";
++    }
++    if (settings.audio_channels != 2) {
++      return "Only stereo audio is supported";
++    }
++    if (std::ranges::find(SUPPORTED_BITRATES_KBPS, settings.bitrate_kbps) == SUPPORTED_BITRATES_KBPS.end()) {
++      return "Unsupported bitrate";
++    }
++    return std::nullopt;
++  }
++
++  std::string_view codec_name(video_codec_e codec) {
++    switch (codec) {
++      case video_codec_e::h264:
++        return "h264";
++      case video_codec_e::hevc:
++        return "hevc";
++      case video_codec_e::av1:
++        return "av1";
++    }
++    return "unknown";
++  }
++
++  std::optional<video_codec_e> parse_codec(std::string_view name) {
++    std::string lowercase(name);
++    std::ranges::transform(lowercase, lowercase.begin(), [](unsigned char character) {
++      return static_cast<char>(std::tolower(character));
++    });
++    for (const auto codec : ALL_CODECS) {
++      if (lowercase == codec_name(codec)) {
++        return codec;
++      }
++    }
++    return std::nullopt;
++  }
++
++  protocol_error_t::protocol_error_t(std::string code, const std::string &message):
++      std::runtime_error(message),
++      _code(std::move(code)) {
++  }
++
++  const std::string &protocol_error_t::code() const noexcept {
++    return _code;
++  }
++
++  client_message_t parse_client_message(std::string_view text) {
++    json message;
++    try {
++      message = json::parse(text);
++    } catch (const std::exception &) {
++      throw protocol_error_t("invalid-json", "Message is not valid JSON");
++    }
++
++    try {
++      require_version(message);
++      const auto type = message.at("type").get<std::string>();
++      if (type == "authenticate") {
++        auto client_id = message.at("clientId").get<std::string>();
++        auto proof = message.at("proof").get<std::string>();
++        if (client_id.empty() || client_id.size() > 64 || proof.empty() || proof.size() > 128) {
++          throw protocol_error_t("invalid-message", "clientId and proof are required");
++        }
++        return {type, authenticate_t {std::move(client_id), std::move(proof)}};
++      }
++      if (type == "pair-client") {
++        auto pin = message.at("pin").get<std::string>();
++        if (pin.size() != 4) {
++          throw protocol_error_t("invalid-message", "pin must have four digits");
++        }
++        std::string client_name;
++        if (message.contains("clientName")) {
++          client_name = message.at("clientName").get<std::string>();
++        }
++        return {type, pair_client_t {std::move(pin), std::move(client_name)}};
++      }
++      if (type == "get-apps") {
++        return {type, get_apps_t {}};
++      }
++      if (type == "get-app-artwork") {
++        return {type, get_app_artwork_t {app_id(message)}};
++      }
++      if (type == "stop-session") {
++        return {type, stop_session_t {}};
++      }
++      if (type == "stop-host-session") {
++        return {type, stop_host_session_t {}};
++      }
++      if (type == "start-session") {
++        return {type, start_session_t {app_id(message), parse_settings(message)}};
++      }
++      if (type == "switch-session") {
++        return {type, switch_session_t {app_id(message), parse_settings(message)}};
++      }
++      if (type == "answer") {
++        return {type, answer_t {session_id(message), message.at("sdp").get<std::string>()}};
++      }
++      if (type == "candidate") {
++        return {type, candidate_t {session_id(message), message.at("candidate").get<std::string>(), message.at("mid").get<std::string>()}};
++      }
++      throw protocol_error_t("unsupported-message", "Unsupported message type: " + type);
++    } catch (const protocol_error_t &) {
++      throw;
++    } catch (const std::exception &) {
++      throw protocol_error_t("invalid-message", "Message fields are invalid");
++    }
++  }
++
++  json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available) {
++    auto message = envelope("auth-required");
++    message["nonce"] = nonce;
++    if (mac_address) {
++      message["macAddress"] = *mac_address;
++    }
++    if (sunshine_available) {
++      message["sunshineAvailable"] = *sunshine_available;
++    }
++    return message;
++  }
++
++  json make_sunshine_availability(bool sunshine_available) {
++    auto message = envelope("sunshine-availability");
++    message["sunshineAvailable"] = sunshine_available;
++    return message;
++  }
++
++  json make_authenticated() {
++    return envelope("authenticated");
++  }
++
++  json make_paired(std::string_view client_id, std::string_view client_secret) {
++    auto message = envelope("paired");
++    message.update({{"clientId", client_id}, {"clientSecret", client_secret}});
++    return message;
++  }
++
++  json make_gateway_status(const gateway_status_t &status) {
++    auto message = envelope("gateway-status");
++    // Sunshine is the server itself, so it is always detected and needs no Moonlight pairing.
++    message.update({{"gatewayName", status.gateway_name}, {"sunshineDetected", true}, {"sunshinePaired", true}, {"sessionActive", status.session_active}});
++    if (status.running_app_id) {
++      message["runningAppId"] = *status.running_app_id;
++    }
++    if (status.mac_address) {
++      message["macAddress"] = *status.mac_address;
++    }
++    return message;
++  }
++
++  json make_capabilities(const encoder_support_t &encoders) {
++    auto message = envelope("capabilities");
++    message["videoModes"] = json::array();
++    message["resolutions"] = json::array();
++    for (const auto &mode : SUPPORTED_VIDEO_MODES) {
++      message["videoModes"].push_back(video_mode_json(mode, encoders));
++      message["resolutions"].push_back({{"width", mode.width}, {"height", mode.height}, {"experimental", mode.experimental}});
++    }
++    message.update({
++      {"frameRates", {60}},
++      {"codecs", encoders.av1 ? json::array({"h264", "hevc", "av1"}) : json::array({"h264", "hevc"})},
++      {"hdr", true},
++      {"audio", "stereo"},
++      {"audioSampleRate", 48000},
++      {"bitratesKbps", SUPPORTED_BITRATES_KBPS},
++      {"defaults", {{"720p60", 12000}, {"1080p60", 20000}, {"1440p60", 30000}, {"2160p60", 50000}}},
++    });
++    return message;
++  }
++
++  json make_apps(const std::vector<application_t> &applications) {
++    auto message = envelope("apps");
++    message["apps"] = json::array();
++    for (const auto &application : applications) {
++      message["apps"].push_back({{"id", application.id}, {"title", application.title}, {"artworkAvailable", application.artwork_available}, {"running", application.running}});
++    }
++    return message;
++  }
++
++  json make_app_artwork(std::string_view app_id, bool available, std::string_view mime_type, std::string_view base64_data) {
++    auto message = envelope("app-artwork");
++    message.update({{"appId", app_id}, {"available", available}});
++    if (available) {
++      message.update({{"mimeType", mime_type}, {"data", base64_data}});
++    }
++    return message;
++  }
++
++  json make_session_status(std::string_view state, std::optional<std::uint64_t> session_id_value, std::optional<stream_settings_t> settings, std::optional<std::string> detail) {
++    auto message = envelope("session-status");
++    message["state"] = state;
++    if (session_id_value) {
++      message["sessionId"] = *session_id_value;
++    }
++    if (settings) {
++      message.update(settings_json(*settings));
++    }
++    if (detail) {
++      message["message"] = *detail;
++    }
++    return message;
++  }
++
++  json make_host_session_status(std::string_view state, std::optional<std::string> running_app_id, std::optional<std::string> target_app_id, std::optional<std::string> detail) {
++    auto message = envelope("host-session-status");
++    message["state"] = state;
++    if (running_app_id) {
++      message["runningAppId"] = *running_app_id;
++    }
++    if (target_app_id) {
++      message["targetAppId"] = *target_app_id;
++    }
++    if (detail) {
++      message["message"] = *detail;
++    }
++    return message;
++  }
++
++  json make_error(std::string_view request_type, std::string_view code, std::string_view detail) {
++    auto message = envelope("error");
++    message.update({{"requestType", request_type}, {"code", code}, {"message", detail}});
++    return message;
++  }
++
++  json make_offer(std::uint64_t session_id_value, std::string_view sdp) {
++    auto message = envelope("offer");
++    message.update({{"sessionId", session_id_value}, {"sdp", sdp}});
++    return message;
++  }
++
++  json make_candidate(std::uint64_t session_id_value, std::string_view candidate, std::string_view mid) {
++    auto message = envelope("candidate");
++    message.update({{"sessionId", session_id_value}, {"candidate", candidate}, {"mid", mid}});
++    return message;
++  }
++}  // namespace webrtc_stream::protocol
+diff --git a/src/webrtc/protocol.h b/src/webrtc/protocol.h
+new file mode 100644
+index 00000000..d2c92b03
+--- /dev/null
++++ b/src/webrtc/protocol.h
+@@ -0,0 +1,380 @@
++/**
++ * @file src/webrtc/protocol.h
++ * @brief Declarations for the Moonlight WebRTC TV protocol (version 2).
++ *
++ * This is the JSON protocol spoken by the Moonlight WebRTC Tizen client over its signaling
++ * WebSocket. Sunshine implements it directly, so the TV needs no separate Gateway process.
++ */
++#pragma once
++
++// standard includes
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <span>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <variant>
++#include <vector>
++
++// lib includes
++#include <nlohmann/json.hpp>
++
++namespace webrtc_stream::protocol {
++  constexpr int VERSION = 2;  ///< Protocol version; version 2 made TV authentication mandatory.
++
++  /**
++   * @brief Video codecs the TV can request.
++   */
++  enum class video_codec_e {
++    h264,  ///< H.264 High 8-bit.
++    hevc,  ///< HEVC Main, or Main10 with HDR.
++    av1,  ///< AV1 Main 8-bit, or 10-bit with HDR.
++  };
++
++  /**
++   * @brief One resolution the TV may choose, with the codecs it may combine with it.
++   */
++  struct video_mode_t {
++    int width;  ///< Width in pixels.
++    int height;  ///< Height in pixels.
++    int fps;  ///< Frame rate.
++    bool supports_h264;  ///< Whether H.264 is offered at this resolution.
++    bool supports_hevc;  ///< Whether HEVC is offered at this resolution.
++    bool supports_av1;  ///< Whether AV1 is offered at this resolution, when the encoder supports it.
++    video_codec_e default_codec;  ///< Codec preselected by the TV.
++    int default_bitrate_kbps;  ///< Bitrate preselected by the TV.
++    bool experimental;  ///< Whether the TV labels the resolution as experimental.
++    bool supports_hdr;  ///< Whether HDR may be selected at this resolution.
++  };
++
++  /**
++   * @brief Stream settings requested by the TV and validated against the supported modes.
++   */
++  struct stream_settings_t {
++    int width = 1280;  ///< Width in pixels.
++    int height = 720;  ///< Height in pixels.
++    int fps = 60;  ///< Frame rate.
++    int bitrate_kbps = 12000;  ///< Total stream bitrate in kilobits per second.
++    video_codec_e codec = video_codec_e::h264;  ///< Video codec.
++    bool hdr = false;  ///< Whether a 10-bit BT.2020 PQ stream is requested.
++    int audio_channels = 2;  ///< Audio channel count; only stereo is supported.
++
++    /**
++     * @brief Compare two settings field by field.
++     * @return True when every field matches.
++     */
++    bool operator==(const stream_settings_t &) const = default;
++  };
++
++  /**
++   * @brief Resolutions offered to the TV. 1440p is not in Samsung's Cloud Gaming table.
++   */
++  constexpr std::array SUPPORTED_VIDEO_MODES {
++    video_mode_t {1280, 720, 60, true, true, true, video_codec_e::h264, 12000, false, false},
++    video_mode_t {1920, 1080, 60, true, true, true, video_codec_e::h264, 20000, false, true},
++    video_mode_t {2560, 1440, 60, true, true, true, video_codec_e::hevc, 30000, true, true},
++    video_mode_t {3840, 2160, 60, false, true, true, video_codec_e::hevc, 50000, false, true},
++  };
++
++  /**
++   * @brief Bitrates the TV may select. Above 50 Mbps a wired TV may hit its 100 Mbps port.
++   */
++  constexpr std::array SUPPORTED_BITRATES_KBPS {10000, 12000, 15000, 20000, 25000, 30000, 40000, 50000, 60000, 80000, 100000};
++
++  /**
++   * @brief Find the supported mode matching a resolution and frame rate.
++   * @param width Width in pixels.
++   * @param height Height in pixels.
++   * @param fps Frame rate.
++   * @return The matching mode, or null when the combination is not offered.
++   */
++  const video_mode_t *find_video_mode(int width, int height, int fps = 60);
++
++  /**
++   * @brief Report whether a mode offers a codec.
++   * @param mode Supported mode.
++   * @param codec Codec to check.
++   * @return True when the codec may be selected with the mode.
++   */
++  bool mode_supports_codec(const video_mode_t &mode, video_codec_e codec);
++
++  /**
++   * @brief Report whether a mode offers HDR with a codec.
++   * @param mode Supported mode.
++   * @param codec Codec to check.
++   * @return True when HDR may be selected with the mode and codec.
++   */
++  bool mode_supports_hdr(const video_mode_t &mode, video_codec_e codec);
++
++  /**
++   * @brief Validate settings requested by the TV.
++   * @param settings Requested settings.
++   * @return A user-safe reason when the settings are rejected, or nothing when they are valid.
++   */
++  std::optional<std::string> validate_stream_settings(const stream_settings_t &settings);
++
++  /**
++   * @brief Return the protocol name of a codec.
++   * @param codec Codec to name.
++   * @return "h264", "hevc" or "av1".
++   */
++  std::string_view codec_name(video_codec_e codec);
++
++  /**
++   * @brief Parse a protocol codec name.
++   * @param name Name sent by the TV.
++   * @return The codec, or nothing for an unknown name.
++   */
++  std::optional<video_codec_e> parse_codec(std::string_view name);
++
++  /**
++   * @brief Protocol violation reported to the TV with a stable error code.
++   */
++  class protocol_error_t: public std::runtime_error {
++  public:
++    /**
++     * @brief Create a protocol error.
++     * @param code Stable error code sent to the TV.
++     * @param message User-safe description.
++     */
++    protocol_error_t(std::string code, const std::string &message);
++
++    /**
++     * @brief Return the stable error code.
++     * @return Error code sent to the TV.
++     */
++    const std::string &code() const noexcept;
++
++  private:
++    std::string _code;  ///< Stable error code.
++  };
++
++  /**
++   * @brief A paired TV proving it holds its secret.
++   */
++  struct authenticate_t {
++    std::string client_id;  ///< Client ID issued at pairing.
++    std::string proof;  ///< HMAC-SHA256 over the connection nonce.
++  };
++
++  /**
++   * @brief A TV pairing with the PIN shown on the PC.
++   */
++  struct pair_client_t {
++    std::string pin;  ///< Four-digit PIN.
++    std::string client_name;  ///< Display name of the TV.
++  };
++
++  /**
++   * @brief Request for the application list.
++   */
++  struct get_apps_t {};
++
++  /**
++   * @brief Request for one application's artwork.
++   */
++  struct get_app_artwork_t {
++    std::string app_id;  ///< Application ID.
++  };
++
++  /**
++   * @brief Request to end the stream while leaving the application running.
++   */
++  struct stop_session_t {};
++
++  /**
++   * @brief Request to stop the running application.
++   */
++  struct stop_host_session_t {};
++
++  /**
++   * @brief Request to start or resume a stream.
++   */
++  struct start_session_t {
++    std::string app_id;  ///< Application ID.
++    stream_settings_t settings;  ///< Validated stream settings.
++  };
++
++  /**
++   * @brief Request to stop the running application and start another.
++   */
++  struct switch_session_t {
++    std::string app_id;  ///< Application ID.
++    stream_settings_t settings;  ///< Validated stream settings.
++  };
++
++  /**
++   * @brief SDP answer for a session's offer.
++   */
++  struct answer_t {
++    std::uint64_t session_id = 0;  ///< Session the answer belongs to.
++    std::string sdp;  ///< Answer SDP.
++  };
++
++  /**
++   * @brief Remote ICE candidate.
++   */
++  struct candidate_t {
++    std::uint64_t session_id = 0;  ///< Session the candidate belongs to.
++    std::string candidate;  ///< Candidate line.
++    std::string mid;  ///< Media ID.
++  };
++
++  /**
++   * @brief Any message the TV may send.
++   */
++  using client_payload_t = std::variant<authenticate_t, pair_client_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
++
++  /**
++   * @brief A parsed TV message.
++   */
++  struct client_message_t {
++    std::string type;  ///< Message type.
++    client_payload_t payload;  ///< Parsed payload.
++  };
++
++  /**
++   * @brief Server state reported after authentication.
++   */
++  struct gateway_status_t {
++    std::string gateway_name;  ///< Name shown on the TV.
++    bool session_active = false;  ///< Whether this TV has a stream.
++    std::optional<std::string> running_app_id;  ///< Application running on the host, if any.
++    std::optional<std::string> mac_address;  ///< Wake-on-LAN address of the adapter facing the TV.
++  };
++
++  /**
++   * @brief One entry of the application list.
++   */
++  struct application_t {
++    std::string id;  ///< Opaque application ID.
++    std::string title;  ///< Display title.
++    bool artwork_available = false;  ///< Whether artwork is already cached.
++    bool running = false;  ///< Whether the application is running on the host.
++  };
++
++  /**
++   * @brief Encoders available beyond H.264 and HEVC.
++   */
++  struct encoder_support_t {
++    bool av1 = false;  ///< AV1 Main 8-bit.
++    bool av1_hdr = false;  ///< AV1 Main 10-bit.
++  };
++
++  /**
++   * @brief Parse a message from the TV.
++   * @param text JSON text.
++   * @return The parsed message.
++   * @throws protocol_error_t for malformed or unsupported messages.
++   */
++  client_message_t parse_client_message(std::string_view text);
++
++  /**
++   * @brief Build the greeting carrying the authentication nonce.
++   * @param nonce Single-use nonce in lower-case hex.
++   * @param mac_address Wake-on-LAN address, offered before authentication like ARP does.
++   * @param sunshine_available Whether streaming is possible, for the TV's reachability probe.
++   * @return The message.
++   */
++  nlohmann::json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available);
++
++  /**
++   * @brief Build the push sent when streaming becomes possible or impossible.
++   * @param sunshine_available Whether streaming is possible.
++   * @return The message.
++   */
++  nlohmann::json make_sunshine_availability(bool sunshine_available);
++
++  /**
++   * @brief Build the reply to a successful authentication.
++   * @return The message.
++   */
++  nlohmann::json make_authenticated();
++
++  /**
++   * @brief Build the reply to a successful pairing.
++   * @param client_id Issued client ID.
++   * @param client_secret Issued client secret.
++   * @return The message.
++   */
++  nlohmann::json make_paired(std::string_view client_id, std::string_view client_secret);
++
++  /**
++   * @brief Build the server status message.
++   * @param status Server status.
++   * @return The message.
++   */
++  nlohmann::json make_gateway_status(const gateway_status_t &status);
++
++  /**
++   * @brief Build the capabilities message listing every selectable mode.
++   * @param encoders Encoders available beyond H.264 and HEVC.
++   * @return The message.
++   */
++  nlohmann::json make_capabilities(const encoder_support_t &encoders);
++
++  /**
++   * @brief Build the application list.
++   * @param applications Applications.
++   * @return The message.
++   */
++  nlohmann::json make_apps(const std::vector<application_t> &applications);
++
++  /**
++   * @brief Build the reply to an artwork request.
++   * @param app_id Application ID.
++   * @param available Whether artwork is included.
++   * @param mime_type Artwork media type.
++   * @param base64_data Base64 artwork bytes.
++   * @return The message.
++   */
++  nlohmann::json make_app_artwork(std::string_view app_id, bool available, std::string_view mime_type = {}, std::string_view base64_data = {});
++
++  /**
++   * @brief Build a stream state change.
++   * @param state New state.
++   * @param session_id Session the state belongs to.
++   * @param settings Session settings.
++   * @param message Optional detail.
++   * @return The message.
++   */
++  nlohmann::json make_session_status(std::string_view state, std::optional<std::uint64_t> session_id = std::nullopt, std::optional<stream_settings_t> settings = std::nullopt, std::optional<std::string> message = std::nullopt);
++
++  /**
++   * @brief Build a host application state change.
++   * @param state New state.
++   * @param running_app_id Running application.
++   * @param target_app_id Application being switched to.
++   * @param message Optional detail.
++   * @return The message.
++   */
++  nlohmann::json make_host_session_status(std::string_view state, std::optional<std::string> running_app_id = std::nullopt, std::optional<std::string> target_app_id = std::nullopt, std::optional<std::string> message = std::nullopt);
++
++  /**
++   * @brief Build an error reply.
++   * @param request_type Request that failed.
++   * @param code Stable error code.
++   * @param message User-safe description.
++   * @return The message.
++   */
++  nlohmann::json make_error(std::string_view request_type, std::string_view code, std::string_view message);
++
++  /**
++   * @brief Build an SDP offer.
++   * @param session_id Session the offer belongs to.
++   * @param sdp Offer SDP.
++   * @return The message.
++   */
++  nlohmann::json make_offer(std::uint64_t session_id, std::string_view sdp);
++
++  /**
++   * @brief Build a local ICE candidate.
++   * @param session_id Session the candidate belongs to.
++   * @param candidate Candidate line.
++   * @param mid Media ID.
++   * @return The message.
++   */
++  nlohmann::json make_candidate(std::uint64_t session_id, std::string_view candidate, std::string_view mid);
++}  // namespace webrtc_stream::protocol
+diff --git a/src/webrtc/sdp.cpp b/src/webrtc/sdp.cpp
+new file mode 100644
+index 00000000..bf5b30b9
+--- /dev/null
++++ b/src/webrtc/sdp.cpp
+@@ -0,0 +1,176 @@
++/**
++ * @file src/webrtc/sdp.cpp
++ * @brief Definitions for the SDP details Samsung Tizen needs for low-latency streaming.
++ */
++// standard includes
++#include <array>
++#include <charconv>
++
++// local includes
++#include "sdp.h"
++
++namespace webrtc_stream::sdp {
++  namespace {
++    /**
++     * @brief Return the video media section of an SDP.
++     * @param sdp SDP text.
++     * @return The section, or an empty view when there is none.
++     */
++    std::string_view video_section(std::string_view sdp) {
++      const auto begin = sdp.find("m=video ");
++      if (begin == std::string_view::npos) {
++        return {};
++      }
++      const auto end = sdp.find("\r\nm=", begin + 1);
++      return sdp.substr(begin, end == std::string_view::npos ? end : end - begin);
++    }
++
++    /**
++     * @brief Remove leading and trailing spaces.
++     * @param value Text to trim.
++     * @return The trimmed text.
++     */
++    std::string_view trim(std::string_view value) {
++      while (!value.empty() && value.front() == ' ') {
++        value.remove_prefix(1);
++      }
++      while (!value.empty() && value.back() == ' ') {
++        value.remove_suffix(1);
++      }
++      return value;
++    }
++
++    /**
++     * @brief Read one format parameter of a payload type.
++     * @param section Media section.
++     * @param payload_type RTP payload type.
++     * @param name Parameter name.
++     * @return The value, or nothing when it is absent.
++     */
++    std::optional<std::string_view> format_parameter(std::string_view section, int payload_type, std::string_view name) {
++      const auto prefix = "a=fmtp:" + std::to_string(payload_type) + " ";
++      const auto position = section.find(prefix);
++      if (position == std::string_view::npos) {
++        return std::nullopt;
++      }
++      const auto end = section.find("\r\n", position);
++      auto parameters = section.substr(position + prefix.size(), end == std::string_view::npos ? end : end - position - prefix.size());
++      while (!parameters.empty()) {
++        const auto separator = parameters.find(';');
++        const auto parameter = trim(parameters.substr(0, separator));
++        const auto equals = parameter.find('=');
++        if (equals != std::string_view::npos && parameter.substr(0, equals) == name) {
++          return parameter.substr(equals + 1);
++        }
++        if (separator == std::string_view::npos) {
++          break;
++        }
++        parameters.remove_prefix(separator + 1);
++      }
++      return std::nullopt;
++    }
++
++    /**
++     * @brief Return the rtpmap encoding name of a codec.
++     * @param codec Codec.
++     * @return The encoding name and clock rate.
++     */
++    std::string_view rtpmap_name(protocol::video_codec_e codec) {
++      switch (codec) {
++        case protocol::video_codec_e::h264:
++          return "H264/90000";
++        case protocol::video_codec_e::hevc:
++          return "H265/90000";
++        case protocol::video_codec_e::av1:
++          return "AV1/90000";
++      }
++      return {};
++    }
++  }  // namespace
++
++  std::string game_mode_image_attribute(const protocol::stream_settings_t &settings, int payload_type) {
++    const auto width = std::to_string(settings.width);
++    const auto height = std::to_string(settings.height);
++    const auto fps = std::to_string(settings.fps);
++    return "imageattr:" + std::to_string(payload_type) + " send [x=[" + width + ":" + width + "],y=[" + height + ":" + height + "],fps=[" + fps + ":" + fps + "]]";
++  }
++
++  bool has_valid_game_mode_image_attribute(std::string_view sdp, const protocol::stream_settings_t &settings, int payload_type) {
++    for (std::size_t index = 0; index < sdp.size(); ++index) {
++      const bool bare_lf = sdp[index] == '\n' && (index == 0 || sdp[index - 1] != '\r');
++      const bool bare_cr = sdp[index] == '\r' && (index + 1 == sdp.size() || sdp[index + 1] != '\n');
++      if (bare_lf || bare_cr) {
++        return false;
++      }
++    }
++
++    const auto expected = "a=" + game_mode_image_attribute(settings, payload_type);
++    const auto position = sdp.find(expected);
++    if (position == std::string_view::npos || sdp.find(expected, position + expected.size()) != std::string_view::npos || sdp.find("a=imageattr:") != position || sdp.find("a=imageattr:", position + 1) != std::string_view::npos) {
++      return false;
++    }
++
++    const bool complete_line = (position == 0 || sdp.substr(position - 2, 2) == "\r\n") && sdp.substr(position + expected.size(), 2) == "\r\n";
++    const auto video_position = sdp.find("m=video ");
++    const auto next_media_position = video_position == std::string_view::npos ? std::string_view::npos : sdp.find("\r\nm=", video_position + 1);
++    return complete_line && video_position != std::string_view::npos && position > video_position && (next_media_position == std::string_view::npos || position < next_media_position);
++  }
++
++  bool has_expected_video_codec(std::string_view sdp, protocol::video_codec_e codec, int payload_type) {
++    const auto section = video_section(sdp);
++    if (section.empty()) {
++      return false;
++    }
++    const auto expected = "a=rtpmap:" + std::to_string(payload_type) + " " + std::string(rtpmap_name(codec));
++    if (section.find(expected) == std::string_view::npos) {
++      return false;
++    }
++    // The offer must carry the requested codec alone, so the TV cannot answer another one.
++    constexpr std::array ALL_CODECS {protocol::video_codec_e::h264, protocol::video_codec_e::hevc, protocol::video_codec_e::av1};
++    for (const auto other : ALL_CODECS) {
++      if (other != codec && section.find(rtpmap_name(other)) != std::string_view::npos) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  std::optional<std::string> hevc_format_parameters(const protocol::stream_settings_t &settings) {
++    if (settings.codec != protocol::video_codec_e::hevc || !settings.hdr) {
++      return std::nullopt;
++    }
++    int level_id = 123;
++    if (settings.width == 2560) {
++      level_id = 150;
++    } else if (settings.width == 3840) {
++      level_id = 153;
++    }
++    return "profile-id=2;tier-flag=0;level-id=" + std::to_string(level_id);
++  }
++
++  bool has_expected_hevc_format_parameters(std::string_view sdp, const protocol::stream_settings_t &settings, int payload_type) {
++    if (!hevc_format_parameters(settings)) {
++      return true;
++    }
++    const auto section = video_section(sdp);
++    return !section.empty() && format_parameter(section, payload_type, "profile-id") == "2" && format_parameter(section, payload_type, "tier-flag") == "0";
++  }
++
++  std::optional<int> hevc_level_id(std::string_view sdp, int payload_type) {
++    const auto value = format_parameter(video_section(sdp), payload_type, "level-id");
++    if (!value) {
++      return std::nullopt;
++    }
++    int level = 0;
++    const auto parsed = std::from_chars(value->data(), value->data() + value->size(), level);
++    if (parsed.ec != std::errc {} || parsed.ptr != value->data() + value->size()) {
++      return std::nullopt;
++    }
++    return level;
++  }
++
++  bool has_data_channel_section(std::string_view sdp) {
++    const auto application = sdp.find("m=application ");
++    return application != std::string_view::npos && sdp.find("webrtc-datachannel", application) != std::string_view::npos && sdp.find("a=sctp-port:", application) != std::string_view::npos;
++  }
++}  // namespace webrtc_stream::sdp
+diff --git a/src/webrtc/sdp.h b/src/webrtc/sdp.h
+new file mode 100644
+index 00000000..6820164e
+--- /dev/null
++++ b/src/webrtc/sdp.h
+@@ -0,0 +1,75 @@
++/**
++ * @file src/webrtc/sdp.h
++ * @brief Declarations for the SDP details Samsung Tizen needs for low-latency streaming.
++ */
++#pragma once
++
++// standard includes
++#include <optional>
++#include <string>
++#include <string_view>
++
++// local includes
++#include "protocol.h"
++
++namespace webrtc_stream::sdp {
++  constexpr int VIDEO_PAYLOAD_TYPE = 96;  ///< RTP payload type of the video track.
++  constexpr int AUDIO_PAYLOAD_TYPE = 111;  ///< RTP payload type of the audio track.
++
++  /**
++   * @brief Build the imageattr that puts the Tizen decoder in Samsung Game Mode.
++   * @param settings Stream settings.
++   * @param payload_type Video payload type.
++   * @return Attribute value without the leading "a=".
++   */
++  std::string game_mode_image_attribute(const protocol::stream_settings_t &settings, int payload_type = VIDEO_PAYLOAD_TYPE);
++
++  /**
++   * @brief Check that an offer carries exactly one well-formed Game Mode imageattr in its video section.
++   * @param sdp Offer SDP.
++   * @param settings Stream settings.
++   * @param payload_type Video payload type.
++   * @return True when the attribute is present once and well-formed.
++   */
++  bool has_valid_game_mode_image_attribute(std::string_view sdp, const protocol::stream_settings_t &settings, int payload_type = VIDEO_PAYLOAD_TYPE);
++
++  /**
++   * @brief Check that the video section offers only the requested codec.
++   * @param sdp Offer SDP.
++   * @param codec Requested codec.
++   * @param payload_type Video payload type.
++   * @return True when the requested codec is the only one offered.
++   */
++  bool has_expected_video_codec(std::string_view sdp, protocol::video_codec_e codec, int payload_type = VIDEO_PAYLOAD_TYPE);
++
++  /**
++   * @brief Build the H.265 format parameters that request Main10 for HDR.
++   * @param settings Stream settings.
++   * @return The parameters for HEVC HDR, or nothing otherwise.
++   */
++  std::optional<std::string> hevc_format_parameters(const protocol::stream_settings_t &settings);
++
++  /**
++   * @brief Check that an SDP keeps the requested HEVC Main10 profile.
++   * @param sdp Offer or answer SDP.
++   * @param settings Stream settings.
++   * @param payload_type Video payload type.
++   * @return True when no profile was requested or the SDP keeps it.
++   */
++  bool has_expected_hevc_format_parameters(std::string_view sdp, const protocol::stream_settings_t &settings, int payload_type = VIDEO_PAYLOAD_TYPE);
++
++  /**
++   * @brief Read the HEVC level-id of the video section.
++   * @param sdp Offer or answer SDP.
++   * @param payload_type Video payload type.
++   * @return The level-id, or nothing when it is absent.
++   */
++  std::optional<int> hevc_level_id(std::string_view sdp, int payload_type = VIDEO_PAYLOAD_TYPE);
++
++  /**
++   * @brief Check that the SDP has a data-channel application section.
++   * @param sdp Offer SDP.
++   * @return True when the section is present.
++   */
++  bool has_data_channel_section(std::string_view sdp);
++}  // namespace webrtc_stream::sdp
+diff --git a/src/webrtc/tv_auth.cpp b/src/webrtc/tv_auth.cpp
+new file mode 100644
+index 00000000..7d71894b
+--- /dev/null
++++ b/src/webrtc/tv_auth.cpp
+@@ -0,0 +1,324 @@
++/**
++ * @file src/webrtc/tv_auth.cpp
++ * @brief Definitions for pairing and authenticating Moonlight WebRTC TVs.
++ */
++// standard includes
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <fstream>
++#include <iterator>
++#include <stdexcept>
++#include <system_error>
++
++// lib includes
++#include <nlohmann/json.hpp>
++#include <openssl/crypto.h>
++#include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/rand.h>
++
++// local includes
++#include "tv_auth.h"
++
++namespace webrtc_stream::tv_auth {
++  namespace {
++    using json = nlohmann::json;
++
++    /**
++     * @brief Version of the paired TV file.
++     */
++    constexpr int STORE_VERSION = 1;
++    /**
++     * @brief Label that binds a proof to this protocol.
++     */
++    constexpr std::string_view PROOF_LABEL = "moonlight-webrtc-tv-auth-v1:";
++
++    /**
++     * @brief Encode bytes as lower-case hex.
++     * @param bytes Bytes to encode.
++     * @param size Number of bytes.
++     * @return Hex text.
++     */
++    std::string to_hex(const unsigned char *bytes, std::size_t size) {
++      static constexpr char DIGITS[] = "0123456789abcdef";
++      std::string result(size * 2, '\0');
++      for (std::size_t index = 0; index < size; ++index) {
++        result[index * 2] = DIGITS[bytes[index] >> 4];
++        result[index * 2 + 1] = DIGITS[bytes[index] & 0x0F];
++      }
++      return result;
++    }
++
++    /**
++     * @brief Decode one lower-case hex digit.
++     * @param digit Digit to decode.
++     * @return Its value, or -1 when it is not a lower-case hex digit.
++     */
++    int hex_value(char digit) {
++      if (digit >= '0' && digit <= '9') {
++        return digit - '0';
++      }
++      if (digit >= 'a' && digit <= 'f') {
++        return digit - 'a' + 10;
++      }
++      return -1;
++    }
++
++    /**
++     * @brief Decode lower-case hex.
++     * @param value Hex text.
++     * @return Decoded bytes.
++     */
++    std::vector<unsigned char> from_hex(std::string_view value) {
++      if (value.size() % 2 != 0) {
++        throw std::invalid_argument("Hex value has an odd length");
++      }
++      std::vector<unsigned char> bytes(value.size() / 2);
++      for (std::size_t index = 0; index < bytes.size(); ++index) {
++        const int high = hex_value(value[index * 2]);
++        const int low = hex_value(value[index * 2 + 1]);
++        if (high < 0 || low < 0) {
++          throw std::invalid_argument("Hex value contains a non-hex digit");
++        }
++        bytes[index] = static_cast<unsigned char>((high << 4) | low);
++      }
++      return bytes;
++    }
++
++    /**
++     * @brief Generate a uniformly distributed four-digit PIN.
++     * @return The PIN.
++     */
++    std::string random_pin() {
++      // Rejection sampling keeps every PIN equally likely.
++      for (;;) {
++        std::uint16_t value = 0;
++        if (RAND_bytes(reinterpret_cast<unsigned char *>(&value), sizeof(value)) != 1) {
++          throw std::runtime_error("OpenSSL failed to generate a TV pairing PIN");
++        }
++        if (value < 60000) {
++          const std::string pin = std::to_string(value % 10000);
++          return std::string(4 - pin.size(), '0') + pin;
++        }
++      }
++    }
++
++    /**
++     * @brief Check that a PIN has four digits.
++     * @param pin PIN to check.
++     * @return True when it is valid.
++     */
++    bool is_valid_pin(std::string_view pin) {
++      return pin.size() == 4 && std::ranges::all_of(pin, [](char digit) {
++               return digit >= '0' && digit <= '9';
++             });
++    }
++
++    /**
++     * @brief Compute HMAC-SHA256.
++     * @param key_hex Key in hex.
++     * @param message Message.
++     * @return The digest in lower-case hex.
++     */
++    std::string hmac_sha256_hex(std::string_view key_hex, std::string_view message) {
++      const auto key = from_hex(key_hex);
++      std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
++      unsigned int digest_length = 0;
++      if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char *>(message.data()), message.size(), digest.data(), &digest_length)) {
++        throw std::runtime_error("OpenSSL failed to compute HMAC-SHA256");
++      }
++      return to_hex(digest.data(), digest_length);
++    }
++  }  // namespace
++
++  std::string random_hex(std::size_t bytes) {
++    std::vector<unsigned char> buffer(bytes);
++    if (RAND_bytes(buffer.data(), static_cast<int>(buffer.size())) != 1) {
++      throw std::runtime_error("OpenSSL failed to generate random bytes");
++    }
++    return to_hex(buffer.data(), buffer.size());
++  }
++
++  bool is_hex(std::string_view value, std::size_t bytes) {
++    return value.size() == bytes * 2 && std::ranges::all_of(value, [](char digit) {
++             return hex_value(digit) >= 0;
++           });
++  }
++
++  std::string authentication_proof(std::string_view client_secret_hex, std::string_view nonce_hex) {
++    return hmac_sha256_hex(client_secret_hex, std::string(PROOF_LABEL) + std::string(nonce_hex));
++  }
++
++  bool constant_time_equals(std::string_view left, std::string_view right) {
++    return left.size() == right.size() && CRYPTO_memcmp(left.data(), right.data(), left.size()) == 0;
++  }
++
++  std::string sanitize_client_name(std::string_view name) {
++    std::string result;
++    for (const char character : name) {
++      if (result.size() >= MAXIMUM_CLIENT_NAME_LENGTH) {
++        break;
++      }
++      // Keep printable ASCII only; the name is a label shown in the Web UI.
++      if (character >= 0x20 && character < 0x7F) {
++        result.push_back(character);
++      }
++    }
++    const auto first = result.find_first_not_of(' ');
++    const auto last = result.find_last_not_of(' ');
++    result = first == std::string::npos ? std::string() : result.substr(first, last - first + 1);
++    return result.empty() ? "Samsung TV" : result;
++  }
++
++  tv_client_store_t::tv_client_store_t(std::filesystem::path path):
++      _path(std::move(path)) {
++    load();
++  }
++
++  void tv_client_store_t::load() {
++    std::error_code error;
++    if (!std::filesystem::exists(_path, error)) {
++      return;
++    }
++    try {
++      std::ifstream input(_path, std::ios::binary);
++      const json value = json::parse(std::string(std::istreambuf_iterator<char>(input), {}));
++      if (value.value("version", 0) != STORE_VERSION || !value.contains("clients") || !value.at("clients").is_array()) {
++        return;
++      }
++      for (const auto &entry : value.at("clients")) {
++        tv_client_t client {entry.value("id", ""), entry.value("name", ""), entry.value("secret", "")};
++        if (is_hex(client.id, CLIENT_ID_BYTES) && is_hex(client.secret, CLIENT_SECRET_BYTES)) {
++          client.name = sanitize_client_name(client.name);
++          _clients.push_back(std::move(client));
++        }
++      }
++    } catch (const std::exception &) {
++      // An unreadable store trusts nobody; affected TVs pair again.
++      _clients.clear();
++    }
++  }
++
++  void tv_client_store_t::save() const {
++    json clients = json::array();
++    for (const auto &client : _clients) {
++      clients.push_back({{"id", client.id}, {"name", client.name}, {"secret", client.secret}});
++    }
++    const std::string contents = json {{"version", STORE_VERSION}, {"clients", std::move(clients)}}.dump(2);
++
++    auto temporary_path = _path;
++    temporary_path += ".tmp";
++    {
++      std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
++      output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
++      if (!output) {
++        throw std::runtime_error("Unable to write the paired TV list");
++      }
++    }
++    std::error_code error;
++    std::filesystem::rename(temporary_path, _path, error);
++    if (error) {
++      std::filesystem::remove(temporary_path, error);
++      throw std::runtime_error("Unable to persist the paired TV list");
++    }
++  }
++
++  std::optional<tv_client_t> tv_client_store_t::find(std::string_view id) const {
++    std::lock_guard lock(_mutex);
++    const auto found = std::ranges::find_if(_clients, [id](const tv_client_t &client) {
++      return client.id == id;
++    });
++    return found == _clients.end() ? std::nullopt : std::optional<tv_client_t>(*found);
++  }
++
++  tv_client_t tv_client_store_t::add(std::string_view name) {
++    tv_client_t client {random_hex(CLIENT_ID_BYTES), sanitize_client_name(name), random_hex(CLIENT_SECRET_BYTES)};
++    std::lock_guard lock(_mutex);
++    auto updated = _clients;
++    if (updated.size() >= MAXIMUM_CLIENTS) {
++      updated.erase(updated.begin());
++    }
++    updated.push_back(client);
++    std::swap(_clients, updated);
++    try {
++      save();
++    } catch (...) {
++      std::swap(_clients, updated);
++      throw;
++    }
++    return client;
++  }
++
++  std::size_t tv_client_store_t::remove_all() {
++    std::lock_guard lock(_mutex);
++    auto removed = std::move(_clients);
++    _clients.clear();
++    try {
++      save();
++    } catch (...) {
++      _clients = std::move(removed);
++      throw;
++    }
++    return removed.size();
++  }
++
++  std::vector<tv_client_t> tv_client_store_t::list() const {
++    std::lock_guard lock(_mutex);
++    std::vector<tv_client_t> clients;
++    for (const auto &client : _clients) {
++      clients.push_back({client.id, client.name, {}});
++    }
++    return clients;
++  }
++
++  std::size_t tv_client_store_t::count() const {
++    std::lock_guard lock(_mutex);
++    return _clients.size();
++  }
++
++  std::string tv_pairing_window_t::open(clock::time_point now) {
++    _pin = random_pin();
++    _expires_at = now + PAIRING_WINDOW_LIFETIME;
++    _failed_attempts = 0;
++    _state = pairing_state_e::waiting;
++    return _pin;
++  }
++
++  void tv_pairing_window_t::expire(clock::time_point now) {
++    if (_state == pairing_state_e::waiting && now >= _expires_at) {
++      _state = pairing_state_e::expired;
++      _pin.clear();
++    }
++  }
++
++  pairing_attempt_e tv_pairing_window_t::attempt(std::string_view pin, clock::time_point now) {
++    expire(now);
++    if (_state != pairing_state_e::waiting) {
++      return pairing_attempt_e::not_open;
++    }
++    if (is_valid_pin(pin) && constant_time_equals(pin, _pin)) {
++      _state = pairing_state_e::paired;
++      _pin.clear();
++      return pairing_attempt_e::accepted;
++    }
++    if (++_failed_attempts >= MAXIMUM_PIN_ATTEMPTS) {
++      _state = pairing_state_e::failed;
++      _pin.clear();
++      return pairing_attempt_e::too_many_attempts;
++    }
++    return pairing_attempt_e::incorrect_pin;
++  }
++
++  pairing_state_e tv_pairing_window_t::state(clock::time_point now) {
++    expire(now);
++    return _state;
++  }
++
++  void tv_pairing_window_t::close() {
++    if (_state == pairing_state_e::waiting) {
++      _state = pairing_state_e::idle;
++    }
++    _pin.clear();
++  }
++}  // namespace webrtc_stream::tv_auth
+diff --git a/src/webrtc/tv_auth.h b/src/webrtc/tv_auth.h
+new file mode 100644
+index 00000000..44cc6a84
+--- /dev/null
++++ b/src/webrtc/tv_auth.h
+@@ -0,0 +1,210 @@
++/**
++ * @file src/webrtc/tv_auth.h
++ * @brief Declarations for pairing and authenticating Moonlight WebRTC TVs.
++ */
++#pragma once
++
++// standard includes
++#include <chrono>
++#include <cstddef>
++#include <filesystem>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace webrtc_stream::tv_auth {
++  constexpr std::size_t CLIENT_ID_BYTES = 16;  ///< Length of an issued client ID.
++  constexpr std::size_t CLIENT_SECRET_BYTES = 32;  ///< Length of an issued client secret.
++  constexpr std::size_t NONCE_BYTES = 32;  ///< Length of a connection nonce.
++  constexpr std::size_t MAXIMUM_CLIENTS = 32;  ///< Paired TVs kept; the oldest is dropped beyond this.
++  constexpr std::size_t MAXIMUM_CLIENT_NAME_LENGTH = 64;  ///< Longest stored TV name.
++  constexpr int MAXIMUM_PIN_ATTEMPTS = 3;  ///< Wrong PINs that close a pairing window.
++  constexpr std::chrono::seconds PAIRING_WINDOW_LIFETIME {120};  ///< How long a PIN stays valid.
++
++  /**
++   * @brief Generate random bytes as lower-case hex.
++   * @param bytes Number of random bytes.
++   * @return Hex string of twice @p bytes characters.
++   */
++  std::string random_hex(std::size_t bytes);
++
++  /**
++   * @brief Check that a value is lower-case hex of a given byte length.
++   * @param value Value to check.
++   * @param bytes Expected byte length.
++   * @return True when the value matches.
++   */
++  bool is_hex(std::string_view value, std::size_t bytes);
++
++  /**
++   * @brief Compute the proof a TV sends for a nonce.
++   *
++   * The TV proves it holds its secret without sending it: HMAC-SHA256 keyed with the secret
++   * over a label and the single-use nonce. The label keeps the proof from being reusable as an
++   * HMAC over the bare nonce in any other context.
++   *
++   * @param client_secret_hex Client secret.
++   * @param nonce_hex Connection nonce.
++   * @return Proof in lower-case hex.
++   */
++  std::string authentication_proof(std::string_view client_secret_hex, std::string_view nonce_hex);
++
++  /**
++   * @brief Compare two strings without leaking the position of the first difference.
++   * @param left First string.
++   * @param right Second string.
++   * @return True when the strings are equal.
++   */
++  bool constant_time_equals(std::string_view left, std::string_view right);
++
++  /**
++   * @brief Reduce a TV-supplied name to a short printable label.
++   * @param name Name sent by the TV.
++   * @return Sanitized name, or "Samsung TV" when nothing printable remains.
++   */
++  std::string sanitize_client_name(std::string_view name);
++
++  /**
++   * @brief A paired TV.
++   */
++  struct tv_client_t {
++    std::string id;  ///< Client ID.
++    std::string name;  ///< Display name.
++    std::string secret;  ///< Shared secret.
++  };
++
++  /**
++   * @brief Paired TVs, persisted in Sunshine's configuration directory.
++   *
++   * Secrets are stored as issued because Sunshine must recompute each proof; the file is
++   * protected like Sunshine's own private key next to it.
++   */
++  class tv_client_store_t {
++  public:
++    /**
++     * @brief Load the store from a file.
++     * @param path Store file; a missing or unreadable file trusts no TV.
++     */
++    explicit tv_client_store_t(std::filesystem::path path);
++
++    /**
++     * @brief Find a paired TV.
++     * @param id Client ID.
++     * @return The TV, or nothing when it is not paired.
++     */
++    std::optional<tv_client_t> find(std::string_view id) const;
++
++    /**
++     * @brief Pair a new TV and persist the store.
++     * @param name Display name sent by the TV.
++     * @return The issued credentials.
++     */
++    tv_client_t add(std::string_view name);
++
++    /**
++     * @brief Forget every paired TV and persist the store.
++     * @return Number of TVs removed.
++     */
++    std::size_t remove_all();
++
++    /**
++     * @brief List paired TVs without their secrets.
++     * @return Paired TVs with empty secrets.
++     */
++    std::vector<tv_client_t> list() const;
++
++    /**
++     * @brief Count paired TVs.
++     * @return Number of paired TVs.
++     */
++    std::size_t count() const;
++
++  private:
++    /**
++     * @brief Read the store file.
++     */
++    void load();
++
++    /**
++     * @brief Atomically replace the store file.
++     */
++    void save() const;
++
++    std::filesystem::path _path;  ///< Store file.
++    mutable std::mutex _mutex;  ///< Protects @ref _clients.
++    std::vector<tv_client_t> _clients;  ///< Paired TVs, oldest first.
++  };
++
++  /**
++   * @brief Outcome of one PIN entered on a TV.
++   */
++  enum class pairing_attempt_e {
++    accepted,  ///< The PIN matched.
++    incorrect_pin,  ///< The PIN did not match; the window stays open.
++    not_open,  ///< No pairing window is open.
++    too_many_attempts,  ///< The PIN did not match and the window closed.
++  };
++
++  /**
++   * @brief State of the pairing window as shown on the PC.
++   */
++  enum class pairing_state_e {
++    idle,  ///< No window was opened.
++    waiting,  ///< A PIN is waiting for a TV.
++    paired,  ///< A TV paired.
++    expired,  ///< The PIN expired unused.
++    failed,  ///< Too many wrong PINs were entered.
++  };
++
++  /**
++   * @brief A short, explicitly opened window in which one TV may pair with the PIN shown on the PC.
++   *
++   * It closes on success, on expiry, or after @ref MAXIMUM_PIN_ATTEMPTS wrong PINs, so a device
++   * on the network cannot guess its way through the 10,000 possible PINs.
++   */
++  class tv_pairing_window_t {
++  public:
++    using clock = std::chrono::steady_clock;  ///< Clock used for expiry.
++
++    /**
++     * @brief Open the window with a new PIN.
++     * @param now Current time.
++     * @return The PIN to show on the PC.
++     */
++    std::string open(clock::time_point now);
++
++    /**
++     * @brief Check a PIN entered on a TV.
++     * @param pin PIN sent by the TV.
++     * @param now Current time.
++     * @return The outcome.
++     */
++    pairing_attempt_e attempt(std::string_view pin, clock::time_point now);
++
++    /**
++     * @brief Report the window state.
++     * @param now Current time.
++     * @return The state.
++     */
++    pairing_state_e state(clock::time_point now);
++
++    /**
++     * @brief Close an open window.
++     */
++    void close();
++
++  private:
++    /**
++     * @brief Expire the window when its PIN is past its lifetime.
++     * @param now Current time.
++     */
++    void expire(clock::time_point now);
++
++    std::string _pin;  ///< Current PIN.
++    clock::time_point _expires_at {};  ///< When the PIN expires.
++    int _failed_attempts = 0;  ///< Wrong PINs entered so far.
++    pairing_state_e _state = pairing_state_e::idle;  ///< Current state.
++  };
++}  // namespace webrtc_stream::tv_auth
+diff --git a/src/webrtc/webrtc_stream.cpp b/src/webrtc/webrtc_stream.cpp
+new file mode 100644
+index 00000000..28d75941
+--- /dev/null
++++ b/src/webrtc/webrtc_stream.cpp
+@@ -0,0 +1,1714 @@
++/**
++ * @file src/webrtc/webrtc_stream.cpp
++ * @brief Definitions for streaming to Moonlight WebRTC TVs directly from Sunshine.
++ */
++// standard includes
++#include <algorithm>
++#include <atomic>
++#include <charconv>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <fstream>
++#include <functional>
++#include <iterator>
++#include <memory>
++#include <mutex>
++#include <string_view>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <variant>
++
++// lib includes
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/ip/udp.hpp>
++#include <nlohmann/json.hpp>
++#include <openssl/evp.h>
++#include <rtc/rtc.hpp>
++
++// local includes
++#include "input_bridge.h"
++#include "protocol.h"
++#include "sdp.h"
++#include "src/audio.h"
++#include "src/config.h"
++#include "src/display_device.h"
++#include "src/globals.h"
++#include "src/input.h"
++#include "src/logging.h"
++#include "src/network.h"
++#include "src/platform/common.h"
++#include "src/process.h"
++#include "src/rtsp.h"
++#include "src/system_tray.h"
++#include "src/video.h"
++#include "tv_auth.h"
++#include "webrtc_stream.h"
++
++namespace webrtc_stream {
++  namespace {
++    using json = nlohmann::json;
++    using namespace std::literals;
++
++    /**
++     * @brief RTP SSRC of the video track.
++     */
++    constexpr rtc::SSRC VIDEO_SSRC = 42;
++    /**
++     * @brief RTP SSRC of the audio track.
++     */
++    constexpr rtc::SSRC AUDIO_SSRC = 43;
++    /**
++     * @brief RTP clock rate of video.
++     */
++    constexpr std::uint32_t VIDEO_CLOCK_RATE = 90000;
++    /**
++     * @brief RTP clock rate of Opus.
++     */
++    constexpr std::uint32_t AUDIO_CLOCK_RATE = 48000;
++    /**
++     * @brief RTCP canonical name of both tracks.
++     */
++    constexpr auto RTP_CNAME = "sunshine";
++    /**
++     * @brief Media stream both tracks belong to.
++     */
++    constexpr auto MEDIA_STREAM_ID = "stream1";
++    /**
++     * @brief Opus frame duration, as Moonlight requests on a LAN.
++     */
++    constexpr int AUDIO_PACKET_DURATION_MS = 5;
++    // Artwork is capped at 8 MiB before Base64 and JSON framing expand it for the WebSocket.
++    /**
++     * @brief Largest artwork sent to the TV.
++     */
++    constexpr std::size_t MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
++    /**
++     * @brief Largest WebSocket message, sized for Base64 artwork.
++     */
++    constexpr std::size_t MAX_WEBSOCKET_MESSAGE_SIZE = 12 * 1024 * 1024;
++    // Connections that have not authenticated yet; the oldest is dropped beyond this.
++    /**
++     * @brief Unauthenticated connections kept; the oldest is dropped beyond this.
++     */
++    constexpr std::size_t MAX_PENDING_CONNECTIONS = 8;
++    /**
++     * @brief How often a change of encoder support is checked.
++     */
++    constexpr auto CODEC_CHECK_INTERVAL = 5s;
++    /**
++     * @brief How long a stopped application may take to exit.
++     */
++    constexpr auto HOST_IDLE_TIMEOUT = 10s;
++
++    std::atomic_int active_streams {0};  ///< TV streams whose capture is running.
++    std::mutex host_mutex;  ///< Serializes launching and stopping host applications.
++
++    /**
++     * @brief Codecs the current encoder can produce, as probed by Sunshine.
++     */
++    struct codec_support_t {
++      bool hevc;  ///< HEVC Main.
++      bool hevc_main10;  ///< HEVC Main10.
++      bool av1;  ///< AV1 Main 8-bit.
++      bool av1_main10;  ///< AV1 Main 10-bit.
++
++      /**
++       * @brief Compare two probe results.
++       * @return True when every codec matches.
++       */
++      bool operator==(const codec_support_t &) const = default;
++    };
++
++    /**
++     * @brief Read the codecs found by Sunshine's last encoder probe.
++     * @return Codec support.
++     */
++    codec_support_t current_codec_support() {
++      const int hevc = video::active_hevc_mode;
++      const int av1 = video::active_av1_mode;
++      return {hevc >= 2, hevc == 3 || hevc == 5, av1 >= 2, av1 == 3 || av1 == 5};
++    }
++
++    /**
++     * @brief Describe codec support as the TV protocol does.
++     * @param codecs Codec support.
++     * @return Encoders beyond H.264 and HEVC.
++     */
++    protocol::encoder_support_t encoder_support(const codec_support_t &codecs) {
++      return {codecs.av1, codecs.av1 && codecs.av1_main10};
++    }
++
++    /**
++     * @brief Check requested settings against the encoder.
++     * @param settings Requested settings.
++     * @param codecs Codec support.
++     * @return Why the encoder cannot produce them, or nothing.
++     */
++    std::optional<std::string> unsupported_codec(const protocol::stream_settings_t &settings, const codec_support_t &codecs) {
++      switch (settings.codec) {
++        case protocol::video_codec_e::h264:
++          return std::nullopt;
++        case protocol::video_codec_e::hevc:
++          if (!codecs.hevc) {
++            return "This PC's encoder does not support HEVC"s;
++          }
++          if (settings.hdr && !codecs.hevc_main10) {
++            return "This PC's encoder does not support HEVC Main10 HDR"s;
++          }
++          return std::nullopt;
++        case protocol::video_codec_e::av1:
++          if (!codecs.av1) {
++            return "This PC's encoder does not support AV1"s;
++          }
++          if (settings.hdr && !codecs.av1_main10) {
++            return "This PC's encoder does not support AV1 10-bit HDR"s;
++          }
++          return std::nullopt;
++      }
++      return "Unsupported video codec"s;
++    }
++
++    /**
++     * @brief Encode bytes as Base64.
++     * @param bytes Bytes to encode.
++     * @return Base64 text.
++     */
++    std::string base64_encode(const std::vector<std::uint8_t> &bytes) {
++      if (bytes.empty()) {
++        return {};
++      }
++      std::string encoded(4 * ((bytes.size() + 2) / 3), '\0');
++      const int size = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(encoded.data()), bytes.data(), static_cast<int>(bytes.size()));
++      encoded.resize(size > 0 ? static_cast<std::size_t>(size) : 0);
++      return encoded;
++    }
++
++    /**
++     * @brief Identify PNG, JPEG or WebP data.
++     * @param bytes Image bytes.
++     * @return The media type, or nothing for other data.
++     */
++    std::optional<std::string> image_mime_type(const std::vector<std::uint8_t> &bytes) {
++      const auto starts_with = [&bytes](std::initializer_list<std::uint8_t> prefix, std::size_t offset = 0) {
++        return bytes.size() >= offset + prefix.size() && std::equal(prefix.begin(), prefix.end(), bytes.begin() + offset);
++      };
++      if (starts_with({0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})) {
++        return "image/png"s;
++      }
++      if (starts_with({0xFF, 0xD8, 0xFF})) {
++        return "image/jpeg"s;
++      }
++      if (starts_with({'R', 'I', 'F', 'F'}) && starts_with({'W', 'E', 'B', 'P'}, 8)) {
++        return "image/webp"s;
++      }
++      return std::nullopt;
++    }
++
++    /**
++     * @brief Parse a Sunshine application ID.
++     * @param text ID text.
++     * @return The ID, or nothing when it is not a non-negative integer.
++     */
++    std::optional<int> parse_app_id(std::string_view text) {
++      int value = 0;
++      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
++      if (parsed.ec != std::errc {} || parsed.ptr != text.data() + text.size() || value < 0) {
++        return std::nullopt;
++      }
++      return value;
++    }
++
++    /**
++     * @brief Find the Wake-on-LAN address of the adapter that routes to a peer.
++     * @param remote_address Peer address as "host:port".
++     * @return Upper-case colon-separated MAC address, or nothing when unknown.
++     */
++    std::optional<std::string> wake_on_lan_address(const std::optional<std::string> &remote_address) {
++      if (!remote_address) {
++        return std::nullopt;
++      }
++      try {
++        auto host = remote_address->substr(0, remote_address->rfind(':'));
++        if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
++          host = host.substr(1, host.size() - 2);
++        }
++        // Connecting a UDP socket only selects the route; it sends nothing.
++        boost::asio::io_context io;
++        boost::asio::ip::udp::socket socket(io);
++        const auto peer = boost::asio::ip::make_address(host);
++        socket.connect({peer, 9});
++        const auto local = socket.local_endpoint().address();
++        if (local.is_loopback()) {
++          return std::nullopt;
++        }
++        auto mac = platf::get_mac_address(net::addr_to_normalized_string(local));
++        std::ranges::transform(mac, mac.begin(), [](unsigned char character) {
++          return static_cast<char>(std::toupper(character));
++        });
++        if (mac.empty() || mac == "00:00:00:00:00:00") {
++          return std::nullopt;
++        }
++        return mac;
++      } catch (const std::exception &) {
++        return std::nullopt;
++      }
++    }
++
++    /**
++     * @brief Apply Sunshine's encoded-byte substitutions to an IDR frame, as the GameStream sender does.
++     */
++    std::vector<std::uint8_t> apply_replacements(std::string_view payload, const std::vector<video::packet_raw_t::replace_t> &replacements) {
++      std::vector<std::uint8_t> result(payload.begin(), payload.end());
++      for (const auto &replacement : replacements) {
++        const std::string_view current {reinterpret_cast<const char *>(result.data()), result.size()};
++        const auto position = current.find(replacement.old);
++        if (position == std::string_view::npos) {
++          continue;
++        }
++        std::vector<std::uint8_t> replaced;
++        replaced.reserve(result.size() - replacement.old.size() + replacement._new.size());
++        replaced.insert(replaced.end(), result.begin(), result.begin() + position);
++        replaced.insert(replaced.end(), replacement._new.begin(), replacement._new.end());
++        replaced.insert(replaced.end(), result.begin() + position + replacement.old.size(), result.end());
++        result = std::move(replaced);
++      }
++      return result;
++    }
++
++    /**
++     * @brief One WebRTC stream: its PeerConnection and, once connected, its capture pipeline.
++     */
++    struct stream_t {
++      std::uint64_t id = 0;  ///< Session ID shared with the TV.
++      protocol::stream_settings_t settings;  ///< Requested settings.
++      int app_id = 0;  ///< Sunshine application ID.
++      std::string client_id;  ///< Paired TV ID, used as the stable input identity.
++      std::string client_name;  ///< Paired TV name.
++
++      std::shared_ptr<rtc::PeerConnection> peer;  ///< PeerConnection to the TV.
++      std::shared_ptr<rtc::Track> video_track;  ///< Send-only video track.
++      std::shared_ptr<rtc::Track> audio_track;  ///< Send-only audio track.
++      std::shared_ptr<rtc::DataChannel> control_channel;  ///< Ordered, reliable control channel.
++      std::shared_ptr<rtc::DataChannel> gamepad_channel;  ///< Unordered, unreliable gamepad snapshots.
++      std::shared_ptr<rtc::RtpPacketizationConfig> video_rtp;  ///< Video RTP state.
++      std::shared_ptr<rtc::RtpPacketizationConfig> audio_rtp;  ///< Audio RTP state.
++      std::shared_ptr<input_bridge_t> input_bridge;  ///< Gamepad translation for the whole stream.
++
++      std::mutex input_mutex;  ///< Protects @ref input.
++      std::shared_ptr<input::input_t> input;  ///< Sunshine input state while capturing.
++
++      std::mutex mutex;  ///< Protects the flags below.
++      std::condition_variable condition;  ///< Signals flag changes.
++      bool peer_connected = false;  ///< PeerConnection is connected.
++      bool video_open = false;  ///< Video track is open.
++      bool audio_open = false;  ///< Audio track is open.
++      bool stop_requested = false;  ///< The stream must end.
++      std::optional<std::string> failure;  ///< Why the host ended the stream.
++      safe::mail_raw_t::event_t<bool> idr_event;  ///< Keyframe requests, once capture runs.
++
++      std::mutex candidate_mutex;  ///< Protects candidate buffering.
++      bool has_remote_description = false;  ///< Whether the answer was applied.
++      std::vector<std::pair<std::string, std::string>> pending_candidates;  ///< Candidates received before the answer.
++
++      std::jthread control_thread;  ///< Runs the capture pipeline.
++
++      /**
++       * @brief Ask the stream to end.
++       * @param reason Failure shown on the TV, when the host ended the stream.
++       */
++      void request_stop(std::optional<std::string> reason = std::nullopt) {
++        {
++          std::lock_guard lock(mutex);
++          if (reason && !stop_requested && !failure) {
++            failure = std::move(reason);
++          }
++          stop_requested = true;
++        }
++        condition.notify_all();
++      }
++
++      /**
++       * @brief Check whether the stream must end.
++       * @return True once a stop was requested.
++       */
++      bool stopping() {
++        std::lock_guard lock(mutex);
++        return stop_requested;
++      }
++    };
++
++    /**
++     * @brief One TV WebSocket connection.
++     */
++    struct connection_t {
++      std::shared_ptr<rtc::WebSocket> socket;  ///< Signaling WebSocket.
++      std::mutex send_mutex;  ///< Serializes sends.
++
++      std::mutex mutex;  ///< Protects the state below.
++      bool authenticated = false;  ///< Whether the TV proved it is paired.
++      std::string nonce;  ///< Single-use authentication nonce.
++      std::optional<std::string> mac_address;  ///< Wake-on-LAN address facing this TV.
++      std::string client_id;  ///< Authenticated TV ID.
++      std::string client_name;  ///< Authenticated TV name.
++      std::shared_ptr<stream_t> stream;  ///< Current stream.
++      bool host_operation_active = false;  ///< A stop or switch is in progress.
++    };
++
++    /**
++     * @brief The TV signaling server.
++     */
++    class server_t {
++    public:
++      server_t():
++          _tv_clients(platf::appdata() / "webrtc_tv_clients.json") {
++        rtc::WebSocketServer::Configuration configuration;
++        configuration.port = static_cast<std::uint16_t>(config::webrtc.port);
++        configuration.enableTls = false;
++        configuration.bindAddress = "0.0.0.0";
++        configuration.maxMessageSize = MAX_WEBSOCKET_MESSAGE_SIZE;
++        _server = std::make_unique<rtc::WebSocketServer>(configuration);
++        _server->onClient([this](std::shared_ptr<rtc::WebSocket> socket) {
++          accept(std::move(socket));
++        });
++        _codecs = current_codec_support();
++        BOOST_LOG(info) << "WebRTC: TV server listening on port "sv << config::webrtc.port << ", "sv << _tv_clients.count() << " paired TV(s)"sv;
++      }
++
++      ~server_t() {
++        // Stop accepting first; the callbacks below capture this server.
++        _server->stop();
++        std::vector<std::shared_ptr<connection_t>> connections;
++        {
++          std::lock_guard lock(_connections_mutex);
++          connections = _pending;
++          if (_active) {
++            connections.push_back(_active);
++          }
++          _pending.clear();
++          _active.reset();
++        }
++        for (const auto &connection : connections) {
++          connection->socket->resetCallbacks();
++          stop_stream(connection, false);
++          connection->socket->close();
++        }
++      }
++
++      /**
++       * @brief Serve until Sunshine shuts down, announcing encoder changes to the TV.
++       */
++      void run() {
++        auto shutdown_event = mail::man->event<bool>(mail::shutdown);
++        auto next_check = std::chrono::steady_clock::now() + CODEC_CHECK_INTERVAL;
++        while (!shutdown_event->view(500ms)) {
++          if (std::chrono::steady_clock::now() < next_check) {
++            continue;
++          }
++          next_check = std::chrono::steady_clock::now() + CODEC_CHECK_INTERVAL;
++          // Encoders are re-probed before each stream, and a hardware encoder can appear later.
++          const auto codecs = current_codec_support();
++          std::shared_ptr<connection_t> active;
++          {
++            std::lock_guard lock(_connections_mutex);
++            if (codecs == _codecs) {
++              continue;
++            }
++            _codecs = codecs;
++            active = _active;
++          }
++          BOOST_LOG(info) << "WebRTC: encoder codec support changed"sv;
++          if (active) {
++            send(active, protocol::make_capabilities(encoder_support(codecs)));
++          }
++        }
++      }
++
++      /**
++       * @brief Open the TV pairing window.
++       * @return The PIN.
++       */
++      std::string open_pairing() {
++        std::string pin;
++        {
++          std::lock_guard lock(_pairing_mutex);
++          pin = _pairing.open(tv_auth::tv_pairing_window_t::clock::now());
++        }
++        BOOST_LOG(info) << "WebRTC: TV pairing opened for two minutes"sv;
++        return pin;
++      }
++
++      /**
++       * @brief Report the TV pairing window state.
++       * @return The state code.
++       */
++      std::string pairing_status() {
++        std::lock_guard lock(_pairing_mutex);
++        switch (_pairing.state(tv_auth::tv_pairing_window_t::clock::now())) {
++          case tv_auth::pairing_state_e::waiting:
++            return "tv-pairing-waiting";
++          case tv_auth::pairing_state_e::paired:
++            return "tv-paired";
++          case tv_auth::pairing_state_e::expired:
++            return "tv-pairing-expired";
++          case tv_auth::pairing_state_e::failed:
++            return "tv-pairing-locked";
++          case tv_auth::pairing_state_e::idle:
++            break;
++        }
++        return "tv-pairing-idle";
++      }
++
++      /**
++       * @brief List paired TVs.
++       * @return Paired TVs.
++       */
++      std::vector<paired_tv_t> paired() const {
++        std::vector<paired_tv_t> result;
++        for (const auto &client : _tv_clients.list()) {
++          result.push_back({client.id, client.name});
++        }
++        return result;
++      }
++
++      /**
++       * @brief Forget every TV, cutting off the connected one too.
++       * @return Number of TVs removed.
++       */
++      std::size_t forget_tvs() {
++        const auto removed = _tv_clients.remove_all();
++        {
++          std::lock_guard lock(_pairing_mutex);
++          _pairing.close();
++        }
++        std::vector<std::shared_ptr<connection_t>> connections;
++        {
++          std::lock_guard lock(_connections_mutex);
++          connections = _pending;
++          if (_active) {
++            connections.push_back(_active);
++          }
++        }
++        for (const auto &connection : connections) {
++          connection->socket->close();
++        }
++        BOOST_LOG(info) << "WebRTC: removed "sv << removed << " paired TV(s)"sv;
++        return removed;
++      }
++
++    private:
++      /**
++       * @brief Accept a TV connection and wait for it to authenticate.
++       * @param socket New WebSocket.
++       */
++      void accept(std::shared_ptr<rtc::WebSocket> socket) {
++        auto connection = std::make_shared<connection_t>();
++        connection->socket = std::move(socket);
++
++        // A connection that has not authenticated must not displace the TV that may be
++        // streaming, so it waits beside the active one until it authenticates.
++        std::shared_ptr<connection_t> evicted;
++        {
++          std::lock_guard lock(_connections_mutex);
++          if (_pending.size() >= MAX_PENDING_CONNECTIONS) {
++            evicted = _pending.front();
++            _pending.erase(_pending.begin());
++          }
++          _pending.push_back(connection);
++        }
++        if (evicted) {
++          evicted->socket->close();
++        }
++
++        const std::weak_ptr<connection_t> weak = connection;
++        connection->socket->onOpen([this, weak] {
++          if (const auto connection = weak.lock()) {
++            auto mac = wake_on_lan_address(connection->socket->remoteAddress());
++            auto nonce = tv_auth::random_hex(tv_auth::NONCE_BYTES);
++            {
++              std::lock_guard lock(connection->mutex);
++              connection->nonce = nonce;
++              connection->mac_address = mac;
++            }
++            BOOST_LOG(info) << "WebRTC: TV connected from "sv << connection->socket->remoteAddress().value_or("unknown"s) << "; awaiting authentication"sv;
++            // Sunshine is the server itself, so streaming is available whenever it answers.
++            send(connection, protocol::make_auth_required(nonce, mac, true));
++          }
++        });
++        connection->socket->onClosed([this, weak] {
++          if (const auto connection = weak.lock()) {
++            BOOST_LOG(info) << "WebRTC: TV disconnected"sv;
++            close(connection);
++          }
++        });
++        connection->socket->onError([](const std::string &message) {
++          BOOST_LOG(warning) << "WebRTC: WebSocket error: "sv << message;
++        });
++        connection->socket->onMessage([this, weak](rtc::message_variant data) {
++          if (!std::holds_alternative<std::string>(data)) {
++            return;
++          }
++          if (const auto connection = weak.lock()) {
++            handle_message(connection, std::get<std::string>(data));
++          }
++        });
++      }
++
++      /**
++       * @brief Forget a closed connection and end its stream.
++       * @param connection Connection.
++       */
++      void close(const std::shared_ptr<connection_t> &connection) {
++        stop_stream(connection, false);
++        std::lock_guard lock(_connections_mutex);
++        std::erase(_pending, connection);
++        if (_active == connection) {
++          _active.reset();
++        }
++      }
++
++      /**
++       * @brief Send a message to a TV, ignoring a closed socket.
++       * @param connection Connection.
++       * @param message Message.
++       */
++      void send(const std::shared_ptr<connection_t> &connection, const json &message) {
++        const auto payload = message.dump();
++        std::lock_guard lock(connection->send_mutex);
++        try {
++          if (connection->socket && connection->socket->isOpen() && payload.size() <= MAX_WEBSOCKET_MESSAGE_SIZE) {
++            connection->socket->send(payload);
++          }
++        } catch (const std::exception &e) {
++          BOOST_LOG(warning) << "WebRTC: message not sent: "sv << e.what();
++        }
++      }
++
++      /**
++       * @brief Dispatch a TV message; only authentication and pairing are allowed before authenticating.
++       * @param connection Connection.
++       * @param text JSON text.
++       */
++      void handle_message(const std::shared_ptr<connection_t> &connection, const std::string &text) {
++        try {
++          const auto message = protocol::parse_client_message(text);
++          bool authenticated;
++          {
++            std::lock_guard lock(connection->mutex);
++            authenticated = connection->authenticated;
++          }
++          if (const auto *request = std::get_if<protocol::authenticate_t>(&message.payload)) {
++            if (authenticated) {
++              send(connection, protocol::make_error(message.type, "already-authenticated", "This TV is already authenticated"));
++            } else {
++              authenticate(connection, *request);
++            }
++            return;
++          }
++          if (const auto *request = std::get_if<protocol::pair_client_t>(&message.payload)) {
++            if (authenticated) {
++              send(connection, protocol::make_error(message.type, "already-authenticated", "This TV is already paired"));
++            } else {
++              pair(connection, *request);
++            }
++            return;
++          }
++          if (!authenticated) {
++            send(connection, protocol::make_error(message.type, "not-authenticated", "Pair this TV with Sunshine first"));
++            return;
++          }
++
++          if (std::holds_alternative<protocol::get_apps_t>(message.payload)) {
++            send_apps(connection);
++          } else if (const auto *artwork = std::get_if<protocol::get_app_artwork_t>(&message.payload)) {
++            send_artwork(connection, artwork->app_id);
++          } else if (const auto *start = std::get_if<protocol::start_session_t>(&message.payload)) {
++            start_stream(connection, start->app_id, start->settings);
++          } else if (std::holds_alternative<protocol::stop_session_t>(message.payload)) {
++            stop_stream(connection, true);
++          } else if (std::holds_alternative<protocol::stop_host_session_t>(message.payload)) {
++            stop_or_switch_host(connection, std::nullopt);
++          } else if (const auto *target = std::get_if<protocol::switch_session_t>(&message.payload)) {
++            stop_or_switch_host(connection, protocol::start_session_t {target->app_id, target->settings});
++          } else if (const auto *answer = std::get_if<protocol::answer_t>(&message.payload)) {
++            handle_answer(connection, *answer);
++          } else if (const auto *candidate = std::get_if<protocol::candidate_t>(&message.payload)) {
++            handle_candidate(connection, *candidate);
++          }
++        } catch (const protocol::protocol_error_t &e) {
++          BOOST_LOG(warning) << "WebRTC: protocol error: "sv << e.what();
++          send(connection, protocol::make_error("unknown", e.code(), e.what()));
++        } catch (const std::exception &e) {
++          BOOST_LOG(error) << "WebRTC: control error: "sv << e.what();
++          send(connection, protocol::make_error("unknown", "internal-error", e.what()));
++        }
++      }
++
++      /**
++       * @brief Check a paired TV's proof against the connection nonce.
++       * @param connection Connection.
++       * @param request Authentication request.
++       */
++      void authenticate(const std::shared_ptr<connection_t> &connection, const protocol::authenticate_t &request) {
++        std::string nonce;
++        {
++          std::lock_guard lock(connection->mutex);
++          nonce = std::exchange(connection->nonce, {});
++        }
++        const auto client = _tv_clients.find(request.client_id);
++        if (nonce.empty() || !client || !tv_auth::constant_time_equals(tv_auth::authentication_proof(client->secret, nonce), request.proof)) {
++          BOOST_LOG(warning) << "WebRTC: TV authentication rejected"sv;
++          send(connection, protocol::make_error("authenticate", "authentication-failed", "This TV is not paired with Sunshine"));
++          return;
++        }
++        BOOST_LOG(info) << "WebRTC: TV authenticated: "sv << client->name;
++        send(connection, protocol::make_authenticated());
++        promote(connection, *client);
++      }
++
++      /**
++       * @brief Pair a TV with the PIN shown on the PC.
++       * @param connection Connection.
++       * @param request Pairing request.
++       */
++      void pair(const std::shared_ptr<connection_t> &connection, const protocol::pair_client_t &request) {
++        tv_auth::pairing_attempt_e outcome;
++        {
++          std::lock_guard lock(_pairing_mutex);
++          outcome = _pairing.attempt(request.pin, tv_auth::tv_pairing_window_t::clock::now());
++        }
++        switch (outcome) {
++          case tv_auth::pairing_attempt_e::not_open:
++            send(connection, protocol::make_error("pair-client", "pairing-not-open", "Open Sunshine's Web UI on the PC, choose Pair TV, then enter the PIN it shows"));
++            return;
++          case tv_auth::pairing_attempt_e::incorrect_pin:
++            BOOST_LOG(warning) << "WebRTC: TV pairing, incorrect PIN"sv;
++            send(connection, protocol::make_error("pair-client", "incorrect-pin", "Incorrect PIN. Check the PIN shown on the PC"));
++            return;
++          case tv_auth::pairing_attempt_e::too_many_attempts:
++            BOOST_LOG(warning) << "WebRTC: TV pairing closed after too many incorrect PINs"sv;
++            send(connection, protocol::make_error("pair-client", "too-many-attempts", "Too many incorrect PINs. Start pairing again on the PC"));
++            return;
++          case tv_auth::pairing_attempt_e::accepted:
++            break;
++        }
++
++        tv_auth::tv_client_t client;
++        try {
++          client = _tv_clients.add(request.client_name);
++        } catch (const std::exception &e) {
++          BOOST_LOG(error) << "WebRTC: TV pairing could not be saved: "sv << e.what();
++          send(connection, protocol::make_error("pair-client", "pairing-failed", "Sunshine could not save this TV"));
++          return;
++        }
++        BOOST_LOG(info) << "WebRTC: TV paired: "sv << client.name;
++        send(connection, protocol::make_paired(client.id, client.secret));
++        promote(connection, client);
++      }
++
++      /**
++       * @brief Make an authenticated connection the active TV, closing the one it replaces.
++       */
++      void promote(const std::shared_ptr<connection_t> &connection, const tv_auth::tv_client_t &client) {
++        std::shared_ptr<connection_t> previous;
++        codec_support_t codecs;
++        {
++          std::lock_guard lock(_connections_mutex);
++          const auto pending = std::ranges::find(_pending, connection);
++          if (pending == _pending.end()) {
++            return;
++          }
++          _pending.erase(pending);
++          previous = std::exchange(_active, connection);
++          codecs = _codecs;
++        }
++        {
++          std::lock_guard lock(connection->mutex);
++          connection->authenticated = true;
++          connection->nonce.clear();
++          connection->client_id = client.id;
++          connection->client_name = client.name;
++        }
++        if (previous) {
++          previous->socket->close();
++        }
++        send(connection, protocol::make_gateway_status(status(connection)));
++        send(connection, protocol::make_capabilities(encoder_support(codecs)));
++        send(connection, protocol::make_session_status("idle"));
++      }
++
++      /**
++       * @brief Describe the server for a TV.
++       * @param connection Connection.
++       * @return Server status.
++       */
++      protocol::gateway_status_t status(const std::shared_ptr<connection_t> &connection) {
++        protocol::gateway_status_t status;
++        status.gateway_name = config::nvhttp.sunshine_name;
++        {
++          std::lock_guard lock(connection->mutex);
++          status.session_active = connection->stream != nullptr;
++          status.mac_address = connection->mac_address;
++        }
++        if (const int running = proc::proc.running(); running != 0) {
++          status.running_app_id = std::to_string(running);
++        }
++        return status;
++      }
++
++      /**
++       * @brief List Sunshine's applications, re-reading the apps file when it changed.
++       * @return Applications.
++       */
++      std::vector<protocol::application_t> applications() {
++        proc::refresh(config::stream.file_apps);
++        const int running = proc::proc.running();
++        std::vector<protocol::application_t> result;
++        std::lock_guard lock(_artwork_mutex);
++        for (const auto &app : proc::proc.get_apps()) {
++          const auto cached = _artwork.find(app.id);
++          result.push_back({app.id, app.name, cached != _artwork.end() && cached->second.has_value(), app.id == std::to_string(running)});
++        }
++        return result;
++      }
++
++      /**
++       * @brief Send the application list.
++       * @param connection Connection.
++       */
++      void send_apps(const std::shared_ptr<connection_t> &connection) {
++        try {
++          const auto apps = applications();
++          send(connection, protocol::make_apps(apps));
++        } catch (const std::exception &e) {
++          send(connection, protocol::make_error("get-apps", "sunshine-unavailable", e.what()));
++        }
++      }
++
++      /**
++       * @brief Send an application's cover art, caching the result.
++       * @param connection Connection.
++       * @param app_id Application ID.
++       */
++      void send_artwork(const std::shared_ptr<connection_t> &connection, const std::string &app_id) {
++        std::optional<std::pair<std::string, std::string>> artwork;
++        {
++          std::lock_guard lock(_artwork_mutex);
++          if (const auto cached = _artwork.find(app_id); cached != _artwork.end()) {
++            artwork = cached->second;
++          }
++        }
++        if (!artwork) {
++          if (const auto id = parse_app_id(app_id)) {
++            std::ifstream file(proc::proc.get_app_image(*id), std::ios::binary);
++            std::vector<std::uint8_t> bytes;
++            if (file) {
++              bytes.assign(std::istreambuf_iterator<char>(file), {});
++            }
++            if (const auto mime = image_mime_type(bytes); mime && bytes.size() <= MAX_ARTWORK_BYTES) {
++              artwork = std::make_pair(*mime, base64_encode(bytes));
++            }
++          }
++          std::lock_guard lock(_artwork_mutex);
++          _artwork[app_id] = artwork;
++        }
++        send(connection, artwork ? protocol::make_app_artwork(app_id, true, artwork->first, artwork->second) : protocol::make_app_artwork(app_id, false));
++      }
++
++      /**
++       * @brief Send a stream state change.
++       * @param connection Connection.
++       * @param stream Stream.
++       * @param state New state.
++       * @param detail Optional detail.
++       */
++      void send_session_status(const std::shared_ptr<connection_t> &connection, const std::shared_ptr<stream_t> &stream, std::string_view state, std::optional<std::string> detail = std::nullopt) {
++        send(connection, protocol::make_session_status(state, stream->id, stream->settings, std::move(detail)));
++        BOOST_LOG(info) << "WebRTC: session "sv << stream->id << ": "sv << state;
++      }
++
++      /**
++       * @brief Check whether a stream is still the connection's stream.
++       * @param connection Connection.
++       * @param stream Stream.
++       * @return True when it is.
++       */
++      bool is_current(const std::shared_ptr<connection_t> &connection, const std::shared_ptr<stream_t> &stream) {
++        std::lock_guard lock(connection->mutex);
++        return connection->stream == stream;
++      }
++
++      /**
++       * @brief Validate a start request and begin WebRTC negotiation.
++       * @param connection Connection.
++       * @param app_id Application ID.
++       * @param settings Validated settings.
++       */
++      void start_stream(const std::shared_ptr<connection_t> &connection, const std::string &app_id, const protocol::stream_settings_t &settings) {
++        std::string client_id;
++        std::string client_name;
++        {
++          std::lock_guard lock(connection->mutex);
++          if (connection->host_operation_active) {
++            send(connection, protocol::make_error("start-session", "host-operation-active", "Wait for the current Sunshine operation to complete"));
++            return;
++          }
++          if (connection->stream) {
++            send(connection, protocol::make_error("start-session", "session-active", "Stop the active session before starting another"));
++            return;
++          }
++          client_id = connection->client_id;
++          client_name = connection->client_name;
++        }
++
++        std::optional<int> numeric_id;
++        std::string title;
++        for (const auto &app : applications()) {
++          if (app.id == app_id) {
++            numeric_id = parse_app_id(app.id);
++            title = app.title;
++          }
++        }
++        if (!numeric_id) {
++          send(connection, protocol::make_error("start-session", "invalid-application", "Selected Sunshine application no longer exists"));
++          return;
++        }
++
++        auto stream = std::make_shared<stream_t>();
++        stream->id = _next_session_id++;
++        stream->settings = settings;
++        stream->app_id = *numeric_id;
++        stream->client_id = client_id;
++        stream->client_name = client_name;
++        {
++          std::lock_guard lock(connection->mutex);
++          connection->stream = stream;
++        }
++        BOOST_LOG(info) << "WebRTC: starting "sv << title << " at "sv << settings.width << 'x' << settings.height << '@' << settings.fps << ", "sv << protocol::codec_name(settings.codec) << ", "sv << settings.bitrate_kbps << " kbps, HDR "sv << (settings.hdr ? "on"sv : "off"sv);
++
++        send_session_status(connection, stream, "starting");
++        send_session_status(connection, stream, "starting-webrtc");
++        try {
++          create_peer_connection(connection, stream);
++        } catch (const std::exception &e) {
++          BOOST_LOG(error) << "WebRTC: session startup failed: "sv << e.what();
++          send_session_status(connection, stream, "error", e.what());
++          stop_stream(connection, true);
++        }
++      }
++
++      /**
++       * @brief Create the PeerConnection, its tracks and channels, and send the offer.
++       * @param connection Connection.
++       * @param stream Stream.
++       */
++      void create_peer_connection(const std::shared_ptr<connection_t> &connection, const std::shared_ptr<stream_t> &stream) {
++        const auto &settings = stream->settings;
++        const std::weak_ptr<connection_t> weak_connection = connection;
++        const std::weak_ptr<stream_t> weak_stream = stream;
++
++        rtc::Configuration configuration;
++        configuration.disableAutoNegotiation = true;
++        stream->peer = std::make_shared<rtc::PeerConnection>(configuration);
++
++        stream->peer->onStateChange([weak_stream](rtc::PeerConnection::State state) {
++          const auto stream = weak_stream.lock();
++          if (!stream) {
++            return;
++          }
++          BOOST_LOG(debug) << "WebRTC: PeerConnection state "sv << static_cast<int>(state);
++          const bool lost = state == rtc::PeerConnection::State::Disconnected || state == rtc::PeerConnection::State::Failed || state == rtc::PeerConnection::State::Closed;
++          if (lost && stream->input_bridge) {
++            stream->input_bridge->on_transport_closed();
++          }
++          {
++            std::lock_guard lock(stream->mutex);
++            stream->peer_connected = state == rtc::PeerConnection::State::Connected;
++            if (lost) {
++              stream->stop_requested = true;
++            }
++          }
++          stream->condition.notify_all();
++        });
++
++        stream->peer->onLocalDescription([this, weak_connection, weak_stream](rtc::Description description) {
++          const auto connection = weak_connection.lock();
++          const auto stream = weak_stream.lock();
++          if (!connection || !stream || description.type() != rtc::Description::Type::Offer || !is_current(connection, stream)) {
++            return;
++          }
++          const std::string offer(description);
++          std::optional<std::string> problem;
++          if (!sdp::has_valid_game_mode_image_attribute(offer, stream->settings)) {
++            problem = "Invalid Samsung Game Mode SDP imageattr";
++          } else if (!sdp::has_expected_video_codec(offer, stream->settings.codec)) {
++            problem = "WebRTC SDP does not contain the requested video codec";
++          } else if (!sdp::has_expected_hevc_format_parameters(offer, stream->settings)) {
++            problem = "WebRTC SDP does not contain the requested HEVC Main10 profile";
++          } else if (!sdp::has_data_channel_section(offer)) {
++            problem = "Missing WebRTC data-channel SDP section";
++          }
++          if (problem) {
++            BOOST_LOG(error) << "WebRTC: "sv << *problem;
++            send_session_status(connection, stream, "error", problem);
++            stream->request_stop();
++            return;
++          }
++          send(connection, protocol::make_offer(stream->id, offer));
++        });
++
++        stream->peer->onLocalCandidate([this, weak_connection, weak_stream](rtc::Candidate candidate) {
++          const auto connection = weak_connection.lock();
++          const auto stream = weak_stream.lock();
++          if (connection && stream && is_current(connection, stream)) {
++            send(connection, protocol::make_candidate(stream->id, candidate.candidate(), candidate.mid()));
++          }
++        });
++
++        // Controllers the TV announces before capture starts are kept and announced to Sunshine
++        // once its input state exists; input arriving before then is dropped.
++        stream->input_bridge = std::make_shared<input_bridge_t>(
++          make_packet_input_api([weak_stream](std::vector<std::uint8_t> &&packet) {
++            if (const auto stream = weak_stream.lock()) {
++              std::lock_guard lock(stream->input_mutex);
++              if (stream->input) {
++                input::passthrough(stream->input, std::move(packet));
++              }
++            }
++          }),
++          [weak_stream](const std::string &message) {
++            const auto stream = weak_stream.lock();
++            if (!stream || !stream->control_channel || !stream->control_channel->isOpen()) {
++              return;
++            }
++            try {
++              stream->control_channel->send(message);
++            } catch (const std::exception &) {
++              // The TV can close while a queued haptic message is sent.
++            }
++          }
++        );
++
++        rtc::DataChannelInit control_options;
++        control_options.reliability.unordered = false;
++        stream->control_channel = stream->peer->createDataChannel("control", control_options);
++        stream->control_channel->onMessage([weak_stream](rtc::message_variant data) {
++          const auto stream = weak_stream.lock();
++          if (stream && std::holds_alternative<std::string>(data) && !stream->input_bridge->handle_control_message(std::get<std::string>(data))) {
++            BOOST_LOG(warning) << "WebRTC: rejected malformed gamepad control message"sv;
++          }
++        });
++        stream->control_channel->onClosed([weak_stream] {
++          if (const auto stream = weak_stream.lock()) {
++            stream->input_bridge->on_transport_closed();
++          }
++        });
++
++        rtc::DataChannelInit gamepad_options;
++        gamepad_options.reliability.unordered = true;
++        gamepad_options.reliability.maxRetransmits = 0;
++        stream->gamepad_channel = stream->peer->createDataChannel("gamepad", gamepad_options);
++        stream->gamepad_channel->onMessage([weak_stream](rtc::message_variant data) {
++          const auto stream = weak_stream.lock();
++          if (stream && std::holds_alternative<std::string>(data)) {
++            stream->input_bridge->handle_gamepad_message(std::get<std::string>(data));
++          }
++        });
++        stream->gamepad_channel->onClosed([weak_stream] {
++          if (const auto stream = weak_stream.lock()) {
++            stream->input_bridge->on_transport_closed();
++          }
++        });
++
++        rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
++        switch (settings.codec) {
++          case protocol::video_codec_e::hevc:
++            video.addH265Codec(sdp::VIDEO_PAYLOAD_TYPE, sdp::hevc_format_parameters(settings));
++            break;
++          case protocol::video_codec_e::av1:
++            video.addAV1Codec(sdp::VIDEO_PAYLOAD_TYPE);
++            break;
++          case protocol::video_codec_e::h264:
++            video.addH264Codec(sdp::VIDEO_PAYLOAD_TYPE);
++            break;
++        }
++        video.addAttribute(sdp::game_mode_image_attribute(settings));
++        if (settings.hdr) {
++          // Offered as the Gateway did, but never sent: Tizen decoded no frames with it present,
++          // and the HEVC VUI/SEI or AV1 sequence header already carry the colour description.
++          video.addExtMap(rtc::Description::Entry::ExtMap(9, "http://www.webrtc.org/experiments/rtp-hdrext/color-space"));
++        }
++        video.addSSRC(VIDEO_SSRC, RTP_CNAME, MEDIA_STREAM_ID, "video");
++        stream->video_track = stream->peer->addTrack(video);
++
++        stream->video_rtp = std::make_shared<rtc::RtpPacketizationConfig>(VIDEO_SSRC, RTP_CNAME, sdp::VIDEO_PAYLOAD_TYPE, VIDEO_CLOCK_RATE);
++        std::shared_ptr<rtc::RtpPacketizer> packetizer;
++        switch (settings.codec) {
++          case protocol::video_codec_e::hevc:
++            packetizer = std::make_shared<rtc::H265RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, stream->video_rtp);
++            break;
++          case protocol::video_codec_e::av1:
++            // Each encoded frame is one AV1 temporal unit of size-delimited OBUs.
++            packetizer = std::make_shared<rtc::AV1RtpPacketizer>(rtc::AV1RtpPacketizer::Packetization::TemporalUnit, stream->video_rtp);
++            break;
++          case protocol::video_codec_e::h264:
++            packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, stream->video_rtp);
++            break;
++        }
++        packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(stream->video_rtp));
++        packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
++        packetizer->addToChain(std::make_shared<rtc::PliHandler>([weak_stream] {
++          const auto stream = weak_stream.lock();
++          if (!stream) {
++            return;
++          }
++          // Sunshine encodes the next frame as IDR; no intermediate client has to ask for it.
++          std::lock_guard lock(stream->mutex);
++          if (stream->idr_event) {
++            stream->idr_event->raise(true);
++          }
++        }));
++        stream->video_track->setMediaHandler(packetizer);
++        stream->video_track->onOpen([weak_stream] {
++          if (const auto stream = weak_stream.lock()) {
++            {
++              std::lock_guard lock(stream->mutex);
++              stream->video_open = true;
++            }
++            stream->condition.notify_all();
++          }
++        });
++        stream->video_track->onClosed([weak_stream] {
++          if (const auto stream = weak_stream.lock()) {
++            stream->request_stop();
++          }
++        });
++
++        rtc::Description::Audio audio("audio", rtc::Description::Direction::SendOnly);
++        audio.addOpusCodec(sdp::AUDIO_PAYLOAD_TYPE, "minptime=20;maxaveragebitrate=128000;stereo=1;sprop-stereo=1;useinbandfec=0");
++        audio.addSSRC(AUDIO_SSRC, RTP_CNAME, MEDIA_STREAM_ID, "audio");
++        stream->audio_track = stream->peer->addTrack(audio);
++
++        stream->audio_rtp = std::make_shared<rtc::RtpPacketizationConfig>(AUDIO_SSRC, RTP_CNAME, sdp::AUDIO_PAYLOAD_TYPE, AUDIO_CLOCK_RATE);
++        auto audio_packetizer = std::make_shared<rtc::OpusRtpPacketizer>(stream->audio_rtp);
++        audio_packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(stream->audio_rtp));
++        audio_packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
++        stream->audio_track->setMediaHandler(audio_packetizer);
++        stream->audio_track->onOpen([weak_stream] {
++          if (const auto stream = weak_stream.lock()) {
++            {
++              std::lock_guard lock(stream->mutex);
++              stream->audio_open = true;
++            }
++            stream->condition.notify_all();
++          }
++        });
++        stream->audio_track->onClosed([weak_stream] {
++          if (const auto stream = weak_stream.lock()) {
++            stream->request_stop();
++          }
++        });
++
++        stream->control_thread = std::jthread([this, weak_connection, stream] {
++          run_stream(weak_connection, stream);
++        });
++
++        stream->peer->setLocalDescription();
++      }
++
++      /**
++       * @brief Launch or resume the application and prepare the display, as a GameStream launch does.
++       * @return Why the host cannot stream, or nothing on success.
++       */
++      std::optional<std::string> prepare_host(const stream_t &stream) {
++        std::lock_guard lock(host_mutex);
++        const int running = proc::proc.running();
++        if (running != 0 && running != stream.app_id) {
++          return "An app is already running on this host"s;
++        }
++
++        auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
++        launch_session->id = 0;
++        launch_session->host_audio = false;
++        launch_session->unique_id = "webrtc-" + stream.client_id;
++        launch_session->client_name = stream.client_name;
++        launch_session->width = stream.settings.width;
++        launch_session->height = stream.settings.height;
++        launch_session->fps = stream.settings.fps;
++        launch_session->gcmap = 0;
++        launch_session->appid = stream.app_id;
++        launch_session->surround_info = 196610;  // Stereo, as Moonlight sends by default.
++        launch_session->continuous_audio = false;
++        launch_session->enable_hdr = stream.settings.hdr;
++        launch_session->enable_sops = false;
++
++        // Only the first stream may reconfigure the display, before encoders are probed on it.
++        const bool first_stream = rtsp_stream::session_count() == 0 && active_streams == 0;
++        if (first_stream) {
++          display_device::configure_display(config::video, *launch_session);
++          if (video::probe_encoders()) {
++            display_device::revert_configuration();
++            return "Failed to initialize video capture/encoding. Is a display connected and turned on?"s;
++          }
++        }
++        if (const auto problem = unsupported_codec(stream.settings, current_codec_support())) {
++          if (first_stream) {
++            display_device::revert_configuration();
++          }
++          return problem;
++        }
++        if (running == 0 && stream.app_id > 0 && proc::proc.execute(stream.app_id, launch_session)) {
++          if (first_stream) {
++            display_device::revert_configuration();
++          }
++          return "Failed to start the specified application"s;
++        }
++        if (++active_streams == 1 && rtsp_stream::session_count() == 0) {
++          platf::streaming_will_start();
++        }
++#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
++        system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
++#endif
++        return std::nullopt;
++      }
++
++      /**
++       * @brief Release the host after a stream, as the last GameStream session does.
++       */
++      void release_host() {
++        std::lock_guard lock(host_mutex);
++        if (--active_streams != 0 || rtsp_stream::session_count() != 0) {
++          return;
++        }
++        bool revert_display = config::video.dd.config_revert_on_disconnect;
++        if (proc::proc.running()) {
++#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
++          system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
++#endif
++        } else {
++          revert_display = true;
++          input::terminate_gamepads();
++        }
++        if (revert_display) {
++          display_device::revert_configuration();
++        }
++        platf::streaming_will_stop();
++      }
++
++      /**
++       * @brief Run one stream: wait for WebRTC, then pipe Sunshine's encoders into the tracks.
++       */
++      void run_stream(std::weak_ptr<connection_t> weak_connection, std::shared_ptr<stream_t> stream) {
++        platf::set_thread_name("webrtc::stream");
++        {
++          std::unique_lock lock(stream->mutex);
++          stream->condition.wait(lock, [&] {
++            return stream->stop_requested || (stream->peer_connected && stream->video_open && stream->audio_open);
++          });
++          if (stream->stop_requested) {
++            return;
++          }
++        }
++
++        const auto notify = [&](std::string_view state, std::optional<std::string> detail = std::nullopt) {
++          if (const auto connection = weak_connection.lock(); connection && is_current(connection, stream)) {
++            send_session_status(connection, stream, state, std::move(detail));
++          }
++        };
++
++        notify("connecting-sunshine");
++        if (const auto problem = prepare_host(*stream)) {
++          BOOST_LOG(error) << "WebRTC: "sv << *problem;
++          notify("error", problem);
++          return;
++        }
++        notify("starting-moonlight");
++        capture(stream, [&] {
++          notify("streaming");
++        });
++        release_host();
++
++        std::optional<std::string> failure;
++        {
++          std::lock_guard lock(stream->mutex);
++          failure = std::exchange(stream->failure, std::nullopt);
++        }
++        BOOST_LOG(info) << "WebRTC: session "sv << stream->id << " capture stopped"sv;
++        // Without this the TV kept showing the last frame; "error" makes it end the session.
++        if (failure) {
++          notify("error", failure);
++        }
++      }
++
++      /**
++       * @brief Capture, encode and send until the stream ends.
++       * @param stream Stream to feed.
++       * @param on_streaming Called once the pipeline runs.
++       */
++      void capture(const std::shared_ptr<stream_t> &stream, const std::function<void()> &on_streaming) {
++        const auto &settings = stream->settings;
++        const bool hdr = settings.hdr;
++
++        video::config_t video_config {};
++        video_config.width = settings.width;
++        video_config.height = settings.height;
++        video_config.framerate = settings.fps;
++        video_config.framerateX100 = settings.fps * 100;
++        // WebRTC needs no GameStream FEC, so only the audio and RTP overhead come off the total.
++        video_config.bitrate = settings.bitrate_kbps - std::min(512, settings.bitrate_kbps / 5) - std::min(500, settings.bitrate_kbps / 10);
++        video_config.slicesPerFrame = 1;
++        // The TV recovers losses through NACK and keyframes, not reference frame invalidation.
++        video_config.numRefFrames = 1;
++        // (colorspace << 1) | range: Rec.709 or Rec.2020, limited range.
++        video_config.encoderCscMode = hdr ? (2 << 1) : (1 << 1);
++        video_config.videoFormat = settings.codec == protocol::video_codec_e::h264 ? 0 : settings.codec == protocol::video_codec_e::hevc ? 1 :
++                                                                                                                                           2;
++        video_config.dynamicRange = hdr ? 1 : 0;
++        video_config.chromaSamplingType = 0;
++        video_config.enableIntraRefresh = 0;
++
++        audio::config_t audio_config {};
++        audio_config.packetDuration = AUDIO_PACKET_DURATION_MS;
++        audio_config.channels = 2;
++        audio_config.mask = 0x3;
++        audio_config.flags[audio::config_t::HIGH_QUALITY] = true;
++        audio_config.flags[audio::config_t::HOST_AUDIO] = false;
++
++        auto mail = std::make_shared<safe::mail_raw_t>();
++        // Registering these queues makes the encoders deliver to this stream instead of the
++        // GameStream broadcast threads: the encoded frame goes straight to the RTP packetizer.
++        auto video_packets = mail->queue<video::packet_t>(mail::video_packets);
++        auto audio_packets = mail->queue<audio::packet_t>(mail::audio_packets);
++        auto shutdown_event = mail->event<bool>(mail::shutdown);
++        auto feedback = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
++        auto hdr_event = mail->event<video::hdr_info_t>(mail::hdr);
++        {
++          std::lock_guard lock(stream->input_mutex);
++          stream->input = input::alloc(mail, "webrtc-" + stream->client_id);
++        }
++        {
++          std::lock_guard lock(stream->mutex);
++          stream->idr_event = mail->event<bool>(mail::idr);
++        }
++        stream->input_bridge->set_stream_active(true);
++
++        const auto epoch = std::chrono::steady_clock::now();
++        std::jthread video_capture([mail, video_config, stream] {
++          platf::set_thread_name("webrtc::video");
++          video::capture(mail, video_config, stream.get());
++          stream->request_stop("Video capture stopped");
++        });
++        std::jthread audio_capture([mail, audio_config, stream] {
++          platf::set_thread_name("webrtc::audio");
++          audio::capture(mail, audio_config, stream.get());
++        });
++        std::jthread video_sender([video_packets, stream, epoch] {
++          platf::set_thread_name("webrtc::video_send");
++          platf::adjust_thread_priority(platf::thread_priority_e::high);
++          std::optional<std::uint32_t> last_timestamp;
++          const std::uint32_t frame_ticks = VIDEO_CLOCK_RATE / std::max(1, stream->settings.fps);
++          while (auto packet = video_packets->pop()) {
++            std::string_view payload {reinterpret_cast<const char *>(packet->data()), packet->data_size()};
++            std::vector<std::uint8_t> replaced;
++            if (packet->is_idr() && packet->replacements) {
++              replaced = apply_replacements(payload, *packet->replacements);
++              payload = {reinterpret_cast<const char *>(replaced.data()), replaced.size()};
++            }
++            // The capture time drives the RTP clock so the TV paces frames as they were captured.
++            auto timestamp = last_timestamp ? *last_timestamp + frame_ticks : 0U;
++            if (packet->frame_timestamp) {
++              const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(*packet->frame_timestamp - epoch).count();
++              const auto captured = static_cast<std::uint32_t>(std::max<std::int64_t>(0, elapsed) * VIDEO_CLOCK_RATE / 1'000'000);
++              if (!last_timestamp || static_cast<std::int32_t>(captured - *last_timestamp) > 0) {
++                timestamp = captured;
++              }
++            }
++            last_timestamp = timestamp;
++            try {
++              stream->video_track->sendFrame(reinterpret_cast<const rtc::byte *>(payload.data()), payload.size(), rtc::FrameInfo(stream->video_rtp->startTimestamp + timestamp));
++            } catch (const std::exception &e) {
++              BOOST_LOG(warning) << "WebRTC: video frame not sent: "sv << e.what();
++              stream->request_stop();
++              break;
++            }
++          }
++        });
++        std::jthread audio_sender([audio_packets, stream] {
++          platf::set_thread_name("webrtc::audio_send");
++          platf::adjust_thread_priority(platf::thread_priority_e::high);
++          std::uint32_t timestamp = 0;
++          constexpr std::uint32_t samples_per_packet = AUDIO_CLOCK_RATE * AUDIO_PACKET_DURATION_MS / 1000;
++          while (auto packet = audio_packets->pop()) {
++            auto &bytes = packet->second;
++            try {
++              stream->audio_track->sendFrame(reinterpret_cast<const rtc::byte *>(bytes.begin()), bytes.size(), rtc::FrameInfo(stream->audio_rtp->startTimestamp + timestamp));
++            } catch (const std::exception &e) {
++              BOOST_LOG(warning) << "WebRTC: audio packet not sent: "sv << e.what();
++              stream->request_stop();
++              break;
++            }
++            timestamp += samples_per_packet;
++          }
++        });
++
++        on_streaming();
++
++        const bool launched_app = stream->app_id > 0;
++        while (true) {
++          {
++            std::unique_lock lock(stream->mutex);
++            if (stream->condition.wait_for(lock, 100ms, [&] {
++                  return stream->stop_requested;
++                })) {
++              break;
++            }
++          }
++          while (feedback->peek()) {
++            const auto message = feedback->pop();
++            if (!message) {
++              break;
++            }
++            if (message->type == platf::gamepad_feedback_e::rumble) {
++              stream->input_bridge->handle_rumble(message->id, message->data.rumble.lowfreq, message->data.rumble.highfreq);
++            } else if (message->type == platf::gamepad_feedback_e::rumble_triggers) {
++              stream->input_bridge->handle_trigger_rumble(message->id, message->data.rumble_triggers.left_trigger, message->data.rumble_triggers.right_trigger);
++            }
++          }
++          if (hdr_event->peek()) {
++            const auto hdr_info = hdr_event->pop();
++            const bool enabled = hdr_info && hdr_info->enabled;
++            BOOST_LOG(info) << "WebRTC: host display HDR "sv << (enabled ? "enabled"sv : "disabled"sv);
++            if (hdr && !enabled) {
++              // A Main10 stream with SDR content would look washed out; never fall back silently.
++              stream->request_stop("HDR is not enabled on the host display"s);
++            }
++          }
++          if (launched_app) {
++            std::lock_guard lock(host_mutex);
++            if (proc::proc.running() != stream->app_id) {
++              stream->request_stop("The application exited"s);
++            }
++          }
++        }
++
++        stream->input_bridge->set_stream_active(false);
++        {
++          std::lock_guard lock(stream->mutex);
++          stream->idr_event.reset();
++        }
++        shutdown_event->raise(true);
++        video_packets->stop();
++        audio_packets->stop();
++        video_capture.join();
++        audio_capture.join();
++        video_sender.join();
++        audio_sender.join();
++        {
++          std::lock_guard lock(stream->input_mutex);
++          // Release anything still held so no key or button stays pressed on the host.
++          input::reset(stream->input);
++          stream->input.reset();
++        }
++      }
++
++      /**
++       * @brief End a connection's stream, leaving the application running.
++       * @param connection Connection.
++       * @param notify Whether to report the transition to the TV.
++       */
++      void stop_stream(const std::shared_ptr<connection_t> &connection, bool notify) {
++        std::shared_ptr<stream_t> stream;
++        {
++          std::lock_guard lock(connection->mutex);
++          stream = connection->stream;
++        }
++        if (!stream) {
++          if (notify) {
++            send(connection, protocol::make_session_status("idle"));
++          }
++          return;
++        }
++        if (notify) {
++          send_session_status(connection, stream, "stopping");
++        }
++        stream->input_bridge->on_transport_closed();
++        stream->request_stop();
++        if (stream->control_thread.joinable() && stream->control_thread.get_id() != std::this_thread::get_id()) {
++          stream->control_thread.join();
++        }
++        stream->input_bridge->shutdown();
++        if (stream->peer) {
++          // Its callbacks capture this server, which may be shutting down.
++          stream->peer->resetCallbacks();
++          stream->peer->close();
++        }
++        {
++          std::lock_guard lock(connection->mutex);
++          if (connection->stream == stream) {
++            connection->stream.reset();
++          }
++        }
++        BOOST_LOG(info) << "WebRTC: session "sv << stream->id << " stopped"sv;
++        if (notify) {
++          send(connection, protocol::make_session_status("idle"));
++          send(connection, protocol::make_gateway_status(status(connection)));
++        }
++      }
++
++      /**
++       * @brief Apply the TV's answer, checking that HEVC Main10 survived negotiation.
++       * @param connection Connection.
++       * @param answer Answer.
++       */
++      void handle_answer(const std::shared_ptr<connection_t> &connection, const protocol::answer_t &answer) {
++        std::shared_ptr<stream_t> stream;
++        {
++          std::lock_guard lock(connection->mutex);
++          stream = connection->stream;
++        }
++        if (!stream || stream->id != answer.session_id || !stream->peer) {
++          BOOST_LOG(debug) << "WebRTC: ignored answer for inactive session "sv << answer.session_id;
++          return;
++        }
++        if (!sdp::has_expected_hevc_format_parameters(answer.sdp, stream->settings)) {
++          BOOST_LOG(error) << "WebRTC: the TV did not negotiate HEVC Main10"sv;
++          send_session_status(connection, stream, "error", "Tizen did not negotiate HEVC Main10"s);
++          stream->request_stop();
++          return;
++        }
++        if (stream->settings.hdr && stream->settings.codec == protocol::video_codec_e::hevc) {
++          if (const auto level = sdp::hevc_level_id(answer.sdp)) {
++            BOOST_LOG(info) << "WebRTC: TV HEVC Main10 answer level-id "sv << *level;
++          }
++        }
++        stream->peer->setRemoteDescription(rtc::Description(answer.sdp, "answer"));
++
++        std::vector<std::pair<std::string, std::string>> pending;
++        {
++          std::lock_guard lock(stream->candidate_mutex);
++          stream->has_remote_description = true;
++          pending.swap(stream->pending_candidates);
++        }
++        for (auto &[candidate, mid] : pending) {
++          stream->peer->addRemoteCandidate(rtc::Candidate(candidate, mid));
++        }
++      }
++
++      /**
++       * @brief Apply a remote candidate, holding it until the answer arrives.
++       * @param connection Connection.
++       * @param candidate Candidate.
++       */
++      void handle_candidate(const std::shared_ptr<connection_t> &connection, const protocol::candidate_t &candidate) {
++        std::shared_ptr<stream_t> stream;
++        {
++          std::lock_guard lock(connection->mutex);
++          stream = connection->stream;
++        }
++        if (!stream || stream->id != candidate.session_id || !stream->peer) {
++          return;
++        }
++        {
++          std::lock_guard lock(stream->candidate_mutex);
++          if (!stream->has_remote_description) {
++            stream->pending_candidates.emplace_back(candidate.candidate, candidate.mid);
++            return;
++          }
++        }
++        stream->peer->addRemoteCandidate(rtc::Candidate(candidate.candidate, candidate.mid));
++      }
++
++      /**
++       * @brief Start a stop or switch, refusing a second one.
++       * @param connection Connection.
++       * @param request_type Request being served.
++       * @return True when the operation may proceed.
++       */
++      bool begin_host_operation(const std::shared_ptr<connection_t> &connection, std::string_view request_type) {
++        std::lock_guard lock(connection->mutex);
++        if (connection->host_operation_active) {
++          send(connection, protocol::make_error(request_type, "host-operation-active", "A Sunshine session operation is already in progress"));
++          return false;
++        }
++        connection->host_operation_active = true;
++        return true;
++      }
++
++      /**
++       * @brief Allow the next stop or switch.
++       * @param connection Connection.
++       */
++      void finish_host_operation(const std::shared_ptr<connection_t> &connection) {
++        std::lock_guard lock(connection->mutex);
++        connection->host_operation_active = false;
++      }
++
++      /**
++       * @brief Send the application list and server status after the host changed.
++       * @param connection Connection.
++       */
++      void reconcile(const std::shared_ptr<connection_t> &connection) {
++        send_apps(connection);
++        send(connection, protocol::make_gateway_status(status(connection)));
++      }
++
++      /**
++       * @brief Stop the running application, then optionally start another, as one ordered operation.
++       */
++      void stop_or_switch_host(const std::shared_ptr<connection_t> &connection, std::optional<protocol::start_session_t> target) {
++        const std::string request_type = target ? "switch-session" : "stop-host-session";
++        if (!begin_host_operation(connection, request_type)) {
++          return;
++        }
++        try {
++          const int running = proc::proc.running();
++          const auto running_id = running == 0 ? std::optional<std::string> {} : std::optional<std::string>(std::to_string(running));
++          if (target) {
++            const auto apps = applications();
++            if (std::ranges::none_of(apps, [&](const auto &app) {
++                  return app.id == target->app_id;
++                })) {
++              throw std::runtime_error("Selected Sunshine application no longer exists");
++            }
++            if (running_id && *running_id == target->app_id) {
++              send(connection, protocol::make_host_session_status("resuming", running_id, target->app_id));
++              finish_host_operation(connection);
++              start_stream(connection, target->app_id, target->settings);
++              return;
++            }
++          }
++          if (!running_id) {
++            if (target) {
++              send(connection, protocol::make_host_session_status("starting", std::nullopt, target->app_id));
++              finish_host_operation(connection);
++              start_stream(connection, target->app_id, target->settings);
++            } else {
++              reconcile(connection);
++              send(connection, protocol::make_host_session_status("stopped"));
++              finish_host_operation(connection);
++            }
++            return;
++          }
++
++          send(connection, protocol::make_host_session_status(target ? "switching" : "stopping", running_id, target ? std::optional<std::string>(target->app_id) : std::nullopt));
++          // A local disconnect stays distinct from stopping the application; here both happen.
++          stop_stream(connection, false);
++          {
++            std::lock_guard lock(host_mutex);
++            rtsp_stream::terminate_sessions();
++            if (proc::proc.running() > 0) {
++              proc::proc.terminate();
++            }
++            display_device::revert_configuration();
++          }
++          const auto deadline = std::chrono::steady_clock::now() + HOST_IDLE_TIMEOUT;
++          while (proc::proc.running() != 0) {
++            if (std::chrono::steady_clock::now() >= deadline) {
++              throw std::runtime_error("Sunshine still reports a running application after cancellation");
++            }
++            std::this_thread::sleep_for(250ms);
++          }
++
++          reconcile(connection);
++          if (target) {
++            send(connection, protocol::make_host_session_status("starting", std::nullopt, target->app_id));
++            finish_host_operation(connection);
++            start_stream(connection, target->app_id, target->settings);
++          } else {
++            send(connection, protocol::make_host_session_status("stopped"));
++            finish_host_operation(connection);
++          }
++        } catch (const std::exception &e) {
++          BOOST_LOG(error) << "WebRTC: host session operation failed: "sv << e.what();
++          reconcile(connection);
++          send(connection, protocol::make_host_session_status("failed", std::nullopt, std::nullopt, e.what()));
++          finish_host_operation(connection);
++        }
++      }
++
++      tv_auth::tv_client_store_t _tv_clients;  ///< Paired TVs.
++      std::mutex _pairing_mutex;  ///< Protects @ref _pairing.
++      tv_auth::tv_pairing_window_t _pairing;  ///< TV pairing window.
++      std::mutex _connections_mutex;  ///< Protects the connections and codec state.
++      std::vector<std::shared_ptr<connection_t>> _pending;  ///< Connections not authenticated yet.
++      std::shared_ptr<connection_t> _active;  ///< The authenticated TV.
++      codec_support_t _codecs {};  ///< Codec support last announced.
++      std::mutex _artwork_mutex;  ///< Protects @ref _artwork.
++      std::unordered_map<std::string, std::optional<std::pair<std::string, std::string>>> _artwork;  ///< MIME type and Base64 by app ID.
++      std::atomic<std::uint64_t> _next_session_id {1};  ///< Next session ID.
++      std::unique_ptr<rtc::WebSocketServer> _server;  ///< Signaling server.
++    };
++
++    std::mutex server_mutex;  ///< Protects @ref running_server.
++    server_t *running_server = nullptr;  ///< The server while it runs.
++  }  // namespace
++
++  void start() {
++    if (!config::webrtc.enabled) {
++      BOOST_LOG(info) << "WebRTC: TV server disabled"sv;
++      return;
++    }
++    rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string &message) {
++      if (level <= rtc::LogLevel::Error) {
++        BOOST_LOG(error) << "libdatachannel: "sv << message;
++      } else {
++        BOOST_LOG(warning) << "libdatachannel: "sv << message;
++      }
++    });
++    rtc::Preload();
++
++    std::unique_ptr<server_t> server;
++    try {
++      server = std::make_unique<server_t>();
++    } catch (const std::exception &e) {
++      BOOST_LOG(error) << "WebRTC: TV server failed to start on port "sv << config::webrtc.port << ": "sv << e.what();
++      return;
++    }
++    {
++      std::lock_guard lock(server_mutex);
++      running_server = server.get();
++    }
++    server->run();
++    {
++      std::lock_guard lock(server_mutex);
++      running_server = nullptr;
++    }
++    server.reset();
++    rtc::Cleanup();
++  }
++
++  int session_count() {
++    return active_streams.load();
++  }
++
++  pairing_t open_tv_pairing() {
++    std::lock_guard lock(server_mutex);
++    if (!running_server) {
++      return {false, {}, "The TV server is not running"};
++    }
++    try {
++      return {true, running_server->open_pairing(), "Enter this PIN on the TV within two minutes"};
++    } catch (const std::exception &) {
++      return {false, {}, "TV pairing could not be started"};
++    }
++  }
++
++  std::string tv_pairing_status() {
++    std::lock_guard lock(server_mutex);
++    return running_server ? running_server->pairing_status() : "tv-pairing-idle"s;
++  }
++
++  std::vector<paired_tv_t> paired_tvs() {
++    std::lock_guard lock(server_mutex);
++    return running_server ? running_server->paired() : std::vector<paired_tv_t> {};
++  }
++
++  std::optional<std::size_t> unpair_all_tvs() {
++    std::lock_guard lock(server_mutex);
++    if (!running_server) {
++      return std::nullopt;
++    }
++    return running_server->forget_tvs();
++  }
++}  // namespace webrtc_stream
+diff --git a/src/webrtc/webrtc_stream.h b/src/webrtc/webrtc_stream.h
+new file mode 100644
+index 00000000..ee1930cb
+--- /dev/null
++++ b/src/webrtc/webrtc_stream.h
+@@ -0,0 +1,69 @@
++/**
++ * @file src/webrtc/webrtc_stream.h
++ * @brief Declarations for streaming to Moonlight WebRTC TVs directly from Sunshine.
++ *
++ * Sunshine serves the Moonlight WebRTC Tizen client itself: the TV signals over a WebSocket and
++ * receives Sunshine's encoded video and Opus audio over WebRTC, without a GameStream hop through a
++ * separate Gateway process. Encoded frames go from the encoder straight to the RTP packetizer.
++ */
++#pragma once
++
++// standard includes
++#include <cstddef>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace webrtc_stream {
++  /**
++   * @brief A paired TV as shown in the Web UI.
++   */
++  struct paired_tv_t {
++    std::string id;  ///< Client ID.
++    std::string name;  ///< Display name.
++  };
++
++  /**
++   * @brief Outcome of opening a TV pairing window.
++   */
++  struct pairing_t {
++    bool ok;  ///< Whether a window was opened.
++    std::string pin;  ///< PIN to show; empty on failure.
++    std::string message;  ///< User-safe status.
++  };
++
++  /**
++   * @brief Run the TV signaling server until Sunshine shuts down.
++   */
++  void start();
++
++  /**
++   * @brief Count TV streams that are capturing.
++   * @return Number of active TV streams.
++   */
++  int session_count();
++
++  /**
++   * @brief Open a two-minute window in which one TV may pair.
++   * @return The PIN to show, which is never logged.
++   */
++  pairing_t open_tv_pairing();
++
++  /**
++   * @brief Report the state of the TV pairing window.
++   * @return One of "tv-pairing-idle", "tv-pairing-waiting", "tv-paired", "tv-pairing-expired" or "tv-pairing-locked".
++   */
++  std::string tv_pairing_status();
++
++  /**
++   * @brief List paired TVs.
++   * @return Paired TVs.
++   */
++  std::vector<paired_tv_t> paired_tvs();
++
++  /**
++   * @brief Forget every paired TV and disconnect any connected TV.
++   * @return Number of TVs removed, or nothing when the server is not running.
++   */
++  std::optional<std::size_t> unpair_all_tvs();
++}  // namespace webrtc_stream

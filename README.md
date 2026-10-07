@@ -10,7 +10,7 @@
 
 > [!NOTE]
 > This fork streams directly to the Moonlight WebRTC app on Samsung Tizen TVs, without a separate Gateway.
-> See [Moonlight WebRTC for Samsung Tizen](docs/moonlight_webrtc_tizen.md).
+> See [Moonlight WebRTC for Samsung Tizen](docs/moonlight_webrtc_tizen.md), and [PATCHES.md](PATCHES.md) for every change made to upstream.
 
 <div align="center">
   <!-- Keep whitespace outside the badge links to avoid an underlined gap. -->
