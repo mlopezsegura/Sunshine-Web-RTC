@@ -45,6 +45,7 @@
 #include "system_tray.h"
 #include "upnp.h"
 #include "video.h"
+#include "webrtc/webrtc_stream.h"
 
 using namespace std::literals;
 
@@ -495,6 +496,7 @@ int main(int argc, char *argv[]) {
   std::jthread httpThread {nvhttp::start};
   std::jthread configThread {confighttp::start};
   std::jthread rtspThread {rtsp_stream::start};
+  std::jthread webrtcThread {webrtc_stream::start};
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user

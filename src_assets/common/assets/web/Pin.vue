@@ -51,6 +51,30 @@
       </div>
       <div v-if="status" :class="`alert alert-${status.type}`" role="alert">{{ status.message }}</div>
     </form>
+
+    <h2 class="my-4 text-center">{{ $t('pin.tv_pairing') }}</h2>
+    <div class="d-flex flex-column align-items-center">
+      <div class="card flex-column d-flex p-4 mb-4">
+        <p class="mb-3">{{ $t('pin.tv_pairing_desc') }}</p>
+        <div v-if="tvPin" class="text-center mb-3">
+          <div class="display-4 fw-bold" id="tv-pin">{{ tvPin }}</div>
+          <div class="form-text">{{ tvStatusText }}</div>
+        </div>
+        <button type="button" class="btn btn-primary mb-3" @click="pairTv">
+          <tv :size="18" class="icon"></tv>
+          {{ $t('pin.tv_pair') }}
+        </button>
+        <ul class="list-group mb-3">
+          <li v-if="!pairedTvs.length" class="list-group-item">{{ $t('pin.tv_none') }}</li>
+          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">{{ tv.name }}</li>
+        </ul>
+        <button type="button" class="btn btn-outline-danger" :disabled="!pairedTvs.length" @click="unpairTvs">
+          <x :size="18" class="icon"></x>
+          {{ $t('pin.tv_unpair_all') }}
+        </button>
+      </div>
+      <div v-if="tvStatus" :class="`alert alert-${tvStatus.type}`" role="alert">{{ tvStatus.message }}</div>
+    </div>
   </div>
 </template>
 
@@ -61,6 +85,7 @@
     Forward,
     Hash,
     Monitor,
+    Tv,
     UserRoundSearch,
     X,
   } from '@lucide/vue'
@@ -71,6 +96,7 @@
       Forward,
       Hash,
       Monitor,
+      Tv,
       UserRoundSearch,
       X,
     },
@@ -83,11 +109,30 @@
         refreshTimer: null,
         selectedPairingId: '',
         status: null,
+        pairedTvs: [],
+        tvPairing: 'tv-pairing-idle',
+        tvPin: '',
+        tvStatus: null,
       };
+    },
+    computed: {
+      tvStatusText() {
+        const keys = {
+          'tv-pairing-waiting': 'pin.tv_waiting',
+          'tv-paired': 'pin.tv_paired',
+          'tv-pairing-expired': 'pin.tv_expired',
+          'tv-pairing-locked': 'pin.tv_locked',
+        };
+        return keys[this.tvPairing] ? this.i18n.t(keys[this.tvPairing]) : '';
+      },
     },
     mounted() {
       this.loadPendingPairings();
-      this.refreshTimer = window.setInterval(() => this.loadPendingPairings(), 2000);
+      this.loadTvs();
+      this.refreshTimer = window.setInterval(() => {
+        this.loadPendingPairings();
+        this.loadTvs();
+      }, 2000);
     },
     beforeUnmount() {
       window.clearInterval(this.refreshTimer);
@@ -145,6 +190,53 @@
           this.status = {type: 'danger', message: this.i18n.t('pin.pair_failure')};
         }
         await this.loadPendingPairings();
+      },
+
+      /**
+       * Refresh the Moonlight WebRTC TVs and the state of an open TV pairing window.
+       */
+      async loadTvs() {
+        try {
+          const response = await apiFetch('./api/webrtc/tvs', {method: 'GET'});
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          const body = await response.json();
+          this.pairedTvs = body.tvs || [];
+          this.tvPairing = body.pairing || 'tv-pairing-idle';
+          if (this.tvPairing !== 'tv-pairing-waiting' && this.tvPairing !== 'tv-paired') {
+            this.tvPin = '';
+          }
+        } catch (error) {
+          console.error('Failed to load Moonlight WebRTC TVs', error);
+        }
+      },
+
+      /**
+       * Open a two-minute window and show the PIN to enter on the TV.
+       */
+      async pairTv() {
+        this.tvStatus = null;
+        const response = await apiFetch('./api/webrtc/pair', {method: 'POST'});
+        const result = await response.json();
+        if (result.status === true) {
+          this.tvPin = result.pin;
+          this.tvPairing = 'tv-pairing-waiting';
+        } else {
+          this.tvStatus = {type: 'danger', message: this.i18n.t('pin.tv_pair_failure')};
+        }
+      },
+
+      /**
+       * Forget every paired TV; a connected TV is disconnected at once.
+       */
+      async unpairTvs() {
+        const response = await apiFetch('./api/webrtc/unpair-all', {method: 'POST'});
+        const result = await response.json();
+        this.tvStatus = result.status === true
+          ? {type: 'success', message: this.i18n.t('pin.tv_unpair_success')}
+          : {type: 'danger', message: this.i18n.t('pin.tv_unpair_failure')};
+        await this.loadTvs();
       },
 
       /**

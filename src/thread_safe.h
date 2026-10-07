@@ -855,6 +855,19 @@ namespace safe {
     }
 
     /**
+     * @brief Check whether a live event or queue is registered under an identifier.
+     *
+     * @param id Identifier for the controller, session, display, or resource.
+     * @return True when an event or queue for @p id exists and is still referenced.
+     */
+    bool has(const std::string_view &id) {
+      std::lock_guard lg {mutex};
+
+      auto it = id_to_post.find(id);
+      return it != std::end(id_to_post) && !it->second.expired();
+    }
+
+    /**
      * @brief Run cleanup for completed asynchronous work.
      */
     void cleanup() {

@@ -825,6 +825,14 @@ namespace config {
   };
 
   /**
+   * @brief Default Moonlight WebRTC TV server values used before file and CLI overrides.
+   */
+  webrtc_t webrtc {
+    true,  // enabled
+    8000,  // port, the Moonlight WebRTC TV client's default
+  };
+
+  /**
    * @brief Default NVHTTP server configuration values used before file and CLI overrides.
    */
   nvhttp_t nvhttp {
@@ -1803,6 +1811,9 @@ namespace config {
 #endif
 
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+
+    bool_f(vars, "webrtc_enabled", webrtc.enabled);
+    int_between_f(vars, "webrtc_port", webrtc.port, {1024, 65535});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

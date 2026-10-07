@@ -265,6 +265,14 @@ namespace config {
   };
 
   /**
+   * @brief Settings of the Moonlight WebRTC TV server.
+   */
+  struct webrtc_t {
+    bool enabled;  ///< Whether Sunshine serves Moonlight WebRTC TVs directly.
+    int port;  ///< TCP port of the TV signaling WebSocket.
+  };
+
+  /**
    * @brief HTTP and HTTPS settings used by the GameStream pairing server.
    */
   struct nvhttp_t {
@@ -398,6 +406,7 @@ namespace config {
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;
+  extern webrtc_t webrtc;
   extern nvhttp_t nvhttp;
   extern input_t input;
   extern sunshine_t sunshine;

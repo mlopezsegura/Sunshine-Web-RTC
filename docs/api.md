@@ -99,3 +99,12 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 
 ## GET /api/virtual-input/status
 @copydoc confighttp::getVirtualInputStatus()
+
+## POST /api/webrtc/pair
+@copydoc confighttp::pairWebrtcTv()
+
+## GET /api/webrtc/tvs
+@copydoc confighttp::getWebrtcTvs()
+
+## POST /api/webrtc/unpair-all
+@copydoc confighttp::unpairAllWebrtcTvs()

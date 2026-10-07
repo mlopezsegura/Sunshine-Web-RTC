@@ -174,5 +174,20 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
       <div class="form-text">{{ $t('config.packetsize_desc') }}</div>
     </div>
 
+    <!-- Moonlight WebRTC TV server -->
+    <Checkbox class="mb-3"
+              id="webrtc_enabled"
+              locale-prefix="config"
+              v-model="config.webrtc_enabled"
+              default="true"
+    ></Checkbox>
+
+    <!-- Moonlight WebRTC TV port -->
+    <div class="mb-3">
+      <label for="webrtc_port" class="form-label">{{ $t('config.webrtc_port') }}</label>
+      <input type="number" min="1024" max="65535" class="form-control" id="webrtc_port" placeholder="8000" v-model="config.webrtc_port" />
+      <div class="form-text">{{ $t('config.webrtc_port_desc') }}</div>
+    </div>
+
   </div>
 </template>

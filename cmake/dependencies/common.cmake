@@ -88,6 +88,7 @@ endif()
 # common dependencies
 include("${CMAKE_MODULE_PATH}/dependencies/nv_codec_headers.cmake")
 include("${CMAKE_MODULE_PATH}/dependencies/nlohmann_json.cmake")
+include("${CMAKE_MODULE_PATH}/dependencies/libdatachannel.cmake")
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(CURL REQUIRED libcurl)

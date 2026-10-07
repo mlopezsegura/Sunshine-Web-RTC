@@ -194,6 +194,16 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/round_robin.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/input_bridge.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/input_bridge.h"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/protocol.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/protocol.h"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/sdp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/sdp.h"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/tv_auth.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/tv_auth.h"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/webrtc_stream.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webrtc/webrtc_stream.h"
         ${PLATFORM_TARGET_FILES})
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)
@@ -232,6 +242,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         libdisplaydevice::display_device
         lizardbyte::common
         nlohmann_json::nlohmann_json
+        ${SUNSHINE_LIBDATACHANNEL_TARGET}
         ${Opus_LIBRARY}
         ${FFMPEG_LIBRARIES}
         ${Boost_LIBRARIES}

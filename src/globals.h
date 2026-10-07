@@ -61,4 +61,23 @@ namespace mail {
   MAIL(hdr);  ///< HDR.
 #undef MAIL
 
+  /**
+   * @brief Select the queue that receives a session's encoded packets.
+   *
+   * A session that registers its own queue under @p id in its mailbox consumes its packets
+   * itself, as the WebRTC stream does. Every other session publishes to the process-wide queue
+   * drained by the GameStream broadcast threads.
+   *
+   * @param session_mail Mailbox of the session producing the packets.
+   * @param id Queue identifier, such as @ref video_packets or @ref audio_packets.
+   * @return The session's own queue when it registered one, otherwise the process-wide queue.
+   */
+  template<class T>
+  safe::mail_raw_t::queue_t<T> packet_queue(const safe::mail_t &session_mail, std::string_view id) {
+    if (session_mail && session_mail->has(id)) {
+      return session_mail->queue<T>(id);
+    }
+    return man->queue<T>(id);
+  }
+
 }  // namespace mail

@@ -103,11 +103,11 @@ namespace audio {
    * @brief Encode captured PCM samples into Opus packets on the audio worker thread.
    *
    * @param samples Queue of captured PCM sample buffers to encode.
+   * @param packets Queue that receives the encoded packets.
    * @param config Audio stream settings negotiated with the client.
    * @param channel_data Platform-specific audio capture context passed to packet metadata.
    */
-  void encodeThread(sample_queue_t samples, config_t config, void *channel_data) {
-    auto packets = mail::man->queue<packet_t>(mail::audio_packets);
+  void encodeThread(sample_queue_t samples, safe::mail_raw_t::queue_t<packet_t> packets, config_t config, void *channel_data) {
     auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
     if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
       apply_surround_params(stream, config.customStreamParams);
@@ -234,7 +234,7 @@ namespace audio {
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     auto samples = std::make_shared<sample_queue_t::element_type>(30);
-    std::jthread thread {encodeThread, samples, config, channel_data};
+    std::jthread thread {encodeThread, samples, mail::packet_queue<packet_t>(mail, mail::audio_packets), config, channel_data};
 
     auto fg = util::fail_guard([&]() {
       samples->stop();

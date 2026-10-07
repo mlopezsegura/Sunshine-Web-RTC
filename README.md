@@ -8,6 +8,10 @@
   <h4 align="center">Self-hosted game stream host for Moonlight.</h4>
 </div>
 
+> [!NOTE]
+> This fork streams directly to the Moonlight WebRTC app on Samsung Tizen TVs, without a separate Gateway.
+> See [Moonlight WebRTC for Samsung Tizen](docs/moonlight_webrtc_tizen.md).
+
 <div align="center">
   <!-- Keep whitespace outside the badge links to avoid an underlined gap. -->
   <!-- Use raw HTML aliases to keep Doxygen's emitted comment delimiters balanced. -->

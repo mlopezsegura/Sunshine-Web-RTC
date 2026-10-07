@@ -76,7 +76,9 @@
       "lan_encryption_mode": 0,
       "wan_encryption_mode": 1,
       "ping_timeout": 10000,
-      "packetsize": 0
+      "packetsize": 0,
+      "webrtc_enabled": "enabled",
+      "webrtc_port": 8000
     }
   },
   {

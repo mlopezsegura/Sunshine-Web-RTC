@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>WebRTC TV E2E</title></head>
+<body>
+<video id="video" autoplay muted playsinline></video>
+<script>
+const params = new URLSearchParams(location.search);
+const wsUrl = params.get("ws");
+const pin = params.get("pin");
+const codec = params.get("codec") || "h264";
+const width = Number(params.get("width") || 1280);
+const height = Number(params.get("height") || 720);
+const bitrate = Number(params.get("bitrate") || 12000);
+const hdr = params.get("hdr") === "1";
+const log = [];
+const result = { codec, width, height, hdr, steps: [], errors: [] };
+const t0 = performance.now();
+function note(step, extra) {
+  const entry = { t: Math.round(performance.now() - t0), step, ...(extra || {}) };
+  result.steps.push(entry);
+}
+async function finish() {
+  result.log = log.slice(-80);
+  await fetch("/result", { method: "POST", body: JSON.stringify(result) });
+}
+setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000);
+
+let ws, pc, sessionId, control, gamepad, phase = "auth", credentials = null, appId = null;
+const send = (m) => { log.push(">> " + m.type); ws.send(JSON.stringify(Object.assign({ version: 2 }, m))); };
+
+async function hmacHex(secretHex, text) {
+  const key = await crypto.subtle.importKey("raw", new Uint8Array(secretHex.match(/../g).map(h => parseInt(h, 16))),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function connect() {
+  ws = new WebSocket(wsUrl);
+  ws.onmessage = async (event) => {
+    const m = JSON.parse(event.data);
+    log.push("<< " + m.type + (m.state ? ":" + m.state : "") + (m.code ? ":" + m.code : ""));
+    try { await handle(m); } catch (e) { result.errors.push(String(e)); finish(); }
+  };
+  ws.onclose = () => { log.push("ws closed"); if (phase === "reconnect") { phase = "auth2"; connect(); } };
+}
+
+async function handle(m) {
+  if (m.type === "auth-required") {
+    note("auth-required", { sunshineAvailable: m.sunshineAvailable, mac: m.macAddress || null });
+    if (credentials) {
+      send({ type: "authenticate", clientId: credentials.clientId,
+             proof: await hmacHex(credentials.clientSecret, "moonlight-webrtc-tv-auth-v1:" + m.nonce) });
+    } else {
+      // An unauthenticated request must be refused before pairing.
+      send({ type: "get-apps" });
+      send({ type: "pair-client", pin: "9999" === pin ? "0000" : "9999", clientName: "E2E Edge" });
+      send({ type: "pair-client", pin, clientName: "E2E Edge" });
+    }
+  } else if (m.type === "error") {
+    note("error", { requestType: m.requestType, code: m.code });
+  } else if (m.type === "paired") {
+    note("paired");
+    credentials = { clientId: m.clientId, clientSecret: m.clientSecret };
+  } else if (m.type === "authenticated") {
+    note("authenticated");
+  } else if (m.type === "gateway-status") {
+    note("gateway-status", { name: m.gatewayName, detected: m.sunshineDetected, paired: m.sunshinePaired, running: m.runningAppId || null });
+  } else if (m.type === "capabilities") {
+    note("capabilities", { codecs: m.codecs, hdr4k: m.videoModes.find(v => v.width === 3840).hdrCodecs });
+  } else if (m.type === "session-status" && m.state === "idle" && phase === "auth") {
+    // Reconnect once to prove the issued credentials authenticate a new connection.
+    phase = "reconnect";
+    ws.close();
+  } else if (m.type === "session-status" && m.state === "idle" && phase === "auth2") {
+    phase = "apps";
+    send({ type: "get-apps" });
+  } else if (m.type === "apps") {
+    note("apps", { titles: m.apps.map(a => a.title + "#" + a.id + (a.running ? "*" : "")) });
+    if (phase !== "apps") return;
+    const app = m.apps.find(a => a.title === "Desktop") || m.apps[0];
+    appId = app.id;
+    phase = "artwork";
+    send({ type: "get-app-artwork", appId });
+  } else if (m.type === "app-artwork") {
+    note("app-artwork", { available: m.available, mime: m.mimeType || null, bytes: m.data ? Math.floor(m.data.length * 3 / 4) : 0 });
+    if (phase !== "artwork") return;
+    phase = "start";
+    send({ type: "start-session", appId,
+           video: { width, height, fps: 60, codec, bitrateKbps: bitrate, hdr }, audio: { channels: 2 } });
+  } else if (m.type === "session-status") {
+    note("session-" + m.state, m.message ? { message: m.message } : undefined);
+    if (m.sessionId) sessionId = m.sessionId;
+    if (m.state === "streaming") setTimeout(measure, 8000);
+    if (m.state === "error") { result.errors.push("session error: " + m.message); finish(); }
+    if (m.state === "idle" && phase === "stopping") {
+      phase = "host-stop";
+      send({ type: "stop-host-session" });
+    }
+  } else if (m.type === "host-session-status") {
+    note("host-" + m.state, { running: m.runningAppId || null });
+    if (m.state === "stopped" || m.state === "failed") finish();
+  } else if (m.type === "offer") {
+    note("offer", { imageattr: /a=imageattr:96 send/.test(m.sdp), rtpmap: (m.sdp.match(/a=rtpmap:96 [^\r]+/) || [""])[0] });
+    pc = new RTCPeerConnection();
+    pc.onicecandidate = (e) => { if (e.candidate) send({ type: "candidate", sessionId, candidate: e.candidate.candidate, mid: e.candidate.sdpMid }); };
+    pc.ontrack = (e) => { if (e.track.kind === "video") document.getElementById("video").srcObject = e.streams[0] || new MediaStream([e.track]); };
+    pc.ondatachannel = (e) => {
+      const channel = e.channel;
+      if (channel.label === "control") {
+        control = channel;
+        channel.onmessage = (x) => log.push("ctl " + x.data.slice(0, 90));
+        channel.onopen = () => {
+          note("control-open");
+          channel.send(JSON.stringify({ v: 2, type: "gamepad-connected", controllerId: 1, id: "Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 0b13)", mapping: "standard", buttons: 17, axes: 4, dualRumble: true, triggerRumble: false }));
+        };
+      } else if (channel.label === "gamepad") {
+        gamepad = channel;
+        channel.onopen = () => note("gamepad-open");
+      }
+    };
+    pc.onconnectionstatechange = () => note("pc-" + pc.connectionState);
+    await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send({ type: "answer", sessionId, sdp: pc.localDescription.sdp });
+  } else if (m.type === "candidate") {
+    if (pc) await pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid });
+  }
+}
+
+async function measure() {
+  // Neutral gamepad snapshots exercise the unreliable channel without pressing anything.
+  for (let seq = 1; seq <= 20; seq++) {
+    if (gamepad && gamepad.readyState === "open") {
+      gamepad.send(JSON.stringify({ v: 2, type: "gamepad-state", controllerId: 1, seq, timestampMs: performance.now(), buttons: 0,
+        leftTrigger: 0, rightTrigger: 0, leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0 }));
+    }
+  }
+  const sample = async () => {
+    const stats = await pc.getStats();
+    const out = {};
+    stats.forEach((s) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") {
+        out.video = { framesDecoded: s.framesDecoded, framesReceived: s.framesReceived, framesDropped: s.framesDropped, keyFramesDecoded: s.keyFramesDecoded,
+          frameWidth: s.frameWidth, frameHeight: s.frameHeight, fps: s.framesPerSecond, bytes: s.bytesReceived, packetsLost: s.packetsLost,
+          nack: s.nackCount, pli: s.pliCount, decoder: s.decoderImplementation,
+          jitterBufferMs: s.jitterBufferEmittedCount ? Math.round(1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount * 10) / 10 : null,
+          decodeMs: s.framesDecoded ? Math.round(1000 * s.totalDecodeTime / s.framesDecoded * 100) / 100 : null };
+      }
+      if (s.type === "inbound-rtp" && s.kind === "audio") {
+        out.audio = { packets: s.packetsReceived, lost: s.packetsLost, bytes: s.bytesReceived };
+      }
+      if (s.type === "codec") { (out.codecs = out.codecs || []).push(s.mimeType + (s.sdpFmtpLine ? " " + s.sdpFmtpLine : "")); }
+      if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") out.rttMs = s.currentRoundTripTime * 1000;
+    });
+    return out;
+  };
+  const first = await sample();
+  await new Promise(r => setTimeout(r, 2000));
+  const second = await sample();
+  result.stats = second;
+  if (first.video && second.video) {
+    result.measuredFps = (second.video.framesDecoded - first.video.framesDecoded) / 2;
+    result.measuredKbps = Math.round((second.video.bytes - first.video.bytes) * 8 / 2 / 1000);
+  }
+  note("measured");
+  phase = "stopping";
+  send({ type: "stop-session" });
+}
+
+connect();
+</script>
+</body>
+</html>

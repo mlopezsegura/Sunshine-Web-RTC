@@ -1880,6 +1880,60 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### webrtc_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Stream directly to the Moonlight WebRTC app on Samsung Tizen TVs. The TV signals over a
+            WebSocket and receives the encoded video and Opus audio over WebRTC, without a separate
+            Gateway. Pair a TV from the PIN page of the Web UI.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            webrtc_enabled = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### webrtc_port
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            TCP port of the WebSocket the Moonlight WebRTC TV app connects to. Media uses
+            ephemeral UDP ports negotiated by WebRTC.
+            @note{The TV app uses 8000 unless another port is entered with the PC's address.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            8000
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1024-65535</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            webrtc_port = 8000
+            @endcode</td>
+    </tr>
+</table>
+
 ## Config Files
 
 ### file_apps
