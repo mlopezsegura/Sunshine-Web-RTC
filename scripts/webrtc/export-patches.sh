@@ -3,6 +3,8 @@
 # applying them to a clean upstream checkout reproduces the fork's tree exactly.
 #
 #   scripts/webrtc/export-patches.sh [upstream-ref]   (default: upstream/master)
+#
+# It reads committed history (HEAD): commit your changes first, then run it and commit patches/.
 set -euo pipefail
 
 base="${1:-upstream/master}"

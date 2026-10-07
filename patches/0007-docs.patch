@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index 2f65f3f9..0b5210ea 100644
+index 2f65f3f9..8bad65ba 100644
 --- a/README.md
 +++ b/README.md
 @@ -8,6 +8,10 @@
@@ -8,7 +8,7 @@ index 2f65f3f9..0b5210ea 100644
  
 +> [!NOTE]
 +> This fork streams directly to the Moonlight WebRTC app on Samsung Tizen TVs, without a separate Gateway.
-+> See [Moonlight WebRTC for Samsung Tizen](docs/moonlight_webrtc_tizen.md).
++> See [Moonlight WebRTC for Samsung Tizen](docs/moonlight_webrtc_tizen.md), and [PATCHES.md](PATCHES.md) for every change made to upstream.
 +
  <div align="center">
    <!-- Keep whitespace outside the badge links to avoid an underlined gap. -->

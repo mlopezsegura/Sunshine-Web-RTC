@@ -33,7 +33,8 @@ git apply patches/*.patch
 ```
 
 `scripts/webrtc/export-patches.sh` regenerates them and verifies that property on a clean upstream
-checkout; run it after every change.
+checkout. It reads committed history, so commit a change first, then run the script and commit
+`patches/`.
 
 | Patch | Files | Kind |
 |---|---|---|
