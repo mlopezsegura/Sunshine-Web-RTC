@@ -60,6 +60,10 @@ TEST(WebrtcProtocolTest, RejectsUnsupportedCombinations) {
 
   auto fps = settings(1920, 1080, video_codec_e::h264);
   fps.fps = 120;
+  EXPECT_FALSE(validate_stream_settings(fps));
+  fps.fps = 144;
+  EXPECT_EQ(validate_stream_settings(fps), "Unsupported frame rate");
+  fps.fps = 75;
   EXPECT_EQ(validate_stream_settings(fps), "Unsupported frame rate");
 }
 
@@ -112,7 +116,10 @@ TEST(WebrtcProtocolTest, OffersAv1OnlyWhenTheEncoderSupportsIt) {
   const auto av1_hdr = make_capabilities({true, true});
   EXPECT_EQ(find_mode(av1_hdr, 3840)->at("hdrCodecs"), nlohmann::json::array({"hevc", "av1"}));
   EXPECT_EQ(find_mode(av1_hdr, 1280)->at("hdrCodecs"), nlohmann::json::array());
-  EXPECT_EQ(av1_hdr.at("frameRates"), nlohmann::json::array({60}));
+  EXPECT_EQ(av1_hdr.at("frameRates"), nlohmann::json::array({30, 60, 90, 120}));
+  // Older TV apps request the mode's fps; newer ones choose from its frameRates.
+  EXPECT_EQ(find_mode(av1_hdr, 3840)->at("fps"), 60);
+  EXPECT_EQ(find_mode(av1_hdr, 3840)->at("frameRates"), nlohmann::json::array({30, 60, 90, 120}));
 }
 
 TEST(WebrtcProtocolTest, ReportsSunshineAsDetectedAndPaired) {

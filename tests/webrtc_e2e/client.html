@@ -11,10 +11,11 @@ const codec = params.get("codec") || "h264";
 const width = Number(params.get("width") || 1280);
 const height = Number(params.get("height") || 720);
 const bitrate = Number(params.get("bitrate") || 12000);
+const fps = Number(params.get("fps") || 60);
 const hdr = params.get("hdr") === "1";
 const takeover = params.get("takeover") === "1";
 const log = [];
-const result = { codec, width, height, hdr, steps: [], errors: [] };
+const result = { codec, width, height, fps, hdr, steps: [], errors: [] };
 const t0 = performance.now();
 function note(step, extra) {
   const entry = { t: Math.round(performance.now() - t0), step, ...(extra || {}) };
@@ -92,7 +93,7 @@ async function handle(m) {
     if (phase !== "artwork") return;
     phase = "start";
     send({ type: "start-session", appId,
-           video: { width, height, fps: 60, codec, bitrateKbps: bitrate, hdr }, audio: { channels: 2 } });
+           video: { width, height, fps, codec, bitrateKbps: bitrate, hdr }, audio: { channels: 2 } });
   } else if (m.type === "session-status") {
     note("session-" + m.state, m.message ? { message: m.message } : undefined);
     if (m.sessionId) sessionId = m.sessionId;

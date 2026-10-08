@@ -121,6 +121,21 @@ namespace webrtc_stream::protocol {
     }
 
     /**
+     * @brief List the frame rates a mode offers.
+     * @param mode Supported mode.
+     * @return The frame rates, lowest first.
+     */
+    json frame_rates(const video_mode_t &mode) {
+      json rates = json::array();
+      for (const int rate : SUPPORTED_FRAME_RATES) {
+        if (rate <= mode.max_fps) {
+          rates.push_back(rate);
+        }
+      }
+      return rates;
+    }
+
+    /**
      * @brief Describe one selectable mode, offering only what the encoder supports.
      * @param mode Supported mode.
      * @param encoders Encoders available beyond H.264 and HEVC.
@@ -141,7 +156,9 @@ namespace webrtc_stream::protocol {
       return {
         {"width", mode.width},
         {"height", mode.height},
-        {"fps", mode.fps},
+        // Older TV apps read fps and request exactly it; newer ones choose from frameRates.
+        {"fps", DEFAULT_FRAME_RATE},
+        {"frameRates", frame_rates(mode)},
         {"codecs", std::move(codecs)},
         {"hdrCodecs", std::move(hdr_codecs)},
         {"defaultCodec", codec_name(mode.default_codec)},
@@ -155,9 +172,10 @@ namespace webrtc_stream::protocol {
 
   const video_mode_t *find_video_mode(int width, int height, int fps) {
     const auto mode = std::ranges::find_if(SUPPORTED_VIDEO_MODES, [=](const video_mode_t &candidate) {
-      return candidate.width == width && candidate.height == height && candidate.fps == fps;
+      return candidate.width == width && candidate.height == height;
     });
-    return mode == SUPPORTED_VIDEO_MODES.end() ? nullptr : &*mode;
+    const bool offered_rate = std::ranges::find(SUPPORTED_FRAME_RATES, fps) != SUPPORTED_FRAME_RATES.end();
+    return mode == SUPPORTED_VIDEO_MODES.end() || !offered_rate || fps > mode->max_fps ? nullptr : &*mode;
   }
 
   bool mode_supports_codec(const video_mode_t &mode, video_codec_e codec) {
@@ -179,13 +197,13 @@ namespace webrtc_stream::protocol {
   std::optional<std::string> validate_stream_settings(const stream_settings_t &settings) {
     const auto *mode = find_video_mode(settings.width, settings.height, settings.fps);
     if (!mode) {
-      return settings.fps != 60 ? "Unsupported frame rate" : "Unsupported resolution";
+      return find_video_mode(settings.width, settings.height, DEFAULT_FRAME_RATE) ? "Unsupported frame rate" : "Unsupported resolution";
     }
     if (!mode_supports_codec(*mode, settings.codec)) {
       return "Unsupported resolution and codec combination";
     }
     if (settings.hdr && !mode_supports_hdr(*mode, settings.codec)) {
-      return "HDR is supported only with HEVC or AV1 at 1080p60, 1440p60, or 4K60";
+      return "HDR is supported only with HEVC or AV1 at 1080p, 1440p, or 4K";
     }
     if (settings.audio_channels != 2) {
       return "Only stereo audio is supported";
@@ -349,7 +367,7 @@ namespace webrtc_stream::protocol {
       message["resolutions"].push_back({{"width", mode.width}, {"height", mode.height}, {"experimental", mode.experimental}});
     }
     message.update({
-      {"frameRates", {60}},
+      {"frameRates", SUPPORTED_FRAME_RATES},
       {"codecs", encoders.av1 ? json::array({"h264", "hevc", "av1"}) : json::array({"h264", "hevc"})},
       {"hdr", true},
       {"audio", "stereo"},

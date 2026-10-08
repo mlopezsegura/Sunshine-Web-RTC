@@ -39,7 +39,7 @@ namespace webrtc_stream::protocol {
   struct video_mode_t {
     int width;  ///< Width in pixels.
     int height;  ///< Height in pixels.
-    int fps;  ///< Frame rate.
+    int max_fps;  ///< Highest frame rate offered; see @ref SUPPORTED_FRAME_RATES.
     bool supports_h264;  ///< Whether H.264 is offered at this resolution.
     bool supports_hevc;  ///< Whether HEVC is offered at this resolution.
     bool supports_av1;  ///< Whether AV1 is offered at this resolution, when the encoder supports it.
@@ -69,13 +69,25 @@ namespace webrtc_stream::protocol {
   };
 
   /**
+   * @brief Frame rates a TV may request, up to a mode's @ref video_mode_t::max_fps.
+   *
+   * The TV offers only the rates its own decoder reports it can sustain.
+   */
+  constexpr std::array SUPPORTED_FRAME_RATES {30, 60, 90, 120};
+
+  /**
+   * @brief Frame rate a TV uses when it does not choose one; older TV apps always send it.
+   */
+  constexpr int DEFAULT_FRAME_RATE = 60;
+
+  /**
    * @brief Resolutions offered to the TV. 1440p is not in Samsung's Cloud Gaming table.
    */
   constexpr std::array SUPPORTED_VIDEO_MODES {
-    video_mode_t {1280, 720, 60, true, true, true, video_codec_e::h264, 12000, false, false},
-    video_mode_t {1920, 1080, 60, true, true, true, video_codec_e::h264, 20000, false, true},
-    video_mode_t {2560, 1440, 60, true, true, true, video_codec_e::hevc, 30000, true, true},
-    video_mode_t {3840, 2160, 60, false, true, true, video_codec_e::hevc, 50000, false, true},
+    video_mode_t {1280, 720, 120, true, true, true, video_codec_e::h264, 12000, false, false},
+    video_mode_t {1920, 1080, 120, true, true, true, video_codec_e::h264, 20000, false, true},
+    video_mode_t {2560, 1440, 120, true, true, true, video_codec_e::hevc, 30000, true, true},
+    video_mode_t {3840, 2160, 120, false, true, true, video_codec_e::hevc, 50000, false, true},
   };
 
   /**
