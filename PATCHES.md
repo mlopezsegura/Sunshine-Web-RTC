@@ -88,7 +88,7 @@ MSYS2 does not package libdatachannel, so Windows builds always take the FetchCo
 | File | Contents |
 |---|---|
 | `src/webrtc/webrtc_stream.{h,cpp}` | The server: libdatachannel `WebSocketServer`, TV connections (up to 8 unauthenticated, one active), sessions, PeerConnection with send-only H.264/H.265/AV1 + Opus tracks and the `control` (reliable) and `gamepad` (unordered, no retransmits) DataChannels, application launch/resume/stop/switch through `proc::proc`, display configuration, the capture pipeline and the Web UI hooks. |
-| `src/webrtc/protocol.{h,cpp}` | Gateway protocol version 2, ported unchanged: stream settings and supported modes, message parsing and construction. |
+| `src/webrtc/protocol.{h,cpp}` | Gateway protocol version 2, ported and extended: stream settings and supported modes (now with 30/60/90/120 fps per mode), message parsing and construction, TV-shown PIN pairing and LAN discovery messages. |
 | `src/webrtc/tv_auth.{h,cpp}` | Pairing requests (the TV shows a 4-digit PIN that the Web UI approves; one attempt, 5 minutes), paired-TV store (`webrtc_tv_clients.json` in Sunshine's config directory) and HMAC-SHA256 nonce authentication. |
 | `src/webrtc/sdp.{h,cpp}` | Samsung Game Mode `imageattr`, single-codec offers, HEVC Main10 `fmtp` and level checks. |
 | `src/webrtc/input_bridge.{h,cpp}` | Gamepad snapshots → Moonlight controller packets fed to `input::passthrough()`, so Sunshine's own controller emulation handles them; long-press Start mouse mode; rumble relayed to the TV. |
@@ -134,7 +134,7 @@ The upstream config-consistency test requires every new option in `config_tabs.j
 ## Verification of this revision
 
 - Builds with MSYS2 UCRT64 (GCC) without warnings.
-- `test_sunshine`: 685 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
+- `test_sunshine`: 686 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
   no virtual HID licence, no external shell command), 0 failed.
 - End to end on an AMD RX 9060 XT (AMF) with headless Edge: pairing through the Web UI PIN form (the TV listed in
   `/api/pin`, a wrong PIN, a cancellation and a stale request ID refused, the right PIN pairing it under
@@ -145,6 +145,12 @@ The upstream config-consistency test requires every new option in `config_tabs.j
   decoded with every frame and 0 packets lost, Opus audio with 0 lost, controller announced,
   stop-session and stop-host-session, PLI answered with IDR, paired TVs persisted across a restart,
   and a clean exit (code 0) when Sunshine shuts down mid-stream.
+- Frame rates: H.264 1080p at 120 fps, H.264 720p at 30 fps and AV1 1080p at 90 fps accepted and streamed
+  with 0 packets lost; the measured rate follows the 60 Hz test display, so above 60 fps needs a 120 Hz
+  source and TV to judge.
+- Discovery: a broadcast `{"version":2,"type":"discover"}` to UDP 8000 answered with the name, the
+  configured `webrtc_port` and the Wake-on-LAN address of the interface facing the sender; malformed and
+  version 1 requests ignored.
 - Not verifiable with headless Edge, which has no HEVC or AV1 10-bit WebRTC decoder: decoding of HEVC
   and of 10-bit HDR streams. Sunshine established those sessions and encoded AV1 Main10 PQ; a Samsung
   TV is the reference.

@@ -32,9 +32,10 @@ less the Opus audio and a small RTP allowance, instead of losing 20% to FEC as i
 
 1. Install this build of Sunshine and complete its normal first-run setup.
 2. If the Moonlight WebRTC Gateway is installed on the same PC, uninstall it or stop its service: both
-   use TCP port 8000.
-3. On the TV, add the PC by its address. The TV app always connects to port 8000, so keep
-   `webrtc_port` at its default for a TV.
+   use port 8000.
+3. On the TV, open Moonlight WebRTC. It finds this PC by broadcasting to UDP port 8000, which Sunshine
+   answers with its name, its `webrtc_port` and its Wake-on-LAN address. On a network that blocks
+   broadcasts, add the PC by its address and port.
 4. The TV shows a four-digit PIN. In the Sunshine Web UI, open **PIN**, select the TV in the list of
    devices waiting to pair (it appears beside any Moonlight client), and enter the PIN. The name typed
    there is the TV's name in Sunshine.
@@ -53,6 +54,10 @@ available while Sunshine is running.
 | `webrtc_enabled` | `enabled` | Serve Moonlight WebRTC TVs.                                   |
 | `webrtc_port`    | `8000`    | TCP port of the signaling WebSocket. Media uses ephemeral UDP. |
 
+TV discovery always listens on UDP port 8000, whatever `webrtc_port` is, and answers only peers on the
+local network: loopback, private, link-local and unique local addresses. Sunshine's firewall rule, which
+allows its executable, already covers it.
+
 Both are on the **Network** tab of the configuration page.
 
 ## Behaviour
@@ -66,6 +71,8 @@ works as is. Sunshine implements it as follows:
   while one runs is refused, as Moonlight does; the TV offers to switch instead.
 - **Stopping the stream** leaves the application running. **Stopping the application** ends every
   stream, Moonlight's included, and terminates the application.
+- **Frame rates** of 30, 60, 90 and 120 fps are offered at every resolution. The TV streams at the
+  highest one its decoder announces it sustains, or lets the user choose when it announces none.
 - **Codecs** are offered from what Sunshine's encoder probe found: AV1 only when the GPU encodes it, and
   AV1 HDR only with AV1 Main10. HEVC and HEVC HDR requests fail when the encoder lacks them.
 - **HDR** requires the host display to be in HDR mode, or Sunshine's display device settings to enable
