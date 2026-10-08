@@ -1093,10 +1093,10 @@ index 00000000..6acae118
 +}  // namespace webrtc_stream
 diff --git a/src/webrtc/protocol.cpp b/src/webrtc/protocol.cpp
 new file mode 100644
-index 00000000..7df7e513
+index 00000000..043d8953
 --- /dev/null
 +++ b/src/webrtc/protocol.cpp
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,464 @@
 +/**
 + * @file src/webrtc/protocol.cpp
 + * @brief Definitions for the Moonlight WebRTC TV protocol (version 2).
@@ -1220,6 +1220,21 @@ index 00000000..7df7e513
 +    }
 +
 +    /**
++     * @brief List the frame rates a mode offers.
++     * @param mode Supported mode.
++     * @return The frame rates, lowest first.
++     */
++    json frame_rates(const video_mode_t &mode) {
++      json rates = json::array();
++      for (const int rate : SUPPORTED_FRAME_RATES) {
++        if (rate <= mode.max_fps) {
++          rates.push_back(rate);
++        }
++      }
++      return rates;
++    }
++
++    /**
 +     * @brief Describe one selectable mode, offering only what the encoder supports.
 +     * @param mode Supported mode.
 +     * @param encoders Encoders available beyond H.264 and HEVC.
@@ -1240,7 +1255,9 @@ index 00000000..7df7e513
 +      return {
 +        {"width", mode.width},
 +        {"height", mode.height},
-+        {"fps", mode.fps},
++        // Older TV apps read fps and request exactly it; newer ones choose from frameRates.
++        {"fps", DEFAULT_FRAME_RATE},
++        {"frameRates", frame_rates(mode)},
 +        {"codecs", std::move(codecs)},
 +        {"hdrCodecs", std::move(hdr_codecs)},
 +        {"defaultCodec", codec_name(mode.default_codec)},
@@ -1254,9 +1271,10 @@ index 00000000..7df7e513
 +
 +  const video_mode_t *find_video_mode(int width, int height, int fps) {
 +    const auto mode = std::ranges::find_if(SUPPORTED_VIDEO_MODES, [=](const video_mode_t &candidate) {
-+      return candidate.width == width && candidate.height == height && candidate.fps == fps;
++      return candidate.width == width && candidate.height == height;
 +    });
-+    return mode == SUPPORTED_VIDEO_MODES.end() ? nullptr : &*mode;
++    const bool offered_rate = std::ranges::find(SUPPORTED_FRAME_RATES, fps) != SUPPORTED_FRAME_RATES.end();
++    return mode == SUPPORTED_VIDEO_MODES.end() || !offered_rate || fps > mode->max_fps ? nullptr : &*mode;
 +  }
 +
 +  bool mode_supports_codec(const video_mode_t &mode, video_codec_e codec) {
@@ -1278,13 +1296,13 @@ index 00000000..7df7e513
 +  std::optional<std::string> validate_stream_settings(const stream_settings_t &settings) {
 +    const auto *mode = find_video_mode(settings.width, settings.height, settings.fps);
 +    if (!mode) {
-+      return settings.fps != 60 ? "Unsupported frame rate" : "Unsupported resolution";
++      return find_video_mode(settings.width, settings.height, DEFAULT_FRAME_RATE) ? "Unsupported frame rate" : "Unsupported resolution";
 +    }
 +    if (!mode_supports_codec(*mode, settings.codec)) {
 +      return "Unsupported resolution and codec combination";
 +    }
 +    if (settings.hdr && !mode_supports_hdr(*mode, settings.codec)) {
-+      return "HDR is supported only with HEVC or AV1 at 1080p60, 1440p60, or 4K60";
++      return "HDR is supported only with HEVC or AV1 at 1080p, 1440p, or 4K";
 +    }
 +    if (settings.audio_channels != 2) {
 +      return "Only stereo audio is supported";
@@ -1410,6 +1428,24 @@ index 00000000..7df7e513
 +    return message;
 +  }
 +
++  bool is_discovery_request(std::string_view datagram) {
++    try {
++      const auto message = json::parse(datagram);
++      return message.is_object() && message.value("version", 0) == VERSION && message.value("type", "") == "discover";
++    } catch (const std::exception &) {
++      return false;
++    }
++  }
++
++  json make_discovery_response(std::string_view name, int port, const std::optional<std::string> &mac_address) {
++    auto message = envelope("discovery");
++    message.update({{"name", name}, {"port", port}});
++    if (mac_address) {
++      message["macAddress"] = *mac_address;
++    }
++    return message;
++  }
++
 +  json make_sunshine_availability(bool sunshine_available) {
 +    auto message = envelope("sunshine-availability");
 +    message["sunshineAvailable"] = sunshine_available;
@@ -1448,7 +1484,7 @@ index 00000000..7df7e513
 +      message["resolutions"].push_back({{"width", mode.width}, {"height", mode.height}, {"experimental", mode.experimental}});
 +    }
 +    message.update({
-+      {"frameRates", {60}},
++      {"frameRates", SUPPORTED_FRAME_RATES},
 +      {"codecs", encoders.av1 ? json::array({"h264", "hevc", "av1"}) : json::array({"h264", "hevc"})},
 +      {"hdr", true},
 +      {"audio", "stereo"},
@@ -1527,10 +1563,10 @@ index 00000000..7df7e513
 +}  // namespace webrtc_stream::protocol
 diff --git a/src/webrtc/protocol.h b/src/webrtc/protocol.h
 new file mode 100644
-index 00000000..df7db3a4
+index 00000000..657ff023
 --- /dev/null
 +++ b/src/webrtc/protocol.h
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,417 @@
 +/**
 + * @file src/webrtc/protocol.h
 + * @brief Declarations for the Moonlight WebRTC TV protocol (version 2).
@@ -1572,7 +1608,7 @@ index 00000000..df7db3a4
 +  struct video_mode_t {
 +    int width;  ///< Width in pixels.
 +    int height;  ///< Height in pixels.
-+    int fps;  ///< Frame rate.
++    int max_fps;  ///< Highest frame rate offered; see @ref SUPPORTED_FRAME_RATES.
 +    bool supports_h264;  ///< Whether H.264 is offered at this resolution.
 +    bool supports_hevc;  ///< Whether HEVC is offered at this resolution.
 +    bool supports_av1;  ///< Whether AV1 is offered at this resolution, when the encoder supports it.
@@ -1602,13 +1638,25 @@ index 00000000..df7db3a4
 +  };
 +
 +  /**
++   * @brief Frame rates a TV may request, up to a mode's @ref video_mode_t::max_fps.
++   *
++   * The TV offers only the rates its own decoder reports it can sustain.
++   */
++  constexpr std::array SUPPORTED_FRAME_RATES {30, 60, 90, 120};
++
++  /**
++   * @brief Frame rate a TV uses when it does not choose one; older TV apps always send it.
++   */
++  constexpr int DEFAULT_FRAME_RATE = 60;
++
++  /**
 +   * @brief Resolutions offered to the TV. 1440p is not in Samsung's Cloud Gaming table.
 +   */
 +  constexpr std::array SUPPORTED_VIDEO_MODES {
-+    video_mode_t {1280, 720, 60, true, true, true, video_codec_e::h264, 12000, false, false},
-+    video_mode_t {1920, 1080, 60, true, true, true, video_codec_e::h264, 20000, false, true},
-+    video_mode_t {2560, 1440, 60, true, true, true, video_codec_e::hevc, 30000, true, true},
-+    video_mode_t {3840, 2160, 60, false, true, true, video_codec_e::hevc, 50000, false, true},
++    video_mode_t {1280, 720, 120, true, true, true, video_codec_e::h264, 12000, false, false},
++    video_mode_t {1920, 1080, 120, true, true, true, video_codec_e::h264, 20000, false, true},
++    video_mode_t {2560, 1440, 120, true, true, true, video_codec_e::hevc, 30000, true, true},
++    video_mode_t {3840, 2160, 120, false, true, true, video_codec_e::hevc, 50000, false, true},
 +  };
 +
 +  /**
@@ -1818,6 +1866,27 @@ index 00000000..df7db3a4
 +  nlohmann::json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available);
 +
 +  /**
++   * @brief UDP port on which Sunshine answers TVs looking for it, whatever `webrtc_port` is.
++   */
++  constexpr std::uint16_t DISCOVERY_PORT = 8000;
++
++  /**
++   * @brief Check whether a datagram is a TV looking for Sunshine on the local network.
++   * @param datagram Received datagram.
++   * @return True for `{"version":2,"type":"discover"}`.
++   */
++  bool is_discovery_request(std::string_view datagram);
++
++  /**
++   * @brief Build the reply that tells a TV where to connect.
++   * @param name Sunshine's name.
++   * @param port TCP port of the signaling WebSocket.
++   * @param mac_address Wake-on-LAN address facing the TV, if known.
++   * @return The message.
++   */
++  nlohmann::json make_discovery_response(std::string_view name, int port, const std::optional<std::string> &mac_address);
++
++  /**
 +   * @brief Build the push sent when streaming becomes possible or impossible.
 +   * @param sunshine_available Whether streaming is possible.
 +   * @return The message.
@@ -1917,10 +1986,10 @@ index 00000000..df7db3a4
 +}  // namespace webrtc_stream::protocol
 diff --git a/src/webrtc/sdp.cpp b/src/webrtc/sdp.cpp
 new file mode 100644
-index 00000000..bf5b30b9
+index 00000000..76e312a8
 --- /dev/null
 +++ b/src/webrtc/sdp.cpp
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,195 @@
 +/**
 + * @file src/webrtc/sdp.cpp
 + * @brief Definitions for the SDP details Samsung Tizen needs for low-latency streaming.
@@ -1928,6 +1997,7 @@ index 00000000..bf5b30b9
 +// standard includes
 +#include <array>
 +#include <charconv>
++#include <cstdint>
 +
 +// local includes
 +#include "sdp.h"
@@ -2062,11 +2132,29 @@ index 00000000..bf5b30b9
 +    if (settings.codec != protocol::video_codec_e::hevc || !settings.hdr) {
 +      return std::nullopt;
 +    }
-+    int level_id = 123;
-+    if (settings.width == 2560) {
-+      level_id = 150;
-+    } else if (settings.width == 3840) {
-+      level_id = 153;
++
++    // The lowest Main-tier level whose picture size and luma sample rate hold the stream
++    // (H.265 table A.8): 4.1 for 1080p60, 5.0 for 1440p60, 5.1 for 4K60, 5.2 for 4K120.
++    struct level_t {
++      int id;  // level-id, 30 times the level number.
++      std::int64_t max_picture_size;
++      std::int64_t max_sample_rate;
++    };
++
++    constexpr std::array LEVELS {
++      level_t {123, 2228224, 133693440},
++      level_t {150, 8912896, 267386880},
++      level_t {153, 8912896, 534773760},
++      level_t {156, 8912896, 1069547520},
++    };
++    const std::int64_t picture_size = static_cast<std::int64_t>(settings.width) * settings.height;
++    const std::int64_t sample_rate = picture_size * settings.fps;
++    int level_id = LEVELS.back().id;
++    for (const auto &level : LEVELS) {
++      if (picture_size <= level.max_picture_size && sample_rate <= level.max_sample_rate) {
++        level_id = level.id;
++        break;
++      }
 +    }
 +    return "profile-id=2;tier-flag=0;level-id=" + std::to_string(level_id);
 +  }
@@ -2707,16 +2795,17 @@ index 00000000..406ed408
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/webrtc_stream.cpp b/src/webrtc/webrtc_stream.cpp
 new file mode 100644
-index 00000000..3b07cbaf
+index 00000000..9fd44130
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.cpp
-@@ -0,0 +1,1879 @@
+@@ -0,0 +1,1973 @@
 +/**
 + * @file src/webrtc/webrtc_stream.cpp
 + * @brief Definitions for streaming to Moonlight WebRTC TVs directly from Sunshine.
 + */
 +// standard includes
 +#include <algorithm>
++#include <array>
 +#include <atomic>
 +#include <charconv>
 +#include <chrono>
@@ -3063,6 +3152,97 @@ index 00000000..3b07cbaf
 +    };
 +
 +    /**
++     * @brief Check that a peer is on the local network.
++     * @param address Peer address.
++     * @return True for loopback, private, link-local and unique local addresses.
++     */
++    bool is_local_peer(const boost::asio::ip::address &address) {
++      if (address.is_v6()) {
++        const auto v6 = address.to_v6();
++        if (v6.is_v4_mapped()) {
++          return is_local_peer(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6));
++        }
++        return v6.is_loopback() || v6.is_link_local() || (v6.to_bytes()[0] & 0xFE) == 0xFC;
++      }
++      const auto bytes = address.to_v4().to_bytes();
++      return bytes[0] == 127 || bytes[0] == 10 || (bytes[0] == 172 && (bytes[1] & 0xF0) == 16) ||
++             (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 169 && bytes[1] == 254);
++    }
++
++    /**
++     * @brief Answers TVs looking for Sunshine on the local network.
++     *
++     * A TV broadcasts `{"version":2,"type":"discover"}` to UDP @ref protocol::DISCOVERY_PORT and
++     * learns this PC's address from the reply's source, plus its name, signaling port and
++     * Wake-on-LAN address. Only local peers are answered, with a reply about as small as the request.
++     */
++    class discovery_responder_t {
++    public:
++      explicit discovery_responder_t(std::uint16_t port):
++          _socket(_io) {
++        boost::system::error_code error;
++        _socket.open(boost::asio::ip::udp::v4(), error);
++        if (!error) {
++          _socket.bind({boost::asio::ip::address_v4::any(), port}, error);
++        }
++        if (error) {
++          BOOST_LOG(warning) << "WebRTC: TV discovery unavailable on UDP port "sv << port << ": "sv << error.message();
++          return;
++        }
++        receive();
++        _thread = std::jthread([this] {
++          _io.run();
++        });
++        BOOST_LOG(info) << "WebRTC: answering TV discovery on UDP port "sv << port;
++      }
++
++      ~discovery_responder_t() {
++        _io.stop();
++      }
++
++      discovery_responder_t(const discovery_responder_t &) = delete;
++      discovery_responder_t &operator=(const discovery_responder_t &) = delete;
++
++    private:
++      void receive() {
++        _socket.async_receive_from(boost::asio::buffer(_buffer), _sender, [this](const boost::system::error_code &error, std::size_t size) {
++          if (error == boost::asio::error::operation_aborted) {
++            return;
++          }
++          // Windows reports an ICMP port-unreachable for an earlier reply as connection_reset.
++          if (error && error != boost::asio::error::connection_reset) {
++            BOOST_LOG(warning) << "WebRTC: TV discovery stopped: "sv << error.message();
++            return;
++          }
++          if (!error) {
++            answer(std::string_view(_buffer.data(), size));
++          }
++          receive();
++        });
++      }
++
++      void answer(std::string_view datagram) {
++        const auto address = _sender.address();
++        if (!is_local_peer(address) || !protocol::is_discovery_request(datagram)) {
++          return;
++        }
++        const auto mac = wake_on_lan_address(address.to_string() + ":0");
++        const auto reply = protocol::make_discovery_response(config::nvhttp.sunshine_name, config::webrtc.port, mac).dump();
++        boost::system::error_code error;
++        _socket.send_to(boost::asio::buffer(reply), _sender, 0, error);
++        if (error) {
++          BOOST_LOG(debug) << "WebRTC: discovery reply not sent: "sv << error.message();
++        }
++      }
++
++      boost::asio::io_context _io;  ///< Runs the socket.
++      boost::asio::ip::udp::socket _socket;  ///< Discovery socket.
++      boost::asio::ip::udp::endpoint _sender;  ///< Sender of the datagram being received.
++      std::array<char, 512> _buffer {};  ///< Received datagram.
++      std::jthread _thread;  ///< Runs @ref _io; joined after it stops.
++    };
++
++    /**
 +     * @brief One TV WebSocket connection.
 +     */
 +    struct connection_t {
@@ -3097,6 +3277,7 @@ index 00000000..3b07cbaf
 +          accept(std::move(socket));
 +        });
 +        _codecs = current_codec_support();
++        _discovery = std::make_unique<discovery_responder_t>(protocol::DISCOVERY_PORT);
 +        BOOST_LOG(info) << "WebRTC: TV server listening on port "sv << config::webrtc.port << ", "sv << _tv_clients.count() << " paired TV(s)"sv;
 +      }
 +
@@ -4492,6 +4673,7 @@ index 00000000..3b07cbaf
 +      std::unordered_map<std::string, std::optional<std::pair<std::string, std::string>>> _artwork;  ///< MIME type and Base64 by app ID.
 +      std::atomic<std::uint64_t> _next_session_id {1};  ///< Next session ID.
 +      std::unique_ptr<rtc::WebSocketServer> _server;  ///< Signaling server.
++      std::unique_ptr<discovery_responder_t> _discovery;  ///< Answers TVs looking for Sunshine.
 +    };
 +
 +    std::mutex server_mutex;  ///< Protects @ref running_server.

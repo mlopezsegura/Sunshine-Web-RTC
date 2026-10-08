@@ -264,10 +264,10 @@ index 00000000..d4d98269
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_protocol.cpp b/tests/unit/webrtc/test_webrtc_protocol.cpp
 new file mode 100644
-index 00000000..95fa86b8
+index 00000000..2c8e1eee
 --- /dev/null
 +++ b/tests/unit/webrtc/test_webrtc_protocol.cpp
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,162 @@
 +/**
 + * @file tests/unit/webrtc/test_webrtc_protocol.cpp
 + * @brief Tests for the Moonlight WebRTC TV protocol.
@@ -330,6 +330,10 @@ index 00000000..95fa86b8
 +
 +  auto fps = settings(1920, 1080, video_codec_e::h264);
 +  fps.fps = 120;
++  EXPECT_FALSE(validate_stream_settings(fps));
++  fps.fps = 144;
++  EXPECT_EQ(validate_stream_settings(fps), "Unsupported frame rate");
++  fps.fps = 75;
 +  EXPECT_EQ(validate_stream_settings(fps), "Unsupported frame rate");
 +}
 +
@@ -366,6 +370,22 @@ index 00000000..95fa86b8
 +  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"pair-client","pin":"0421"})"), "unsupported-pairing");
 +}
 +
++TEST(WebrtcProtocolTest, AnswersTvsLookingForSunshine) {
++  EXPECT_TRUE(is_discovery_request(R"({"version":2,"type":"discover"})"));
++  EXPECT_FALSE(is_discovery_request(R"({"version":1,"type":"discover"})"));
++  EXPECT_FALSE(is_discovery_request(R"({"version":2,"type":"get-apps"})"));
++  EXPECT_FALSE(is_discovery_request("discover"));
++  EXPECT_FALSE(is_discovery_request(""));
++
++  const auto reply = make_discovery_response("Living Room PC", 8001, std::string("2C:F0:5D:7B:E6:D0"));
++  EXPECT_EQ(reply.at("type"), "discovery");
++  EXPECT_EQ(reply.at("version"), 2);
++  EXPECT_EQ(reply.at("name"), "Living Room PC");
++  EXPECT_EQ(reply.at("port"), 8001);
++  EXPECT_EQ(reply.at("macAddress"), "2C:F0:5D:7B:E6:D0");
++  EXPECT_FALSE(make_discovery_response("PC", 8000, std::nullopt).contains("macAddress"));
++}
++
 +TEST(WebrtcProtocolTest, AnnouncesThatTheTvShowsThePin) {
 +  EXPECT_EQ(make_auth_required("00", std::nullopt, true).at("pairing"), "client-pin");
 +}
@@ -382,7 +402,10 @@ index 00000000..95fa86b8
 +  const auto av1_hdr = make_capabilities({true, true});
 +  EXPECT_EQ(find_mode(av1_hdr, 3840)->at("hdrCodecs"), nlohmann::json::array({"hevc", "av1"}));
 +  EXPECT_EQ(find_mode(av1_hdr, 1280)->at("hdrCodecs"), nlohmann::json::array());
-+  EXPECT_EQ(av1_hdr.at("frameRates"), nlohmann::json::array({60}));
++  EXPECT_EQ(av1_hdr.at("frameRates"), nlohmann::json::array({30, 60, 90, 120}));
++  // Older TV apps request the mode's fps; newer ones choose from its frameRates.
++  EXPECT_EQ(find_mode(av1_hdr, 3840)->at("fps"), 60);
++  EXPECT_EQ(find_mode(av1_hdr, 3840)->at("frameRates"), nlohmann::json::array({30, 60, 90, 120}));
 +}
 +
 +TEST(WebrtcProtocolTest, ReportsSunshineAsDetectedAndPaired) {
@@ -409,10 +432,10 @@ index 00000000..95fa86b8
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_sdp.cpp b/tests/unit/webrtc/test_webrtc_sdp.cpp
 new file mode 100644
-index 00000000..ce49ec1c
+index 00000000..7680603b
 --- /dev/null
 +++ b/tests/unit/webrtc/test_webrtc_sdp.cpp
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,78 @@
 +/**
 + * @file tests/unit/webrtc/test_webrtc_sdp.cpp
 + * @brief Tests for the Samsung Tizen SDP helpers.
@@ -466,6 +489,16 @@ index 00000000..ce49ec1c
 +  EXPECT_EQ(sdp::hevc_format_parameters(settings(1920, 1080, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=123");
 +  EXPECT_EQ(sdp::hevc_format_parameters(settings(2560, 1440, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=150");
 +  EXPECT_EQ(sdp::hevc_format_parameters(settings(3840, 2160, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=153");
++  // The level follows the luma sample rate, so higher frame rates need higher levels.
++  auto fast = settings(1920, 1080, protocol::video_codec_e::hevc, true);
++  fast.fps = 120;
++  EXPECT_EQ(sdp::hevc_format_parameters(fast), "profile-id=2;tier-flag=0;level-id=150");
++  fast = settings(2560, 1440, protocol::video_codec_e::hevc, true);
++  fast.fps = 120;
++  EXPECT_EQ(sdp::hevc_format_parameters(fast), "profile-id=2;tier-flag=0;level-id=153");
++  fast = settings(3840, 2160, protocol::video_codec_e::hevc, true);
++  fast.fps = 120;
++  EXPECT_EQ(sdp::hevc_format_parameters(fast), "profile-id=2;tier-flag=0;level-id=156");
 +}
 +
 +TEST(WebrtcSdpTest, ChecksThatTheAnswerKeepsMain10) {
@@ -648,10 +681,10 @@ index 00000000..6fc3c9ae
 +streams are established but their frames are only received, not decoded; a Samsung TV decodes them.
 diff --git a/tests/webrtc_e2e/client.html b/tests/webrtc_e2e/client.html
 new file mode 100644
-index 00000000..e83708c8
+index 00000000..91a6cbe5
 --- /dev/null
 +++ b/tests/webrtc_e2e/client.html
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,207 @@
 +<!doctype html>
 +<html>
 +<head><meta charset="utf-8"><title>WebRTC TV E2E</title></head>
@@ -665,10 +698,11 @@ index 00000000..e83708c8
 +const width = Number(params.get("width") || 1280);
 +const height = Number(params.get("height") || 720);
 +const bitrate = Number(params.get("bitrate") || 12000);
++const fps = Number(params.get("fps") || 60);
 +const hdr = params.get("hdr") === "1";
 +const takeover = params.get("takeover") === "1";
 +const log = [];
-+const result = { codec, width, height, hdr, steps: [], errors: [] };
++const result = { codec, width, height, fps, hdr, steps: [], errors: [] };
 +const t0 = performance.now();
 +function note(step, extra) {
 +  const entry = { t: Math.round(performance.now() - t0), step, ...(extra || {}) };
@@ -746,7 +780,7 @@ index 00000000..e83708c8
 +    if (phase !== "artwork") return;
 +    phase = "start";
 +    send({ type: "start-session", appId,
-+           video: { width, height, fps: 60, codec, bitrateKbps: bitrate, hdr }, audio: { channels: 2 } });
++           video: { width, height, fps, codec, bitrateKbps: bitrate, hdr }, audio: { channels: 2 } });
 +  } else if (m.type === "session-status") {
 +    note("session-" + m.state, m.message ? { message: m.message } : undefined);
 +    if (m.sessionId) sessionId = m.sessionId;
@@ -860,7 +894,7 @@ index 00000000..e83708c8
 +</html>
 diff --git a/tests/webrtc_e2e/driver.mjs b/tests/webrtc_e2e/driver.mjs
 new file mode 100644
-index 00000000..57b097e5
+index 00000000..7e1978d2
 --- /dev/null
 +++ b/tests/webrtc_e2e/driver.mjs
 @@ -0,0 +1,114 @@
@@ -868,7 +902,7 @@ index 00000000..57b097e5
 +// Chromium browser, approves the PIN it shows through the Web UI API, and prints what it measured.
 +//
 +//   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
-+//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --bitrate=20000 --hdr=1]
++//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --fps=60 --bitrate=20000 --hdr=1]
 +//                   [--summary=1] [--unpair=0] [--takeover=1] [--browser=path/to/msedge.exe]
 +//
 +// Sunshine's Web UI uses a self-signed certificate: run with NODE_TLS_REJECT_UNAUTHORIZED=0.
@@ -938,7 +972,7 @@ index 00000000..57b097e5
 +console.log("API clients before:", JSON.stringify(clientsBefore));
 +
 +const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin, codec: args.codec || "h264",
-+  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", takeover: args.takeover || "0" });
++  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", fps: args.fps || "60", takeover: args.takeover || "0" });
 +let edge;
 +const server = http.createServer((request, response) => {
 +  if (request.method === "POST" && request.url === "/result") {
@@ -948,7 +982,7 @@ index 00000000..57b097e5
 +      response.end("ok");
 +      const result = JSON.parse(body);
 +      if (args.summary === "1") {
-+        console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, hdr: result.hdr, errors: result.errors,
++        console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, fps: result.fps, hdr: result.hdr, errors: result.errors,
 +          states: result.steps.filter((s) => s.step.startsWith("session-") || s.step.startsWith("host-") || s.step.startsWith("takeover") || s.step.startsWith("replaced") || s.step === "offer").map((s) => s.step + (s.message ? "(" + s.message + ")" : "") + (s.rtpmap ? "[" + s.rtpmap + "]" : "")),
 +          video: result.stats?.video, audio: result.stats?.audio, codecs: result.stats?.codecs, measuredFps: result.measuredFps, measuredKbps: result.measuredKbps }, null, 1));
 +      } else {
