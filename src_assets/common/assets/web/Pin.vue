@@ -56,17 +56,12 @@
     <div class="d-flex flex-column align-items-center">
       <div class="card flex-column d-flex p-4 mb-4">
         <p class="mb-3">{{ $t('pin.tv_pairing_desc') }}</p>
-        <div v-if="tvPin" class="text-center mb-3">
-          <div class="display-4 fw-bold" id="tv-pin">{{ tvPin }}</div>
-          <div class="form-text">{{ tvStatusText }}</div>
-        </div>
-        <button type="button" class="btn btn-primary mb-3" @click="pairTv">
-          <tv :size="18" class="icon"></tv>
-          {{ $t('pin.tv_pair') }}
-        </button>
         <ul class="list-group mb-3">
           <li v-if="!pairedTvs.length" class="list-group-item">{{ $t('pin.tv_none') }}</li>
-          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">{{ tv.name }}</li>
+          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">
+            <tv :size="18" class="icon"></tv>
+            {{ tv.name }}
+          </li>
         </ul>
         <button type="button" class="btn btn-outline-danger" :disabled="!pairedTvs.length" @click="unpairTvs">
           <x :size="18" class="icon"></x>
@@ -108,22 +103,21 @@
         pin: '',
         refreshTimer: null,
         selectedPairingId: '',
+        suggestedName: '',
         status: null,
         pairedTvs: [],
-        tvPairing: 'tv-pairing-idle',
-        tvPin: '',
         tvStatus: null,
       };
     },
-    computed: {
-      tvStatusText() {
-        const keys = {
-          'tv-pairing-waiting': 'pin.tv_waiting',
-          'tv-paired': 'pin.tv_paired',
-          'tv-pairing-expired': 'pin.tv_expired',
-          'tv-pairing-locked': 'pin.tv_locked',
-        };
-        return keys[this.tvPairing] ? this.i18n.t(keys[this.tvPairing]) : '';
+    watch: {
+      /**
+       * Suggest the name the selected device reported, keeping one the operator typed.
+       */
+      selectedPairingId(id) {
+        if (!this.name || this.name === this.suggestedName) {
+          this.name = this.pendingPairings.find((pairing) => pairing.id === id)?.name || '';
+          this.suggestedName = this.name;
+        }
       },
     },
     mounted() {
@@ -186,6 +180,8 @@
           this.status = {type: 'success', message: this.i18n.t('pin.pair_success')};
           this.pin = '';
           this.name = '';
+          this.suggestedName = '';
+          await this.loadTvs();
         } else {
           this.status = {type: 'danger', message: this.i18n.t('pin.pair_failure')};
         }
@@ -193,7 +189,7 @@
       },
 
       /**
-       * Refresh the Moonlight WebRTC TVs and the state of an open TV pairing window.
+       * Refresh the paired Moonlight WebRTC TVs.
        */
       async loadTvs() {
         try {
@@ -203,27 +199,8 @@
           }
           const body = await response.json();
           this.pairedTvs = body.tvs || [];
-          this.tvPairing = body.pairing || 'tv-pairing-idle';
-          if (this.tvPairing !== 'tv-pairing-waiting' && this.tvPairing !== 'tv-paired') {
-            this.tvPin = '';
-          }
         } catch (error) {
           console.error('Failed to load Moonlight WebRTC TVs', error);
-        }
-      },
-
-      /**
-       * Open a two-minute window and show the PIN to enter on the TV.
-       */
-      async pairTv() {
-        this.tvStatus = null;
-        const response = await apiFetch('./api/webrtc/pair', {method: 'POST'});
-        const result = await response.json();
-        if (result.status === true) {
-          this.tvPin = result.pin;
-          this.tvPairing = 'tv-pairing-waiting';
-        } else {
-          this.tvStatus = {type: 'danger', message: this.i18n.t('pin.tv_pair_failure')};
         }
       },
 

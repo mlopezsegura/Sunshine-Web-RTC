@@ -33,9 +33,15 @@ less the Opus audio and a small RTP allowance, instead of losing 20% to FEC as i
 1. Install this build of Sunshine and complete its normal first-run setup.
 2. If the Moonlight WebRTC Gateway is installed on the same PC, uninstall it or stop its service: both
    use TCP port 8000.
-3. In the Sunshine Web UI, open **PIN**, choose **Pair TV** and enter the four-digit PIN on the TV within
-   two minutes. The PIN is valid for three attempts.
-4. On the TV, add the PC by its address. The TV app connects to port 8000 unless another port is entered.
+3. On the TV, add the PC by its address. The TV app always connects to port 8000, so keep
+   `webrtc_port` at its default for a TV.
+4. The TV shows a four-digit PIN. In the Sunshine Web UI, open **PIN**, select the TV in the list of
+   devices waiting to pair (it appears beside any Moonlight client), and enter the PIN. The name typed
+   there is the TV's name in Sunshine.
+
+Pairing works like Moonlight's: the TV picks the PIN and only a user signed in to the Web UI can approve
+it. A wrong PIN ends the request and the TV shows a new PIN at once; an unused PIN is replaced after five
+minutes. Older TV apps, which entered a PIN shown on the PC, are told to update.
 
 There is no Moonlight pairing between the Gateway and Sunshine any more, so the TV only shows Sunshine as
 available while Sunshine is running.
@@ -72,8 +78,10 @@ works as is. Sunshine implements it as follows:
 
 | Endpoint                       | Description                                         |
 |--------------------------------|-----------------------------------------------------|
-| `GET /api/webrtc/tvs`          | Paired TVs and the state of the pairing window.     |
-| `POST /api/webrtc/pair`        | Opens the pairing window and returns its PIN.       |
+| `GET /api/pin`                 | Lists TVs waiting to pair beside Moonlight clients. |
+| `POST /api/pin`                | Pairs the selected TV when the PIN matches its own. |
+| `DELETE /api/pin`              | Declines the selected TV's pairing request.         |
+| `GET /api/webrtc/tvs`          | Paired TVs.                                         |
 | `POST /api/webrtc/unpair-all`  | Forgets every TV and disconnects the connected one. |
 
 ## Implementation
@@ -82,7 +90,7 @@ works as is. Sunshine implements it as follows:
 |--------------------------------|----------------------------------------------------------------------|
 | `src/webrtc/webrtc_stream.cpp` | Signaling server, TV sessions, application lifecycle, media pumping. |
 | `src/webrtc/protocol.cpp`      | Protocol messages and stream settings.                               |
-| `src/webrtc/tv_auth.cpp`       | TV pairing window, credential store and HMAC authentication.         |
+| `src/webrtc/tv_auth.cpp`       | TV pairing requests, credential store and HMAC authentication.         |
 | `src/webrtc/sdp.cpp`           | Samsung Game Mode `imageattr` and HEVC Main10 SDP handling.          |
 | `src/webrtc/input_bridge.cpp`  | Gamepad snapshots to Moonlight input packets, mouse mode, rumble.    |
 

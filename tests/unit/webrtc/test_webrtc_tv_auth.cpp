@@ -82,33 +82,32 @@ TEST(WebrtcTvAuthTest, TrustsNobodyFromAnUnreadableStore) {
   std::filesystem::remove(path);
 }
 
-TEST(WebrtcTvAuthTest, AcceptsTheShownPinOnce) {
-  tv_pairing_window_t window;
-  const auto now = tv_pairing_window_t::clock::now();
-  EXPECT_EQ(window.attempt("0000", now), pairing_attempt_e::not_open);
-  const auto pin = window.open(now);
-  EXPECT_EQ(window.state(now), pairing_state_e::waiting);
-  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::accepted);
-  EXPECT_EQ(window.state(now), pairing_state_e::paired);
-  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::not_open);
+TEST(WebrtcTvAuthTest, AcceptsOnlyThePinTheTvShows) {
+  const auto now = pairing_request_t::clock::now();
+  const auto request = make_pairing_request("0421", "Living room\n", "192.168.1.20", now);
+  ASSERT_TRUE(request);
+  EXPECT_TRUE(is_hex(request->id, PAIRING_ID_BYTES));
+  EXPECT_EQ(request->client_name, "Living room");
+  EXPECT_EQ(request->address, "192.168.1.20");
+  EXPECT_EQ(check_pairing_pin(*request, "0421", now), pairing_check_e::accepted);
+  EXPECT_EQ(check_pairing_pin(*request, "0420", now), pairing_check_e::incorrect_pin);
+  EXPECT_EQ(check_pairing_pin(*request, "421", now), pairing_check_e::incorrect_pin);
 }
 
-TEST(WebrtcTvAuthTest, LocksAfterThreeWrongPins) {
-  tv_pairing_window_t window;
-  const auto now = tv_pairing_window_t::clock::now();
-  const auto pin = window.open(now);
-  const auto *wrong = pin == "0000" ? "1111" : "0000";
-  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::incorrect_pin);
-  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::incorrect_pin);
-  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::too_many_attempts);
-  EXPECT_EQ(window.state(now), pairing_state_e::failed);
-  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::not_open);
+TEST(WebrtcTvAuthTest, GivesEachRequestItsOwnId) {
+  const auto now = pairing_request_t::clock::now();
+  EXPECT_NE(make_pairing_request("0421", "", "a", now)->id, make_pairing_request("0421", "", "a", now)->id);
 }
 
-TEST(WebrtcTvAuthTest, ExpiresAfterTwoMinutes) {
-  tv_pairing_window_t window;
-  const auto now = tv_pairing_window_t::clock::now();
-  const auto pin = window.open(now);
-  EXPECT_EQ(window.attempt(pin, now + PAIRING_WINDOW_LIFETIME), pairing_attempt_e::not_open);
-  EXPECT_EQ(window.state(now + PAIRING_WINDOW_LIFETIME), pairing_state_e::expired);
+TEST(WebrtcTvAuthTest, RejectsPinsThatAreNotFourDigits) {
+  const auto now = pairing_request_t::clock::now();
+  EXPECT_FALSE(make_pairing_request("042", "", "a", now));
+  EXPECT_FALSE(make_pairing_request("04a1", "", "a", now));
+  EXPECT_FALSE(make_pairing_request("04210", "", "a", now));
+}
+
+TEST(WebrtcTvAuthTest, ExpiresAPairingRequest) {
+  const auto now = pairing_request_t::clock::now();
+  const auto request = make_pairing_request("0421", "", "a", now);
+  EXPECT_EQ(check_pairing_pin(*request, "0421", now + PAIRING_REQUEST_LIFETIME), pairing_check_e::expired);
 }

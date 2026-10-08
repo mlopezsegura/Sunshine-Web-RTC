@@ -160,10 +160,10 @@ namespace webrtc_stream::protocol {
   };
 
   /**
-   * @brief A TV pairing with the PIN shown on the PC.
+   * @brief A TV asking to pair, showing a PIN for the user to enter in Sunshine's Web UI.
    */
-  struct pair_client_t {
-    std::string pin;  ///< Four-digit PIN.
+  struct request_pairing_t {
+    std::string pin;  ///< Four-digit PIN the TV shows.
     std::string client_name;  ///< Display name of the TV.
   };
 
@@ -225,7 +225,7 @@ namespace webrtc_stream::protocol {
   /**
    * @brief Any message the TV may send.
    */
-  using client_payload_t = std::variant<authenticate_t, pair_client_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
+  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
 
   /**
    * @brief A parsed TV message.
@@ -273,6 +273,10 @@ namespace webrtc_stream::protocol {
 
   /**
    * @brief Build the greeting carrying the authentication nonce.
+   *
+   * It also announces `"pairing": "client-pin"`: an unpaired TV shows its own PIN and sends
+   * `request-pairing`, rather than asking for a PIN shown on the PC as the standalone Gateway does.
+   *
    * @param nonce Single-use nonce in lower-case hex.
    * @param mac_address Wake-on-LAN address, offered before authentication like ARP does.
    * @param sunshine_available Whether streaming is possible, for the TV's reachability probe.

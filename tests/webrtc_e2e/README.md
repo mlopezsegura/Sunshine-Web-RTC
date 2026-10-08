@@ -1,8 +1,9 @@
 # Moonlight WebRTC end-to-end test
 
-`driver.mjs` checks the Moonlight WebRTC TV server of a running Sunshine from end to end. It opens a
-pairing window through the Web UI API, then loads `client.html` in headless Edge, which plays the TV:
-it pairs with the PIN (after a wrong one), reconnects and authenticates, lists the applications, fetches
+`driver.mjs` checks the Moonlight WebRTC TV server of a running Sunshine from end to end. It loads
+`client.html` in headless Edge, which plays the TV: it asks to pair showing a PIN, which the driver
+approves through `/api/pin` like a user in the Web UI would (after a wrong PIN and a cancellation); the
+page then reconnects and authenticates, lists the applications, fetches
 artwork, starts a stream, announces a gamepad, measures the decoded video and audio through `getStats()`,
 and finally stops the stream and the application. The driver prints the steps and statistics.
 

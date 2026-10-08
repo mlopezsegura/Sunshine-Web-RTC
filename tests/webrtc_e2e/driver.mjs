@@ -1,5 +1,5 @@
-// Drives one end-to-end run against a running Sunshine: pairs through the Web UI API, serves the
-// TV stand-in page to a headless Chromium browser, and prints what the page measured.
+// Drives one end-to-end run against a running Sunshine: serves the TV stand-in page to a headless
+// Chromium browser, approves the PIN it shows through the Web UI API, and prints what it measured.
 //
 //   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
 //                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --bitrate=20000 --hdr=1]
@@ -19,23 +19,56 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/
 const webUi = args.webui || "https://127.0.0.1:50001";
 const auth = "Basic " + Buffer.from(args.creds || "e2e:e2e-password").toString("base64");
 
-function api(method, route) {
+function api(method, route, payload) {
   return new Promise((resolve, reject) => {
-    const request = https.request(webUi + route, { method, headers: { Authorization: auth }, rejectUnauthorized: false }, (response) => {
+    const headers = { Authorization: auth };
+    if (payload) {
+      // Sunshine's server reads no chunked bodies, which Node would send for a DELETE.
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(JSON.stringify(payload));
+    }
+    const request = https.request(webUi + route, { method, headers, rejectUnauthorized: false }, (response) => {
       let body = "";
       response.on("data", (chunk) => (body += chunk));
       response.on("end", () => resolve({ status: response.statusCode, body: body ? JSON.parse(body) : null }));
     });
     request.on("error", reject);
-    request.end();
+    request.end(payload ? JSON.stringify(payload) : undefined);
   });
 }
 
-const before = await api("GET", "/api/webrtc/tvs");
-const pairing = await api("POST", "/api/webrtc/pair");
-console.log("API tvs:", JSON.stringify(before.body), "pair:", pairing.status, pairing.body.status, "pin length", (pairing.body.pin || "").length);
+// The page shows this PIN like a TV does; the driver plays the user typing it into the Web UI.
+const pin = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+const wrongPin = pin === "0000" ? "1111" : "0000";
 
-const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin: pairing.body.pin, codec: args.codec || "h264",
+async function waitForTvRequest(previousId) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const pending = await api("GET", "/api/pin");
+    const tv = (pending.body.pairings || []).find((pairing) => pairing.name === "E2E Edge" && pairing.id !== previousId);
+    if (tv) {
+      return tv;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error("The TV's pairing request never appeared in /api/pin");
+}
+
+// A wrong PIN and a cancellation each end the request; the page asks again and the right PIN pairs it.
+async function pairThroughWebUi() {
+  const first = await waitForTvRequest();
+  console.log("API pin GET: TV listed", JSON.stringify({ name: first.name, address: first.address, idLength: first.id.length }));
+  console.log("API pin POST wrong PIN:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: first.id, pin: wrongPin, name: "E2E Edge" })).body));
+  const second = await waitForTvRequest(first.id);
+  console.log("API pin DELETE:", JSON.stringify((await api("DELETE", "/api/pin", { pairing_id: second.id })).body));
+  const third = await waitForTvRequest(second.id);
+  console.log("API pin POST stale id:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: first.id, pin, name: "E2E Edge" })).body));
+  console.log("API pin POST right PIN:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: third.id, pin, name: "E2E Living Room" })).body));
+}
+
+const before = await api("GET", "/api/webrtc/tvs");
+console.log("API tvs:", JSON.stringify(before.body));
+
+const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin, codec: args.codec || "h264",
   width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0" });
 let edge;
 const server = http.createServer((request, response) => {
@@ -71,5 +104,6 @@ server.listen(8099, "127.0.0.1", () => {
   edge = spawn(args.browser || "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", [
     "--headless=new", "--no-first-run", "--user-data-dir=" + profile, "--autoplay-policy=no-user-gesture-required",
     "--remote-debugging-port=0", "--enable-features=WebRtcAllowH265Receive,PlatformHEVCDecoderSupport", "http://127.0.0.1:8099/?" + query], { stdio: "ignore" });
+  pairThroughWebUi().catch((error) => { console.log("pairing failed:", error.message); edge?.kill(); process.exit(3); });
 });
 setTimeout(() => { console.log("driver timeout"); edge?.kill(); process.exit(2); }, 90000);

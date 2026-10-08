@@ -20,8 +20,8 @@ namespace webrtc_stream::tv_auth {
   constexpr std::size_t NONCE_BYTES = 32;  ///< Length of a connection nonce.
   constexpr std::size_t MAXIMUM_CLIENTS = 32;  ///< Paired TVs kept; the oldest is dropped beyond this.
   constexpr std::size_t MAXIMUM_CLIENT_NAME_LENGTH = 64;  ///< Longest stored TV name.
-  constexpr int MAXIMUM_PIN_ATTEMPTS = 3;  ///< Wrong PINs that close a pairing window.
-  constexpr std::chrono::seconds PAIRING_WINDOW_LIFETIME {120};  ///< How long a PIN stays valid.
+  constexpr std::size_t PAIRING_ID_BYTES = 16;  ///< Length of a pairing request ID.
+  constexpr std::chrono::seconds PAIRING_REQUEST_LIFETIME {300};  ///< How long a TV's PIN waits for approval.
 
   /**
    * @brief Generate random bytes as lower-case hex.
@@ -138,73 +138,54 @@ namespace webrtc_stream::tv_auth {
   };
 
   /**
-   * @brief Outcome of one PIN entered on a TV.
+   * @brief Check that a PIN has four digits.
+   * @param pin PIN to check.
+   * @return True when it is valid.
    */
-  enum class pairing_attempt_e {
-    accepted,  ///< The PIN matched.
-    incorrect_pin,  ///< The PIN did not match; the window stays open.
-    not_open,  ///< No pairing window is open.
-    too_many_attempts,  ///< The PIN did not match and the window closed.
+  bool is_valid_pin(std::string_view pin);
+
+  /**
+   * @brief Outcome of the PIN entered in Sunshine's Web UI for a TV's pairing request.
+   */
+  enum class pairing_check_e {
+    accepted,  ///< The PIN matched the one the TV shows.
+    incorrect_pin,  ///< The PIN did not match; the request ends.
+    expired,  ///< The request outlived @ref PAIRING_REQUEST_LIFETIME.
   };
 
   /**
-   * @brief State of the pairing window as shown on the PC.
-   */
-  enum class pairing_state_e {
-    idle,  ///< No window was opened.
-    waiting,  ///< A PIN is waiting for a TV.
-    paired,  ///< A TV paired.
-    expired,  ///< The PIN expired unused.
-    failed,  ///< Too many wrong PINs were entered.
-  };
-
-  /**
-   * @brief A short, explicitly opened window in which one TV may pair with the PIN shown on the PC.
+   * @brief A TV asking to pair, showing a PIN that the user enters in Sunshine's Web UI.
    *
-   * It closes on success, on expiry, or after @ref MAXIMUM_PIN_ATTEMPTS wrong PINs, so a device
-   * on the network cannot guess its way through the 10,000 possible PINs.
+   * Pairing works like Moonlight's: the TV picks the PIN and shows it, and only a user signed in
+   * to the Web UI can approve it. The TV is selected there by this request's unguessable ID, so a
+   * device that copies the TV's name and PIN still cannot take its place.
    */
-  class tv_pairing_window_t {
-  public:
+  struct pairing_request_t {
     using clock = std::chrono::steady_clock;  ///< Clock used for expiry.
 
-    /**
-     * @brief Open the window with a new PIN.
-     * @param now Current time.
-     * @return The PIN to show on the PC.
-     */
-    std::string open(clock::time_point now);
-
-    /**
-     * @brief Check a PIN entered on a TV.
-     * @param pin PIN sent by the TV.
-     * @param now Current time.
-     * @return The outcome.
-     */
-    pairing_attempt_e attempt(std::string_view pin, clock::time_point now);
-
-    /**
-     * @brief Report the window state.
-     * @param now Current time.
-     * @return The state.
-     */
-    pairing_state_e state(clock::time_point now);
-
-    /**
-     * @brief Close an open window.
-     */
-    void close();
-
-  private:
-    /**
-     * @brief Expire the window when its PIN is past its lifetime.
-     * @param now Current time.
-     */
-    void expire(clock::time_point now);
-
-    std::string _pin;  ///< Current PIN.
-    clock::time_point _expires_at {};  ///< When the PIN expires.
-    int _failed_attempts = 0;  ///< Wrong PINs entered so far.
-    pairing_state_e _state = pairing_state_e::idle;  ///< Current state.
+    std::string id;  ///< Unguessable approval ID shown to the Web UI.
+    std::string pin;  ///< PIN the TV shows.
+    std::string client_name;  ///< Sanitized TV name.
+    std::string address;  ///< TV address, for the Web UI.
+    clock::time_point expires_at;  ///< When the request lapses.
   };
+
+  /**
+   * @brief Start a pairing request for a PIN the TV shows.
+   * @param pin PIN chosen by the TV.
+   * @param client_name Name sent by the TV.
+   * @param address TV address.
+   * @param now Current time.
+   * @return The request, or nothing when the PIN is not four digits.
+   */
+  std::optional<pairing_request_t> make_pairing_request(std::string_view pin, std::string_view client_name, std::string address, pairing_request_t::clock::time_point now);
+
+  /**
+   * @brief Check the PIN entered in the Web UI against a request.
+   * @param request Pairing request.
+   * @param pin PIN entered in the Web UI.
+   * @param now Current time.
+   * @return The outcome; every outcome but acceptance ends the request.
+   */
+  pairing_check_e check_pairing_pin(const pairing_request_t &request, std::string_view pin, pairing_request_t::clock::time_point now);
 }  // namespace webrtc_stream::tv_auth

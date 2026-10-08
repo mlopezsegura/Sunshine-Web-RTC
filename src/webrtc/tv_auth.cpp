@@ -87,35 +87,6 @@ namespace webrtc_stream::tv_auth {
     }
 
     /**
-     * @brief Generate a uniformly distributed four-digit PIN.
-     * @return The PIN.
-     */
-    std::string random_pin() {
-      // Rejection sampling keeps every PIN equally likely.
-      for (;;) {
-        std::uint16_t value = 0;
-        if (RAND_bytes(reinterpret_cast<unsigned char *>(&value), sizeof(value)) != 1) {
-          throw std::runtime_error("OpenSSL failed to generate a TV pairing PIN");
-        }
-        if (value < 60000) {
-          const std::string pin = std::to_string(value % 10000);
-          return std::string(4 - pin.size(), '0') + pin;
-        }
-      }
-    }
-
-    /**
-     * @brief Check that a PIN has four digits.
-     * @param pin PIN to check.
-     * @return True when it is valid.
-     */
-    bool is_valid_pin(std::string_view pin) {
-      return pin.size() == 4 && std::ranges::all_of(pin, [](char digit) {
-               return digit >= '0' && digit <= '9';
-             });
-    }
-
-    /**
      * @brief Compute HMAC-SHA256.
      * @param key_hex Key in hex.
      * @param message Message.
@@ -277,48 +248,23 @@ namespace webrtc_stream::tv_auth {
     return _clients.size();
   }
 
-  std::string tv_pairing_window_t::open(clock::time_point now) {
-    _pin = random_pin();
-    _expires_at = now + PAIRING_WINDOW_LIFETIME;
-    _failed_attempts = 0;
-    _state = pairing_state_e::waiting;
-    return _pin;
+  bool is_valid_pin(std::string_view pin) {
+    return pin.size() == 4 && std::ranges::all_of(pin, [](char digit) {
+             return digit >= '0' && digit <= '9';
+           });
   }
 
-  void tv_pairing_window_t::expire(clock::time_point now) {
-    if (_state == pairing_state_e::waiting && now >= _expires_at) {
-      _state = pairing_state_e::expired;
-      _pin.clear();
+  std::optional<pairing_request_t> make_pairing_request(std::string_view pin, std::string_view client_name, std::string address, pairing_request_t::clock::time_point now) {
+    if (!is_valid_pin(pin)) {
+      return std::nullopt;
     }
+    return pairing_request_t {random_hex(PAIRING_ID_BYTES), std::string(pin), sanitize_client_name(client_name), std::move(address), now + PAIRING_REQUEST_LIFETIME};
   }
 
-  pairing_attempt_e tv_pairing_window_t::attempt(std::string_view pin, clock::time_point now) {
-    expire(now);
-    if (_state != pairing_state_e::waiting) {
-      return pairing_attempt_e::not_open;
+  pairing_check_e check_pairing_pin(const pairing_request_t &request, std::string_view pin, pairing_request_t::clock::time_point now) {
+    if (now >= request.expires_at) {
+      return pairing_check_e::expired;
     }
-    if (is_valid_pin(pin) && constant_time_equals(pin, _pin)) {
-      _state = pairing_state_e::paired;
-      _pin.clear();
-      return pairing_attempt_e::accepted;
-    }
-    if (++_failed_attempts >= MAXIMUM_PIN_ATTEMPTS) {
-      _state = pairing_state_e::failed;
-      _pin.clear();
-      return pairing_attempt_e::too_many_attempts;
-    }
-    return pairing_attempt_e::incorrect_pin;
-  }
-
-  pairing_state_e tv_pairing_window_t::state(clock::time_point now) {
-    expire(now);
-    return _state;
-  }
-
-  void tv_pairing_window_t::close() {
-    if (_state == pairing_state_e::waiting) {
-      _state = pairing_state_e::idle;
-    }
-    _pin.clear();
+    return is_valid_pin(pin) && constant_time_equals(pin, request.pin) ? pairing_check_e::accepted : pairing_check_e::incorrect_pin;
   }
 }  // namespace webrtc_stream::tv_auth

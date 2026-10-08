@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace webrtc_stream {
@@ -24,12 +25,12 @@ namespace webrtc_stream {
   };
 
   /**
-   * @brief Outcome of opening a TV pairing window.
+   * @brief A TV showing a PIN and waiting for it to be entered in the Web UI.
    */
-  struct pairing_t {
-    bool ok;  ///< Whether a window was opened.
-    std::string pin;  ///< PIN to show; empty on failure.
-    std::string message;  ///< User-safe status.
+  struct pending_tv_pairing_t {
+    std::string id;  ///< Pairing request ID, 32 hex digits like a Moonlight request's.
+    std::string name;  ///< Name sent by the TV.
+    std::string address;  ///< TV address.
   };
 
   /**
@@ -44,16 +45,26 @@ namespace webrtc_stream {
   int session_count();
 
   /**
-   * @brief Open a two-minute window in which one TV may pair.
-   * @return The PIN to show, which is never logged.
+   * @brief List the TVs waiting to pair, for the Web UI's PIN page.
+   * @return Pending TV pairing requests.
    */
-  pairing_t open_tv_pairing();
+  std::vector<pending_tv_pairing_t> pending_tv_pairings();
 
   /**
-   * @brief Report the state of the TV pairing window.
-   * @return One of "tv-pairing-idle", "tv-pairing-waiting", "tv-paired", "tv-pairing-expired" or "tv-pairing-locked".
+   * @brief Pair the TV that made a request if the PIN matches the one it shows.
+   * @param pairing_id Pairing request ID.
+   * @param pin PIN entered in the Web UI.
+   * @param name Name to store; the TV's own name when empty.
+   * @return Whether the TV paired, or nothing when no TV made that request.
    */
-  std::string tv_pairing_status();
+  std::optional<bool> approve_tv_pairing(std::string_view pairing_id, std::string_view pin, std::string_view name);
+
+  /**
+   * @brief Decline a TV's pairing request.
+   * @param pairing_id Pairing request ID.
+   * @return True when it was declined, or nothing when no TV made that request.
+   */
+  std::optional<bool> cancel_tv_pairing(std::string_view pairing_id);
 
   /**
    * @brief List paired TVs.

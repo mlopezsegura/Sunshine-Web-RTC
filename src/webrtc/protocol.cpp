@@ -249,16 +249,22 @@ namespace webrtc_stream::protocol {
         }
         return {type, authenticate_t {std::move(client_id), std::move(proof)}};
       }
-      if (type == "pair-client") {
+      if (type == "request-pairing") {
         auto pin = message.at("pin").get<std::string>();
-        if (pin.size() != 4) {
+        if (pin.size() != 4 || !std::ranges::all_of(pin, [](unsigned char digit) {
+              return std::isdigit(digit);
+            })) {
           throw protocol_error_t("invalid-message", "pin must have four digits");
         }
         std::string client_name;
         if (message.contains("clientName")) {
           client_name = message.at("clientName").get<std::string>();
         }
-        return {type, pair_client_t {std::move(pin), std::move(client_name)}};
+        return {type, request_pairing_t {std::move(pin), std::move(client_name)}};
+      }
+      if (type == "pair-client") {
+        // TV apps from before Sunshine took over the Gateway entered a PIN shown on the PC.
+        throw protocol_error_t("unsupported-pairing", "Update the TV app: Sunshine pairs TVs with a PIN shown on the TV");
       }
       if (type == "get-apps") {
         return {type, get_apps_t {}};
@@ -295,6 +301,7 @@ namespace webrtc_stream::protocol {
   json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available) {
     auto message = envelope("auth-required");
     message["nonce"] = nonce;
+    message["pairing"] = "client-pin";
     if (mac_address) {
       message["macAddress"] = *mac_address;
     }

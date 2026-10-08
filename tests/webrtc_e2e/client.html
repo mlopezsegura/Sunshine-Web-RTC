@@ -47,18 +47,22 @@ function connect() {
 
 async function handle(m) {
   if (m.type === "auth-required") {
-    note("auth-required", { sunshineAvailable: m.sunshineAvailable, mac: m.macAddress || null });
+    note("auth-required", { sunshineAvailable: m.sunshineAvailable, mac: m.macAddress || null, pairing: m.pairing || null });
     if (credentials) {
       send({ type: "authenticate", clientId: credentials.clientId,
              proof: await hmacHex(credentials.clientSecret, "moonlight-webrtc-tv-auth-v1:" + m.nonce) });
     } else {
       // An unauthenticated request must be refused before pairing.
       send({ type: "get-apps" });
-      send({ type: "pair-client", pin: "9999" === pin ? "0000" : "9999", clientName: "E2E Edge" });
       send({ type: "pair-client", pin, clientName: "E2E Edge" });
+      send({ type: "request-pairing", pin, clientName: "E2E Edge" });
     }
   } else if (m.type === "error") {
     note("error", { requestType: m.requestType, code: m.code });
+    // Like the TV, ask again after the Web UI rejects or cancels the request.
+    if (m.requestType === "request-pairing" && !credentials) {
+      send({ type: "request-pairing", pin, clientName: "E2E Edge" });
+    }
   } else if (m.type === "paired") {
     note("paired");
     credentials = { clientId: m.clientId, clientSecret: m.clientSecret };

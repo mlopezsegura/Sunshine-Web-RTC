@@ -87,9 +87,17 @@ TEST(WebrtcProtocolTest, ParsesAuthenticationAndPairing) {
   const auto authenticate = parse_client_message(R"({"version":2,"type":"authenticate","clientId":"ab","proof":"cd"})");
   EXPECT_EQ(std::get<authenticate_t>(authenticate.payload).client_id, "ab");
 
-  const auto pair = parse_client_message(R"({"version":2,"type":"pair-client","pin":"0421","clientName":"Samsung TV"})");
-  EXPECT_EQ(std::get<pair_client_t>(pair.payload).pin, "0421");
-  EXPECT_EQ(std::get<pair_client_t>(pair.payload).client_name, "Samsung TV");
+  const auto pair = parse_client_message(R"({"version":2,"type":"request-pairing","pin":"0421","clientName":"Samsung TV"})");
+  EXPECT_EQ(std::get<request_pairing_t>(pair.payload).pin, "0421");
+  EXPECT_EQ(std::get<request_pairing_t>(pair.payload).client_name, "Samsung TV");
+
+  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"request-pairing","pin":"04a1"})"), "invalid-message");
+  // TV apps that enter a PIN shown on the PC are told to update.
+  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"pair-client","pin":"0421"})"), "unsupported-pairing");
+}
+
+TEST(WebrtcProtocolTest, AnnouncesThatTheTvShowsThePin) {
+  EXPECT_EQ(make_auth_required("00", std::nullopt, true).at("pairing"), "client-pin");
 }
 
 TEST(WebrtcProtocolTest, OffersAv1OnlyWhenTheEncoderSupportsIt) {

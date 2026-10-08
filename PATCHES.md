@@ -67,7 +67,7 @@ global queue as before: behaviour is unchanged.
 | `src/config.h`, `src/config.cpp` | New `config::webrtc_t { enabled, port }`, defaults `true` / `8000`, parsed from `webrtc_enabled` and `webrtc_port` (1024–65535). | 8000 is the TV app's default port. |
 | `src/main.cpp` | Starts `webrtc_stream::start` on its own `std::jthread` next to the nvhttp, confighttp and RTSP threads. | The server returns when `mail::shutdown` is raised, so shutdown joins it like the others. |
 | `src/nvhttp.cpp` | `launch` and `resume` treat a running TV stream like a running Moonlight session (`webrtc_stream::session_count()`). | Otherwise a Moonlight launch while a TV streams would reconfigure the display and re-probe encoders under the TV. |
-| `src/confighttp.cpp` | New authenticated, CSRF-checked endpoints `GET /api/webrtc/tvs`, `POST /api/webrtc/pair`, `POST /api/webrtc/unpair-all`. | TV pairing used to live in the Gateway's tray; it now lives in the Web UI. |
+| `src/confighttp.cpp` | New authenticated, CSRF-checked endpoints `GET /api/webrtc/tvs` and `POST /api/webrtc/unpair-all`; `GET`/`POST`/`DELETE /api/pin` also list, approve and decline TVs waiting to pair. | TV pairing used to live in the Gateway's tray; it now works like Moonlight pairing, in the same Web UI form. |
 
 The reverse coordination is in the new module: a TV stream configures the display and probes encoders
 only when no Moonlight session and no other TV stream is running, and calls
@@ -89,7 +89,7 @@ MSYS2 does not package libdatachannel, so Windows builds always take the FetchCo
 |---|---|
 | `src/webrtc/webrtc_stream.{h,cpp}` | The server: libdatachannel `WebSocketServer`, TV connections (up to 8 unauthenticated, one active), sessions, PeerConnection with send-only H.264/H.265/AV1 + Opus tracks and the `control` (reliable) and `gamepad` (unordered, no retransmits) DataChannels, application launch/resume/stop/switch through `proc::proc`, display configuration, the capture pipeline and the Web UI hooks. |
 | `src/webrtc/protocol.{h,cpp}` | Gateway protocol version 2, ported unchanged: stream settings and supported modes, message parsing and construction. |
-| `src/webrtc/tv_auth.{h,cpp}` | Pairing window (4-digit PIN, 2 minutes, 3 attempts), paired-TV store (`webrtc_tv_clients.json` in Sunshine's config directory) and HMAC-SHA256 nonce authentication. |
+| `src/webrtc/tv_auth.{h,cpp}` | Pairing requests (the TV shows a 4-digit PIN that the Web UI approves; one attempt, 5 minutes), paired-TV store (`webrtc_tv_clients.json` in Sunshine's config directory) and HMAC-SHA256 nonce authentication. |
 | `src/webrtc/sdp.{h,cpp}` | Samsung Game Mode `imageattr`, single-codec offers, HEVC Main10 `fmtp` and level checks. |
 | `src/webrtc/input_bridge.{h,cpp}` | Gamepad snapshots → Moonlight controller packets fed to `input::passthrough()`, so Sunshine's own controller emulation handles them; long-press Start mouse mode; rumble relayed to the TV. |
 
@@ -110,18 +110,18 @@ Stream parameters, chosen to match what the Gateway negotiated through moonlight
 
 | File | Change |
 |---|---|
-| `src_assets/common/assets/web/Pin.vue` | New **Moonlight WebRTC TVs** card: Pair TV (shows the PIN and its state), paired-TV list, Forget All TVs. |
+| `src_assets/common/assets/web/Pin.vue` | TVs waiting to pair join the existing PIN form, which now suggests the name the selected device reported; new **Moonlight WebRTC TVs** card with the paired-TV list and Forget All TVs. |
 | `configs/config_tabs.json`, `configs/tabs/Network.vue` | `webrtc_enabled` checkbox and `webrtc_port` field on the Network tab. |
 | `public/assets/locale/en.json` | Strings for both. Other languages fall back to English, as upstream requires. |
 
 ### 0006 — Tests
 
-- `tests/unit/webrtc/` — 31 GoogleTest cases: protocol parsing and capabilities, SDP checks, TV auth
+- `tests/unit/webrtc/` — 33 GoogleTest cases: protocol parsing and capabilities, SDP checks, TV auth
   (including the HMAC vector shared with the TV's JavaScript), and the input bridge, whose packets
   are validated by Sunshine's own `input::testing::is_valid_input_packet()`, plus the packet routing of
   patch 0001.
-- `tests/webrtc_e2e/` — a headless-Edge stand-in for the TV that pairs, authenticates, streams and
-  measures `getStats()` against a running Sunshine.
+- `tests/webrtc_e2e/` — a headless-Edge stand-in for the TV that shows a PIN, gets paired through
+  `/api/pin` like a user would, authenticates, streams and measures `getStats()` against a running Sunshine.
 
 The upstream config-consistency test requires every new option in `config_tabs.json`, `en.json` and
 `docs/configuration.md`; patches 0005 and 0007 satisfy it.
@@ -129,15 +129,17 @@ The upstream config-consistency test requires every new option in `config_tabs.j
 ### 0007 — Documentation
 
 `README.md` gets a note pointing at the guide; `docs/configuration.md` documents both options;
-`docs/api.md` lists the three endpoints; `docs/moonlight_webrtc_tizen.md` is the guide.
+`docs/api.md` lists the two endpoints; `docs/moonlight_webrtc_tizen.md` is the guide.
 
 ## Verification of this revision
 
 - Builds with MSYS2 UCRT64 (GCC) without warnings.
-- `test_sunshine`: 682 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
+- `test_sunshine`: 684 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
   no virtual HID licence, no external shell command), 0 failed.
-- End to end on an AMD RX 9060 XT (AMF) with headless Edge: pairing (wrong PIN and unauthenticated
-  requests refused), re-authentication, application list and artwork, H.264 720p/1080p and AV1 1080p
+- End to end on an AMD RX 9060 XT (AMF) with headless Edge: pairing through the Web UI PIN form (the TV listed in
+  `/api/pin`, a wrong PIN, a cancellation and a stale request ID refused, the right PIN pairing it under
+  the name typed in the Web UI; unauthenticated requests refused), the real Tizen app showing its PIN
+  and pairing in headless Edge, re-authentication, application list and artwork, H.264 720p/1080p and AV1 1080p
   decoded with every frame and 0 packets lost, Opus audio with 0 lost, controller announced,
   stop-session and stop-host-session, PLI answered with IDR, paired TVs persisted across a restart,
   and a clean exit (code 0) when Sunshine shuts down mid-stream.

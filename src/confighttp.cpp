@@ -1467,7 +1467,7 @@ namespace confighttp {
   }
 
   /**
-   * @brief List the TVs paired for Moonlight WebRTC and the TV pairing state.
+   * @brief List the TVs paired for Moonlight WebRTC.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    *
@@ -1485,39 +1485,9 @@ namespace confighttp {
     for (const auto &tv : webrtc_stream::paired_tvs()) {
       output_tree["tvs"].push_back({{"id", tv.id}, {"name", tv.name}});
     }
-    output_tree["pairing"] = webrtc_stream::tv_pairing_status();
     output_tree["enabled"] = config::webrtc.enabled;
     output_tree["port"] = config::webrtc.port;
     output_tree["status"] = true;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Open a two-minute window in which one TV may pair, returning its PIN.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/webrtc/pair|:| POST|:| null}
-   */
-  void pairWebrtcTv(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    const auto pairing = webrtc_stream::open_tv_pairing();
-    nlohmann::json output_tree;
-    output_tree["status"] = pairing.ok;
-    output_tree["message"] = pairing.message;
-    if (pairing.ok) {
-      output_tree["pin"] = pairing.pin;
-    }
     send_response(response, output_tree);
   }
 
@@ -1888,6 +1858,9 @@ namespace confighttp {
   /**
    * @brief List client pairing requests that are waiting for PIN approval.
    *
+   * Moonlight WebRTC TVs waiting to pair are listed beside Moonlight clients and are approved
+   * or cancelled through the same endpoints.
+   *
    * @api_examples{/api/pin|:| GET|:| null}
    */
   void getPendingPairings(const resp_https_t &response, const req_https_t &request) {
@@ -1900,6 +1873,14 @@ namespace confighttp {
     nlohmann::json output_tree;
     output_tree["pairings"] = nlohmann::json::array();
     for (const auto &pairing : nvhttp::get_pending_pairings()) {
+      output_tree["pairings"].push_back({
+        {"id", pairing.id},
+        {"name", pairing.name},
+        {"address", pairing.address},
+      });
+    }
+    // Moonlight WebRTC TVs show their PIN like Moonlight does and are approved in the same form.
+    for (const auto &pairing : webrtc_stream::pending_tv_pairings()) {
       output_tree["pairings"].push_back({
         {"id", pairing.id},
         {"name", pairing.name},
@@ -1946,7 +1927,7 @@ namespace confighttp {
       }
 
       nlohmann::json output_tree;
-      output_tree["status"] = nvhttp::cancel_pairing(pairing_id);
+      output_tree["status"] = webrtc_stream::cancel_tv_pairing(pairing_id).value_or(false) || nvhttp::cancel_pairing(pairing_id);
       send_response(response, output_tree);
     } catch (nlohmann::json::exception &e) {
       BOOST_LOG(warning) << "CancelPairing: "sv << e.what();
@@ -2007,7 +1988,8 @@ namespace confighttp {
         return;
       }
 
-      output_tree["status"] = nvhttp::pin(pairing_id, pin, name);
+      const auto tv_paired = webrtc_stream::approve_tv_pairing(pairing_id, pin, name);
+      output_tree["status"] = tv_paired ? *tv_paired : nvhttp::pin(pairing_id, pin, name);
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SavePin: "sv << e.what();
@@ -2599,7 +2581,6 @@ namespace confighttp {
     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
-    server.resource["^/api/webrtc/pair$"]["POST"] = pairWebrtcTv;
     server.resource["^/api/webrtc/tvs$"]["GET"] = getWebrtcTvs;
     server.resource["^/api/webrtc/unpair-all$"]["POST"] = unpairAllWebrtcTvs;
 
