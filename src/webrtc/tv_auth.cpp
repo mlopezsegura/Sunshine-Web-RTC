@@ -159,7 +159,7 @@ namespace webrtc_stream::tv_auth {
         return;
       }
       for (const auto &entry : value.at("clients")) {
-        tv_client_t client {entry.value("id", ""), entry.value("name", ""), entry.value("secret", "")};
+        tv_client_t client {entry.value("id", ""), entry.value("name", ""), entry.value("secret", ""), entry.value("enabled", true)};
         if (is_hex(client.id, CLIENT_ID_BYTES) && is_hex(client.secret, CLIENT_SECRET_BYTES)) {
           client.name = sanitize_client_name(client.name);
           _clients.push_back(std::move(client));
@@ -174,7 +174,7 @@ namespace webrtc_stream::tv_auth {
   void tv_client_store_t::save() const {
     json clients = json::array();
     for (const auto &client : _clients) {
-      clients.push_back({{"id", client.id}, {"name", client.name}, {"secret", client.secret}});
+      clients.push_back({{"id", client.id}, {"name", client.name}, {"secret", client.secret}, {"enabled", client.enabled}});
     }
     const std::string contents = json {{"version", STORE_VERSION}, {"clients", std::move(clients)}}.dump(2);
 
@@ -221,6 +221,44 @@ namespace webrtc_stream::tv_auth {
     return client;
   }
 
+  bool tv_client_store_t::remove(std::string_view id) {
+    std::lock_guard lock(_mutex);
+    auto updated = _clients;
+    if (std::erase_if(updated, [id](const tv_client_t &client) {
+          return client.id == id;
+        }) == 0) {
+      return false;
+    }
+    std::swap(_clients, updated);
+    try {
+      save();
+    } catch (...) {
+      std::swap(_clients, updated);
+      throw;
+    }
+    return true;
+  }
+
+  bool tv_client_store_t::set_enabled(std::string_view id, bool enabled) {
+    std::lock_guard lock(_mutex);
+    auto updated = _clients;
+    const auto found = std::ranges::find_if(updated, [id](const tv_client_t &client) {
+      return client.id == id;
+    });
+    if (found == updated.end()) {
+      return false;
+    }
+    found->enabled = enabled;
+    std::swap(_clients, updated);
+    try {
+      save();
+    } catch (...) {
+      std::swap(_clients, updated);
+      throw;
+    }
+    return true;
+  }
+
   std::size_t tv_client_store_t::remove_all() {
     std::lock_guard lock(_mutex);
     auto removed = std::move(_clients);
@@ -238,7 +276,7 @@ namespace webrtc_stream::tv_auth {
     std::lock_guard lock(_mutex);
     std::vector<tv_client_t> clients;
     for (const auto &client : _clients) {
-      clients.push_back({client.id, client.name, {}});
+      clients.push_back({client.id, client.name, {}, client.enabled});
     }
     return clients;
   }

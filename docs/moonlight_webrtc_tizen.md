@@ -72,7 +72,9 @@ works as is. Sunshine implements it as follows:
   it. A stream that asked for HDR ends with an error instead of silently sending SDR.
 - **Controllers** are announced to Sunshine as Moonlight controllers, so Sunshine's controller emulation
   and rumble work as with any Moonlight client. Holding Start toggles mouse emulation.
-- **Paired TVs** are stored in `webrtc_tv_clients.json` in Sunshine's configuration directory.
+- **Paired TVs** appear in the client list under **Troubleshooting**, like Moonlight clients: a TV can be
+  disabled there, which keeps it paired but refuses it until it is enabled again, or unpaired. They are
+  stored in `webrtc_tv_clients.json` in Sunshine's configuration directory.
 
 ## Web UI API
 
@@ -81,8 +83,10 @@ works as is. Sunshine implements it as follows:
 | `GET /api/pin`                 | Lists TVs waiting to pair beside Moonlight clients. |
 | `POST /api/pin`                | Pairs the selected TV when the PIN matches its own. |
 | `DELETE /api/pin`              | Declines the selected TV's pairing request.         |
-| `GET /api/webrtc/tvs`          | Paired TVs.                                         |
-| `POST /api/webrtc/unpair-all`  | Forgets every TV and disconnects the connected one. |
+| `GET /api/clients/list`        | Lists paired TVs beside Moonlight clients.          |
+| `POST /api/clients/update`     | Enables or disables a TV; disabling disconnects it. |
+| `POST /api/clients/unpair`     | Forgets one TV and disconnects it.                  |
+| `POST /api/clients/unpair-all` | Forgets every client, TVs included.                 |
 
 ## Implementation
 

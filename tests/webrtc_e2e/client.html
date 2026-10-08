@@ -12,6 +12,7 @@ const width = Number(params.get("width") || 1280);
 const height = Number(params.get("height") || 720);
 const bitrate = Number(params.get("bitrate") || 12000);
 const hdr = params.get("hdr") === "1";
+const takeover = params.get("takeover") === "1";
 const log = [];
 const result = { codec, width, height, hdr, steps: [], errors: [] };
 const t0 = performance.now();
@@ -169,8 +170,34 @@ async function measure() {
     result.measuredKbps = Math.round((second.video.bytes - first.video.bytes) * 8 / 2 / 1000);
   }
   note("measured");
+  if (takeover) {
+    takeOver();
+    return;
+  }
   phase = "stopping";
   send({ type: "stop-session" });
+}
+
+// The same TV reconnecting mid-stream, as after a network drop, must replace the streaming
+// connection and end its stream; the new connection then stops the application.
+function takeOver() {
+  phase = "takeover";
+  ws.onclose = () => note("replaced-connection-closed");
+  const second = new WebSocket(wsUrl);
+  second.onmessage = async (event) => {
+    const m = JSON.parse(event.data);
+    log.push("<<2 " + m.type + (m.state ? ":" + m.state : ""));
+    if (m.type === "auth-required") {
+      second.send(JSON.stringify({ version: 2, type: "authenticate", clientId: credentials.clientId,
+        proof: await hmacHex(credentials.clientSecret, "moonlight-webrtc-tv-auth-v1:" + m.nonce) }));
+    } else if (m.type === "session-status" && m.state === "idle") {
+      note("takeover-idle");
+      second.send(JSON.stringify({ version: 2, type: "stop-host-session" }));
+    } else if (m.type === "host-session-status") {
+      note("host-" + m.state, { running: m.runningAppId || null });
+      if (m.state === "stopped" || m.state === "failed") finish();
+    }
+  };
 }
 
 connect();

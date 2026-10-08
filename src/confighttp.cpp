@@ -1326,7 +1326,11 @@ namespace confighttp {
 
     print_req(request);
 
-    const nlohmann::json named_certs = nvhttp::get_all_clients();
+    nlohmann::json named_certs = nvhttp::get_all_clients();
+    // Moonlight WebRTC TVs are clients too, enabled, disabled and unpaired the same way.
+    for (const auto &tv : webrtc_stream::paired_tvs()) {
+      named_certs.push_back({{"name", tv.name}, {"uuid", tv.id}, {"enabled", tv.enabled}});
+    }
 
     nlohmann::json output_tree;
     output_tree["named_certs"] = named_certs;
@@ -1369,6 +1373,12 @@ namespace confighttp {
       nlohmann::json output_tree;
       std::string uuid = input_tree.value("uuid", "");
       bool enabled = input_tree.value("enabled", true);
+      // Disabling a TV disconnects it, which ends its stream and leaves the application running.
+      if (const auto tv = webrtc_stream::set_tv_enabled(uuid, enabled); tv.value_or(false)) {
+        output_tree["status"] = true;
+        send_response(response, output_tree);
+        return;
+      }
       output_tree["status"] = nvhttp::set_client_enabled(uuid, enabled);
 
       if (!enabled && output_tree["status"]) {
@@ -1425,6 +1435,11 @@ namespace confighttp {
       nlohmann::json output_tree;
       const nlohmann::json input_tree = nlohmann::json::parse(ss);
       const std::string uuid = input_tree.value("uuid", "");
+      if (webrtc_stream::unpair_tv(uuid).value_or(false)) {
+        output_tree["status"] = true;
+        send_response(response, output_tree);
+        return;
+      }
       const bool removed = nvhttp::unpair_client(uuid);
       output_tree["status"] = removed;
 
@@ -1459,67 +1474,15 @@ namespace confighttp {
     print_req(request);
 
     nvhttp::erase_all_clients();
+    try {
+      webrtc_stream::unpair_all_tvs();
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "UnpairAll: paired TVs could not be removed: "sv << e.what();
+    }
     proc::proc.terminate();
 
     nlohmann::json output_tree;
     output_tree["status"] = true;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief List the TVs paired for Moonlight WebRTC.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/webrtc/tvs|:| GET|:| null}
-   */
-  void getWebrtcTvs(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-    output_tree["tvs"] = nlohmann::json::array();
-    for (const auto &tv : webrtc_stream::paired_tvs()) {
-      output_tree["tvs"].push_back({{"id", tv.id}, {"name", tv.name}});
-    }
-    output_tree["enabled"] = config::webrtc.enabled;
-    output_tree["port"] = config::webrtc.port;
-    output_tree["status"] = true;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Forget every TV paired for Moonlight WebRTC and disconnect the connected one.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/webrtc/unpair-all|:| POST|:| null}
-   */
-  void unpairAllWebrtcTvs(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-    try {
-      const auto removed = webrtc_stream::unpair_all_tvs();
-      output_tree["status"] = removed.has_value();
-      output_tree["removed"] = removed.value_or(0);
-    } catch (const std::exception &e) {
-      BOOST_LOG(warning) << "UnpairAllWebrtcTvs: "sv << e.what();
-      output_tree["status"] = false;
-      output_tree["error"] = "Paired TVs could not be removed";
-    }
     send_response(response, output_tree);
   }
 
@@ -2581,8 +2544,6 @@ namespace confighttp {
     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
-    server.resource["^/api/webrtc/tvs$"]["GET"] = getWebrtcTvs;
-    server.resource["^/api/webrtc/unpair-all$"]["POST"] = unpairAllWebrtcTvs;
 
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;

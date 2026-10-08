@@ -75,6 +75,30 @@ TEST(WebrtcTvAuthTest, KeepsTheNewestTvsAtCapacity) {
   std::filesystem::remove(path);
 }
 
+TEST(WebrtcTvAuthTest, DisablesAndForgetsOneTvLikeAMoonlightClient) {
+  const auto path = temporary_store("single");
+  tv_client_t kept;
+  tv_client_t removed;
+  {
+    tv_client_store_t store(path);
+    kept = store.add("Living room");
+    removed = store.add("Bedroom");
+    EXPECT_TRUE(kept.enabled);
+    EXPECT_TRUE(store.set_enabled(kept.id, false));
+    EXPECT_FALSE(store.set_enabled("00000000000000000000000000000000", false));
+    EXPECT_TRUE(store.remove(removed.id));
+    EXPECT_FALSE(store.remove(removed.id));
+  }
+  // Both changes survive a restart; the disabled TV stays paired.
+  const tv_client_store_t reloaded(path);
+  EXPECT_EQ(reloaded.count(), 1);
+  ASSERT_TRUE(reloaded.find(kept.id));
+  EXPECT_FALSE(reloaded.find(kept.id)->enabled);
+  EXPECT_FALSE(reloaded.list().front().enabled);
+  EXPECT_FALSE(reloaded.find(removed.id));
+  std::filesystem::remove(path);
+}
+
 TEST(WebrtcTvAuthTest, TrustsNobodyFromAnUnreadableStore) {
   const auto path = temporary_store("corrupt");
   std::ofstream(path) << "{not json";

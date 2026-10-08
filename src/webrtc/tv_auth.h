@@ -73,6 +73,7 @@ namespace webrtc_stream::tv_auth {
     std::string id;  ///< Client ID.
     std::string name;  ///< Display name.
     std::string secret;  ///< Shared secret.
+    bool enabled = true;  ///< Whether the TV may connect; a disabled TV stays paired.
   };
 
   /**
@@ -104,10 +105,25 @@ namespace webrtc_stream::tv_auth {
     tv_client_t add(std::string_view name);
 
     /**
+     * @brief Forget one paired TV and persist the store.
+     * @param id Client ID.
+     * @return True when the TV was paired.
+     */
+    bool remove(std::string_view id);
+
+    /**
      * @brief Forget every paired TV and persist the store.
      * @return Number of TVs removed.
      */
     std::size_t remove_all();
+
+    /**
+     * @brief Allow or refuse a paired TV and persist the store.
+     * @param id Client ID.
+     * @param enabled Whether the TV may connect.
+     * @return True when the TV is paired.
+     */
+    bool set_enabled(std::string_view id, bool enabled);
 
     /**
      * @brief List paired TVs without their secrets.

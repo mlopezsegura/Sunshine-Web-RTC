@@ -51,25 +51,6 @@
       </div>
       <div v-if="status" :class="`alert alert-${status.type}`" role="alert">{{ status.message }}</div>
     </form>
-
-    <h2 class="my-4 text-center">{{ $t('pin.tv_pairing') }}</h2>
-    <div class="d-flex flex-column align-items-center">
-      <div class="card flex-column d-flex p-4 mb-4">
-        <p class="mb-3">{{ $t('pin.tv_pairing_desc') }}</p>
-        <ul class="list-group mb-3">
-          <li v-if="!pairedTvs.length" class="list-group-item">{{ $t('pin.tv_none') }}</li>
-          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">
-            <tv :size="18" class="icon"></tv>
-            {{ tv.name }}
-          </li>
-        </ul>
-        <button type="button" class="btn btn-outline-danger" :disabled="!pairedTvs.length" @click="unpairTvs">
-          <x :size="18" class="icon"></x>
-          {{ $t('pin.tv_unpair_all') }}
-        </button>
-      </div>
-      <div v-if="tvStatus" :class="`alert alert-${tvStatus.type}`" role="alert">{{ tvStatus.message }}</div>
-    </div>
   </div>
 </template>
 
@@ -80,7 +61,6 @@
     Forward,
     Hash,
     Monitor,
-    Tv,
     UserRoundSearch,
     X,
   } from '@lucide/vue'
@@ -91,7 +71,6 @@
       Forward,
       Hash,
       Monitor,
-      Tv,
       UserRoundSearch,
       X,
     },
@@ -105,8 +84,6 @@
         selectedPairingId: '',
         suggestedName: '',
         status: null,
-        pairedTvs: [],
-        tvStatus: null,
       };
     },
     watch: {
@@ -122,11 +99,7 @@
     },
     mounted() {
       this.loadPendingPairings();
-      this.loadTvs();
-      this.refreshTimer = window.setInterval(() => {
-        this.loadPendingPairings();
-        this.loadTvs();
-      }, 2000);
+      this.refreshTimer = window.setInterval(() => this.loadPendingPairings(), 2000);
     },
     beforeUnmount() {
       window.clearInterval(this.refreshTimer);
@@ -181,39 +154,10 @@
           this.pin = '';
           this.name = '';
           this.suggestedName = '';
-          await this.loadTvs();
         } else {
           this.status = {type: 'danger', message: this.i18n.t('pin.pair_failure')};
         }
         await this.loadPendingPairings();
-      },
-
-      /**
-       * Refresh the paired Moonlight WebRTC TVs.
-       */
-      async loadTvs() {
-        try {
-          const response = await apiFetch('./api/webrtc/tvs', {method: 'GET'});
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          const body = await response.json();
-          this.pairedTvs = body.tvs || [];
-        } catch (error) {
-          console.error('Failed to load Moonlight WebRTC TVs', error);
-        }
-      },
-
-      /**
-       * Forget every paired TV; a connected TV is disconnected at once.
-       */
-      async unpairTvs() {
-        const response = await apiFetch('./api/webrtc/unpair-all', {method: 'POST'});
-        const result = await response.json();
-        this.tvStatus = result.status === true
-          ? {type: 'success', message: this.i18n.t('pin.tv_unpair_success')}
-          : {type: 'danger', message: this.i18n.t('pin.tv_unpair_failure')};
-        await this.loadTvs();
       },
 
       /**

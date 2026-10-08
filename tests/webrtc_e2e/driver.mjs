@@ -3,10 +3,10 @@
 //
 //   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
 //                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --bitrate=20000 --hdr=1]
-//                   [--summary=1] [--unpair=0] [--browser=path/to/msedge.exe]
+//                   [--summary=1] [--unpair=0] [--takeover=1] [--browser=path/to/msedge.exe]
 //
 // Sunshine's Web UI uses a self-signed certificate: run with NODE_TLS_REJECT_UNAUTHORIZED=0.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, mkdtempSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -14,6 +14,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Edge keeps its child processes alive when only the parent is killed.
+const killEdge = () => edge && spawnSync("taskkill", ["/T", "/F", "/PID", String(edge.pid)], { stdio: "ignore" });
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, "").split("=")));
 const webUi = args.webui || "https://127.0.0.1:50001";
@@ -65,11 +67,12 @@ async function pairThroughWebUi() {
   console.log("API pin POST right PIN:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: third.id, pin, name: "E2E Living Room" })).body));
 }
 
-const before = await api("GET", "/api/webrtc/tvs");
-console.log("API tvs:", JSON.stringify(before.body));
+const tvClients = async () => ((await api("GET", "/api/clients/list")).body.named_certs || []).filter((client) => client.name.startsWith("E2E"));
+const clientsBefore = await tvClients();
+console.log("API clients before:", JSON.stringify(clientsBefore));
 
 const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin, codec: args.codec || "h264",
-  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0" });
+  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", takeover: args.takeover || "0" });
 let edge;
 const server = http.createServer((request, response) => {
   if (request.method === "POST" && request.url === "/result") {
@@ -80,17 +83,19 @@ const server = http.createServer((request, response) => {
       const result = JSON.parse(body);
       if (args.summary === "1") {
         console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, hdr: result.hdr, errors: result.errors,
-          states: result.steps.filter((s) => s.step.startsWith("session-") || s.step.startsWith("host-") || s.step === "offer").map((s) => s.step + (s.message ? "(" + s.message + ")" : "") + (s.rtpmap ? "[" + s.rtpmap + "]" : "")),
+          states: result.steps.filter((s) => s.step.startsWith("session-") || s.step.startsWith("host-") || s.step.startsWith("takeover") || s.step.startsWith("replaced") || s.step === "offer").map((s) => s.step + (s.message ? "(" + s.message + ")" : "") + (s.rtpmap ? "[" + s.rtpmap + "]" : "")),
           video: result.stats?.video, audio: result.stats?.audio, codecs: result.stats?.codecs, measuredFps: result.measuredFps, measuredKbps: result.measuredKbps }, null, 1));
       } else {
         console.log(JSON.stringify(result, null, 1));
       }
-      const after = await api("GET", "/api/webrtc/tvs");
-      console.log("API tvs after:", JSON.stringify(after.body));
+      // The paired TV is listed, disabled and unpaired like any Moonlight client.
+      const tv = (await tvClients()).find((client) => !clientsBefore.some((old) => old.uuid === client.uuid));
+      console.log("API clients after:", JSON.stringify(tv));
+      console.log("API clients disable:", JSON.stringify((await api("POST", "/api/clients/update", { uuid: tv.uuid, enabled: false })).body), JSON.stringify(await tvClients()));
       if (args.unpair !== "0") {
-        console.log("API unpair-all:", JSON.stringify((await api("POST", "/api/webrtc/unpair-all")).body));
+        console.log("API clients unpair:", JSON.stringify((await api("POST", "/api/clients/unpair", { uuid: tv.uuid })).body), JSON.stringify(await tvClients()));
       }
-      edge.kill();
+      killEdge();
       server.close();
       process.exit(0);
     });
@@ -104,6 +109,6 @@ server.listen(8099, "127.0.0.1", () => {
   edge = spawn(args.browser || "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", [
     "--headless=new", "--no-first-run", "--user-data-dir=" + profile, "--autoplay-policy=no-user-gesture-required",
     "--remote-debugging-port=0", "--enable-features=WebRtcAllowH265Receive,PlatformHEVCDecoderSupport", "http://127.0.0.1:8099/?" + query], { stdio: "ignore" });
-  pairThroughWebUi().catch((error) => { console.log("pairing failed:", error.message); edge?.kill(); process.exit(3); });
+  pairThroughWebUi().catch((error) => { console.log("pairing failed:", error.message); killEdge(); process.exit(3); });
 });
-setTimeout(() => { console.log("driver timeout"); edge?.kill(); process.exit(2); }, 90000);
+setTimeout(() => { console.log("driver timeout"); killEdge(); process.exit(2); }, 90000);

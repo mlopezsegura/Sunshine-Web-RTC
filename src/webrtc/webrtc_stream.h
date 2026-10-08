@@ -22,6 +22,7 @@ namespace webrtc_stream {
   struct paired_tv_t {
     std::string id;  ///< Client ID.
     std::string name;  ///< Display name.
+    bool enabled = true;  ///< Whether the TV may connect.
   };
 
   /**
@@ -71,6 +72,21 @@ namespace webrtc_stream {
    * @return Paired TVs.
    */
   std::vector<paired_tv_t> paired_tvs();
+
+  /**
+   * @brief Forget one paired TV, disconnecting it if it is connected.
+   * @param id Client ID.
+   * @return True when the TV was paired, or nothing when the server is not running.
+   */
+  std::optional<bool> unpair_tv(std::string_view id);
+
+  /**
+   * @brief Allow or refuse a paired TV, disconnecting it when it is refused.
+   * @param id Client ID.
+   * @param enabled Whether the TV may connect.
+   * @return True when the TV is paired, or nothing when the server is not running.
+   */
+  std::optional<bool> set_tv_enabled(std::string_view id, bool enabled);
 
   /**
    * @brief Forget every paired TV and disconnect any connected TV.

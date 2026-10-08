@@ -44,7 +44,7 @@ checkout. It reads committed history, so commit a change first, then run the scr
 | `0004-webrtc-module` | new `src/webrtc/*` | New files |
 | `0005-web-ui-tv-pairing-and-options` | `Pin.vue`, `configs/config_tabs.json`, `configs/tabs/Network.vue`, `locale/en.json` | Upstream change |
 | `0006-tests` | new `tests/unit/webrtc/*`, new `tests/webrtc_e2e/*` | New files |
-| `0007-docs` | `README.md`, `docs/api.md`, `docs/configuration.md`, new `docs/moonlight_webrtc_tizen.md` | Upstream change + new file |
+| `0007-docs` | `README.md`, `docs/configuration.md`, new `docs/moonlight_webrtc_tizen.md` | Upstream change + new file |
 
 ### 0001 — Per-session packet queues (core)
 
@@ -67,7 +67,7 @@ global queue as before: behaviour is unchanged.
 | `src/config.h`, `src/config.cpp` | New `config::webrtc_t { enabled, port }`, defaults `true` / `8000`, parsed from `webrtc_enabled` and `webrtc_port` (1024–65535). | 8000 is the TV app's default port. |
 | `src/main.cpp` | Starts `webrtc_stream::start` on its own `std::jthread` next to the nvhttp, confighttp and RTSP threads. | The server returns when `mail::shutdown` is raised, so shutdown joins it like the others. |
 | `src/nvhttp.cpp` | `launch` and `resume` treat a running TV stream like a running Moonlight session (`webrtc_stream::session_count()`). | Otherwise a Moonlight launch while a TV streams would reconfigure the display and re-probe encoders under the TV. |
-| `src/confighttp.cpp` | New authenticated, CSRF-checked endpoints `GET /api/webrtc/tvs` and `POST /api/webrtc/unpair-all`; `GET`/`POST`/`DELETE /api/pin` also list, approve and decline TVs waiting to pair. | TV pairing used to live in the Gateway's tray; it now works like Moonlight pairing, in the same Web UI form. |
+| `src/confighttp.cpp` | No new endpoints: `GET`/`POST`/`DELETE /api/pin` also list, approve and decline TVs waiting to pair, and `/api/clients/list`, `update`, `unpair` and `unpair-all` also list, enable or disable, and unpair paired TVs. | TV pairing used to live in the Gateway's tray; TVs are now paired and managed exactly like Moonlight clients, in the same Web UI. |
 
 The reverse coordination is in the new module: a TV stream configures the display and probes encoders
 only when no Moonlight session and no other TV stream is running, and calls
@@ -110,13 +110,13 @@ Stream parameters, chosen to match what the Gateway negotiated through moonlight
 
 | File | Change |
 |---|---|
-| `src_assets/common/assets/web/Pin.vue` | TVs waiting to pair join the existing PIN form, which now suggests the name the selected device reported; new **Moonlight WebRTC TVs** card with the paired-TV list and Forget All TVs. |
+| `src_assets/common/assets/web/Pin.vue` | TVs waiting to pair join the existing PIN form, which now suggests the name the selected device reported. Paired TVs need no UI change: they appear in the existing client list under Troubleshooting. |
 | `configs/config_tabs.json`, `configs/tabs/Network.vue` | `webrtc_enabled` checkbox and `webrtc_port` field on the Network tab. |
 | `public/assets/locale/en.json` | Strings for both. Other languages fall back to English, as upstream requires. |
 
 ### 0006 — Tests
 
-- `tests/unit/webrtc/` — 33 GoogleTest cases: protocol parsing and capabilities, SDP checks, TV auth
+- `tests/unit/webrtc/` — 34 GoogleTest cases: protocol parsing and capabilities, SDP checks, TV auth
   (including the HMAC vector shared with the TV's JavaScript), and the input bridge, whose packets
   are validated by Sunshine's own `input::testing::is_valid_input_packet()`, plus the packet routing of
   patch 0001.
@@ -129,17 +129,19 @@ The upstream config-consistency test requires every new option in `config_tabs.j
 ### 0007 — Documentation
 
 `README.md` gets a note pointing at the guide; `docs/configuration.md` documents both options;
-`docs/api.md` lists the two endpoints; `docs/moonlight_webrtc_tizen.md` is the guide.
+`docs/api.md` is untouched, since TVs use the existing endpoints; `docs/moonlight_webrtc_tizen.md` is the guide.
 
 ## Verification of this revision
 
 - Builds with MSYS2 UCRT64 (GCC) without warnings.
-- `test_sunshine`: 684 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
+- `test_sunshine`: 685 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
   no virtual HID licence, no external shell command), 0 failed.
 - End to end on an AMD RX 9060 XT (AMF) with headless Edge: pairing through the Web UI PIN form (the TV listed in
   `/api/pin`, a wrong PIN, a cancellation and a stale request ID refused, the right PIN pairing it under
   the name typed in the Web UI; unauthenticated requests refused), the real Tizen app showing its PIN
-  and pairing in headless Edge, re-authentication, application list and artwork, H.264 720p/1080p and AV1 1080p
+  and pairing in headless Edge, TVs listed, disabled (refused without losing their credentials), re-enabled
+  and unpaired through the client list, a TV reconnecting mid-stream replacing its old connection
+  (`--takeover=1`), re-authentication, application list and artwork, H.264 720p/1080p and AV1 1080p
   decoded with every frame and 0 packets lost, Opus audio with 0 lost, controller announced,
   stop-session and stop-host-session, PLI answered with IDR, paired TVs persisted across a restart,
   and a clean exit (code 0) when Sunshine shuts down mid-stream.

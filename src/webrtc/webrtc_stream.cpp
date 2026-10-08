@@ -527,7 +527,7 @@ namespace webrtc_stream {
       std::vector<paired_tv_t> paired() const {
         std::vector<paired_tv_t> result;
         for (const auto &client : _tv_clients.list()) {
-          result.push_back({client.id, client.name});
+          result.push_back({client.id, client.name, client.enabled});
         }
         return result;
       }
@@ -551,6 +551,36 @@ namespace webrtc_stream {
         }
         BOOST_LOG(info) << "WebRTC: removed "sv << removed << " paired TV(s)"sv;
         return removed;
+      }
+
+      /**
+       * @brief Forget one TV, cutting it off if it is connected.
+       * @param id Client ID.
+       * @return True when the TV was paired.
+       */
+      bool forget_tv(std::string_view id) {
+        if (!_tv_clients.remove(id)) {
+          return false;
+        }
+        disconnect_client(id);
+        BOOST_LOG(info) << "WebRTC: removed a paired TV"sv;
+        return true;
+      }
+
+      /**
+       * @brief Allow or refuse a paired TV, cutting it off when it is refused.
+       * @param id Client ID.
+       * @param enabled Whether the TV may connect.
+       * @return True when the TV is paired.
+       */
+      bool enable_tv(std::string_view id, bool enabled) {
+        if (!_tv_clients.set_enabled(id, enabled)) {
+          return false;
+        }
+        if (!enabled) {
+          disconnect_client(id);
+        }
+        return true;
       }
 
     private:
@@ -718,6 +748,12 @@ namespace webrtc_stream {
           send(connection, protocol::make_error("authenticate", "authentication-failed", "This TV is not paired with Sunshine"));
           return;
         }
+        // Like a disabled Moonlight client, a disabled TV keeps its pairing but is refused.
+        if (!client->enabled) {
+          BOOST_LOG(info) << "WebRTC: refused disabled TV: "sv << client->name;
+          send(connection, protocol::make_error("authenticate", "client-disabled", "This TV is disabled in Sunshine"));
+          return;
+        }
         BOOST_LOG(info) << "WebRTC: TV authenticated: "sv << client->name;
         send(connection, protocol::make_authenticated());
         promote(connection, *client);
@@ -737,6 +773,28 @@ namespace webrtc_stream {
         BOOST_LOG(info) << "WebRTC: "sv << pairing->client_name << " at "sv << pairing->address << " asks to pair; enter its PIN in the Web UI"sv;
         std::lock_guard lock(connection->mutex);
         connection->pairing = std::move(pairing);
+      }
+
+      /**
+       * @brief Close the connection of an authenticated TV, ending its stream.
+       * @param id Client ID.
+       */
+      void disconnect_client(std::string_view id) {
+        std::shared_ptr<connection_t> active;
+        {
+          std::lock_guard lock(_connections_mutex);
+          active = _active;
+        }
+        if (!active) {
+          return;
+        }
+        {
+          std::lock_guard lock(active->mutex);
+          if (active->client_id != id) {
+            return;
+          }
+        }
+        active->socket->close();
       }
 
       /**
@@ -807,6 +865,9 @@ namespace webrtc_stream {
           connection->client_name = client.name;
         }
         if (previous) {
+          // Its close callback holds only a weak reference, which is gone once this function
+          // releases it, so the replaced TV's stream is stopped here rather than on close.
+          stop_stream(previous, false);
           previous->socket->close();
         }
         send(connection, protocol::make_gateway_status(status(connection)));
@@ -1188,6 +1249,12 @@ namespace webrtc_stream {
 
         stream->control_thread = std::jthread([this, weak_connection, stream] {
           run_stream(weak_connection, stream);
+          // Releasing the last reference here would make the stream's destructor join this very
+          // thread, which terminates Sunshine. The starter's reference outlives the assignment of
+          // control_thread, so when only this one is left nothing else can join it, and it detaches.
+          if (stream.use_count() == 1 && stream->control_thread.joinable()) {
+            stream->control_thread.detach();
+          }
         });
 
         stream->peer->setLocalDescription();
@@ -1774,6 +1841,32 @@ namespace webrtc_stream {
   std::vector<paired_tv_t> paired_tvs() {
     std::lock_guard lock(server_mutex);
     return running_server ? running_server->paired() : std::vector<paired_tv_t> {};
+  }
+
+  std::optional<bool> unpair_tv(std::string_view id) {
+    std::lock_guard lock(server_mutex);
+    if (!running_server) {
+      return std::nullopt;
+    }
+    try {
+      return running_server->forget_tv(id);
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "WebRTC: paired TV could not be removed: "sv << e.what();
+      return false;
+    }
+  }
+
+  std::optional<bool> set_tv_enabled(std::string_view id, bool enabled) {
+    std::lock_guard lock(server_mutex);
+    if (!running_server) {
+      return std::nullopt;
+    }
+    try {
+      return running_server->enable_tv(id, enabled);
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "WebRTC: paired TV could not be updated: "sv << e.what();
+      return false;
+    }
   }
 
   std::optional<std::size_t> unpair_all_tvs() {
