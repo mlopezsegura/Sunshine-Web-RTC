@@ -264,10 +264,10 @@ index 00000000..d4d98269
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_protocol.cpp b/tests/unit/webrtc/test_webrtc_protocol.cpp
 new file mode 100644
-index 00000000..29403155
+index 00000000..95fa86b8
 --- /dev/null
 +++ b/tests/unit/webrtc/test_webrtc_protocol.cpp
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,139 @@
 +/**
 + * @file tests/unit/webrtc/test_webrtc_protocol.cpp
 + * @brief Tests for the Moonlight WebRTC TV protocol.
@@ -357,9 +357,17 @@ index 00000000..29403155
 +  const auto authenticate = parse_client_message(R"({"version":2,"type":"authenticate","clientId":"ab","proof":"cd"})");
 +  EXPECT_EQ(std::get<authenticate_t>(authenticate.payload).client_id, "ab");
 +
-+  const auto pair = parse_client_message(R"({"version":2,"type":"pair-client","pin":"0421","clientName":"Samsung TV"})");
-+  EXPECT_EQ(std::get<pair_client_t>(pair.payload).pin, "0421");
-+  EXPECT_EQ(std::get<pair_client_t>(pair.payload).client_name, "Samsung TV");
++  const auto pair = parse_client_message(R"({"version":2,"type":"request-pairing","pin":"0421","clientName":"Samsung TV"})");
++  EXPECT_EQ(std::get<request_pairing_t>(pair.payload).pin, "0421");
++  EXPECT_EQ(std::get<request_pairing_t>(pair.payload).client_name, "Samsung TV");
++
++  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"request-pairing","pin":"04a1"})"), "invalid-message");
++  // TV apps that enter a PIN shown on the PC are told to update.
++  EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"pair-client","pin":"0421"})"), "unsupported-pairing");
++}
++
++TEST(WebrtcProtocolTest, AnnouncesThatTheTvShowsThePin) {
++  EXPECT_EQ(make_auth_required("00", std::nullopt, true).at("pairing"), "client-pin");
 +}
 +
 +TEST(WebrtcProtocolTest, OffersAv1OnlyWhenTheEncoderSupportsIt) {
@@ -475,10 +483,10 @@ index 00000000..ce49ec1c
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_tv_auth.cpp b/tests/unit/webrtc/test_webrtc_tv_auth.cpp
 new file mode 100644
-index 00000000..4b686599
+index 00000000..ed521780
 --- /dev/null
 +++ b/tests/unit/webrtc/test_webrtc_tv_auth.cpp
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,113 @@
 +/**
 + * @file tests/unit/webrtc/test_webrtc_tv_auth.cpp
 + * @brief Tests for pairing and authenticating Moonlight WebRTC TVs.
@@ -563,47 +571,47 @@ index 00000000..4b686599
 +  std::filesystem::remove(path);
 +}
 +
-+TEST(WebrtcTvAuthTest, AcceptsTheShownPinOnce) {
-+  tv_pairing_window_t window;
-+  const auto now = tv_pairing_window_t::clock::now();
-+  EXPECT_EQ(window.attempt("0000", now), pairing_attempt_e::not_open);
-+  const auto pin = window.open(now);
-+  EXPECT_EQ(window.state(now), pairing_state_e::waiting);
-+  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::accepted);
-+  EXPECT_EQ(window.state(now), pairing_state_e::paired);
-+  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::not_open);
++TEST(WebrtcTvAuthTest, AcceptsOnlyThePinTheTvShows) {
++  const auto now = pairing_request_t::clock::now();
++  const auto request = make_pairing_request("0421", "Living room\n", "192.168.1.20", now);
++  ASSERT_TRUE(request);
++  EXPECT_TRUE(is_hex(request->id, PAIRING_ID_BYTES));
++  EXPECT_EQ(request->client_name, "Living room");
++  EXPECT_EQ(request->address, "192.168.1.20");
++  EXPECT_EQ(check_pairing_pin(*request, "0421", now), pairing_check_e::accepted);
++  EXPECT_EQ(check_pairing_pin(*request, "0420", now), pairing_check_e::incorrect_pin);
++  EXPECT_EQ(check_pairing_pin(*request, "421", now), pairing_check_e::incorrect_pin);
 +}
 +
-+TEST(WebrtcTvAuthTest, LocksAfterThreeWrongPins) {
-+  tv_pairing_window_t window;
-+  const auto now = tv_pairing_window_t::clock::now();
-+  const auto pin = window.open(now);
-+  const auto *wrong = pin == "0000" ? "1111" : "0000";
-+  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::incorrect_pin);
-+  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::incorrect_pin);
-+  EXPECT_EQ(window.attempt(wrong, now), pairing_attempt_e::too_many_attempts);
-+  EXPECT_EQ(window.state(now), pairing_state_e::failed);
-+  EXPECT_EQ(window.attempt(pin, now), pairing_attempt_e::not_open);
++TEST(WebrtcTvAuthTest, GivesEachRequestItsOwnId) {
++  const auto now = pairing_request_t::clock::now();
++  EXPECT_NE(make_pairing_request("0421", "", "a", now)->id, make_pairing_request("0421", "", "a", now)->id);
 +}
 +
-+TEST(WebrtcTvAuthTest, ExpiresAfterTwoMinutes) {
-+  tv_pairing_window_t window;
-+  const auto now = tv_pairing_window_t::clock::now();
-+  const auto pin = window.open(now);
-+  EXPECT_EQ(window.attempt(pin, now + PAIRING_WINDOW_LIFETIME), pairing_attempt_e::not_open);
-+  EXPECT_EQ(window.state(now + PAIRING_WINDOW_LIFETIME), pairing_state_e::expired);
++TEST(WebrtcTvAuthTest, RejectsPinsThatAreNotFourDigits) {
++  const auto now = pairing_request_t::clock::now();
++  EXPECT_FALSE(make_pairing_request("042", "", "a", now));
++  EXPECT_FALSE(make_pairing_request("04a1", "", "a", now));
++  EXPECT_FALSE(make_pairing_request("04210", "", "a", now));
++}
++
++TEST(WebrtcTvAuthTest, ExpiresAPairingRequest) {
++  const auto now = pairing_request_t::clock::now();
++  const auto request = make_pairing_request("0421", "", "a", now);
++  EXPECT_EQ(check_pairing_pin(*request, "0421", now + PAIRING_REQUEST_LIFETIME), pairing_check_e::expired);
 +}
 diff --git a/tests/webrtc_e2e/README.md b/tests/webrtc_e2e/README.md
 new file mode 100644
-index 00000000..475d596e
+index 00000000..6fc3c9ae
 --- /dev/null
 +++ b/tests/webrtc_e2e/README.md
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +# Moonlight WebRTC end-to-end test
 +
-+`driver.mjs` checks the Moonlight WebRTC TV server of a running Sunshine from end to end. It opens a
-+pairing window through the Web UI API, then loads `client.html` in headless Edge, which plays the TV:
-+it pairs with the PIN (after a wrong one), reconnects and authenticates, lists the applications, fetches
++`driver.mjs` checks the Moonlight WebRTC TV server of a running Sunshine from end to end. It loads
++`client.html` in headless Edge, which plays the TV: it asks to pair showing a PIN, which the driver
++approves through `/api/pin` like a user in the Web UI would (after a wrong PIN and a cancellation); the
++page then reconnects and authenticates, lists the applications, fetches
 +artwork, starts a stream, announces a gamepad, measures the decoded video and audio through `getStats()`,
 +and finally stops the stream and the application. The driver prints the steps and statistics.
 +
@@ -616,10 +624,10 @@ index 00000000..475d596e
 +streams are established but their frames are only received, not decoded; a Samsung TV decodes them.
 diff --git a/tests/webrtc_e2e/client.html b/tests/webrtc_e2e/client.html
 new file mode 100644
-index 00000000..88aa8811
+index 00000000..1fd72c05
 --- /dev/null
 +++ b/tests/webrtc_e2e/client.html
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,179 @@
 +<!doctype html>
 +<html>
 +<head><meta charset="utf-8"><title>WebRTC TV E2E</title></head>
@@ -669,18 +677,22 @@ index 00000000..88aa8811
 +
 +async function handle(m) {
 +  if (m.type === "auth-required") {
-+    note("auth-required", { sunshineAvailable: m.sunshineAvailable, mac: m.macAddress || null });
++    note("auth-required", { sunshineAvailable: m.sunshineAvailable, mac: m.macAddress || null, pairing: m.pairing || null });
 +    if (credentials) {
 +      send({ type: "authenticate", clientId: credentials.clientId,
 +             proof: await hmacHex(credentials.clientSecret, "moonlight-webrtc-tv-auth-v1:" + m.nonce) });
 +    } else {
 +      // An unauthenticated request must be refused before pairing.
 +      send({ type: "get-apps" });
-+      send({ type: "pair-client", pin: "9999" === pin ? "0000" : "9999", clientName: "E2E Edge" });
 +      send({ type: "pair-client", pin, clientName: "E2E Edge" });
++      send({ type: "request-pairing", pin, clientName: "E2E Edge" });
 +    }
 +  } else if (m.type === "error") {
 +    note("error", { requestType: m.requestType, code: m.code });
++    // Like the TV, ask again after the Web UI rejects or cancels the request.
++    if (m.requestType === "request-pairing" && !credentials) {
++      send({ type: "request-pairing", pin, clientName: "E2E Edge" });
++    }
 +  } else if (m.type === "paired") {
 +    note("paired");
 +    credentials = { clientId: m.clientId, clientSecret: m.clientSecret };
@@ -797,12 +809,12 @@ index 00000000..88aa8811
 +</html>
 diff --git a/tests/webrtc_e2e/driver.mjs b/tests/webrtc_e2e/driver.mjs
 new file mode 100644
-index 00000000..7751e399
+index 00000000..570a33fa
 --- /dev/null
 +++ b/tests/webrtc_e2e/driver.mjs
-@@ -0,0 +1,75 @@
-+// Drives one end-to-end run against a running Sunshine: pairs through the Web UI API, serves the
-+// TV stand-in page to a headless Chromium browser, and prints what the page measured.
+@@ -0,0 +1,109 @@
++// Drives one end-to-end run against a running Sunshine: serves the TV stand-in page to a headless
++// Chromium browser, approves the PIN it shows through the Web UI API, and prints what it measured.
 +//
 +//   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
 +//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --bitrate=20000 --hdr=1]
@@ -822,23 +834,56 @@ index 00000000..7751e399
 +const webUi = args.webui || "https://127.0.0.1:50001";
 +const auth = "Basic " + Buffer.from(args.creds || "e2e:e2e-password").toString("base64");
 +
-+function api(method, route) {
++function api(method, route, payload) {
 +  return new Promise((resolve, reject) => {
-+    const request = https.request(webUi + route, { method, headers: { Authorization: auth }, rejectUnauthorized: false }, (response) => {
++    const headers = { Authorization: auth };
++    if (payload) {
++      // Sunshine's server reads no chunked bodies, which Node would send for a DELETE.
++      headers["Content-Type"] = "application/json";
++      headers["Content-Length"] = Buffer.byteLength(JSON.stringify(payload));
++    }
++    const request = https.request(webUi + route, { method, headers, rejectUnauthorized: false }, (response) => {
 +      let body = "";
 +      response.on("data", (chunk) => (body += chunk));
 +      response.on("end", () => resolve({ status: response.statusCode, body: body ? JSON.parse(body) : null }));
 +    });
 +    request.on("error", reject);
-+    request.end();
++    request.end(payload ? JSON.stringify(payload) : undefined);
 +  });
 +}
 +
-+const before = await api("GET", "/api/webrtc/tvs");
-+const pairing = await api("POST", "/api/webrtc/pair");
-+console.log("API tvs:", JSON.stringify(before.body), "pair:", pairing.status, pairing.body.status, "pin length", (pairing.body.pin || "").length);
++// The page shows this PIN like a TV does; the driver plays the user typing it into the Web UI.
++const pin = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
++const wrongPin = pin === "0000" ? "1111" : "0000";
 +
-+const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin: pairing.body.pin, codec: args.codec || "h264",
++async function waitForTvRequest(previousId) {
++  for (let attempt = 0; attempt < 100; attempt += 1) {
++    const pending = await api("GET", "/api/pin");
++    const tv = (pending.body.pairings || []).find((pairing) => pairing.name === "E2E Edge" && pairing.id !== previousId);
++    if (tv) {
++      return tv;
++    }
++    await new Promise((resolve) => setTimeout(resolve, 200));
++  }
++  throw new Error("The TV's pairing request never appeared in /api/pin");
++}
++
++// A wrong PIN and a cancellation each end the request; the page asks again and the right PIN pairs it.
++async function pairThroughWebUi() {
++  const first = await waitForTvRequest();
++  console.log("API pin GET: TV listed", JSON.stringify({ name: first.name, address: first.address, idLength: first.id.length }));
++  console.log("API pin POST wrong PIN:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: first.id, pin: wrongPin, name: "E2E Edge" })).body));
++  const second = await waitForTvRequest(first.id);
++  console.log("API pin DELETE:", JSON.stringify((await api("DELETE", "/api/pin", { pairing_id: second.id })).body));
++  const third = await waitForTvRequest(second.id);
++  console.log("API pin POST stale id:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: first.id, pin, name: "E2E Edge" })).body));
++  console.log("API pin POST right PIN:", JSON.stringify((await api("POST", "/api/pin", { pairing_id: third.id, pin, name: "E2E Living Room" })).body));
++}
++
++const before = await api("GET", "/api/webrtc/tvs");
++console.log("API tvs:", JSON.stringify(before.body));
++
++const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin, codec: args.codec || "h264",
 +  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0" });
 +let edge;
 +const server = http.createServer((request, response) => {
@@ -874,5 +919,6 @@ index 00000000..7751e399
 +  edge = spawn(args.browser || "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", [
 +    "--headless=new", "--no-first-run", "--user-data-dir=" + profile, "--autoplay-policy=no-user-gesture-required",
 +    "--remote-debugging-port=0", "--enable-features=WebRtcAllowH265Receive,PlatformHEVCDecoderSupport", "http://127.0.0.1:8099/?" + query], { stdio: "ignore" });
++  pairThroughWebUi().catch((error) => { console.log("pairing failed:", error.message); edge?.kill(); process.exit(3); });
 +});
 +setTimeout(() => { console.log("driver timeout"); edge?.kill(); process.exit(2); }, 90000);

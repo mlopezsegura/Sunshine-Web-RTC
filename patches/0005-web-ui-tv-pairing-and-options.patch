@@ -1,8 +1,8 @@
 diff --git a/src_assets/common/assets/web/Pin.vue b/src_assets/common/assets/web/Pin.vue
-index 95330fa4..fcd19eaa 100644
+index 95330fa4..e5c35e07 100644
 --- a/src_assets/common/assets/web/Pin.vue
 +++ b/src_assets/common/assets/web/Pin.vue
-@@ -51,6 +51,30 @@
+@@ -51,6 +51,25 @@
        </div>
        <div v-if="status" :class="`alert alert-${status.type}`" role="alert">{{ status.message }}</div>
      </form>
@@ -11,17 +11,12 @@ index 95330fa4..fcd19eaa 100644
 +    <div class="d-flex flex-column align-items-center">
 +      <div class="card flex-column d-flex p-4 mb-4">
 +        <p class="mb-3">{{ $t('pin.tv_pairing_desc') }}</p>
-+        <div v-if="tvPin" class="text-center mb-3">
-+          <div class="display-4 fw-bold" id="tv-pin">{{ tvPin }}</div>
-+          <div class="form-text">{{ tvStatusText }}</div>
-+        </div>
-+        <button type="button" class="btn btn-primary mb-3" @click="pairTv">
-+          <tv :size="18" class="icon"></tv>
-+          {{ $t('pin.tv_pair') }}
-+        </button>
 +        <ul class="list-group mb-3">
 +          <li v-if="!pairedTvs.length" class="list-group-item">{{ $t('pin.tv_none') }}</li>
-+          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">{{ tv.name }}</li>
++          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">
++            <tv :size="18" class="icon"></tv>
++            {{ tv.name }}
++          </li>
 +        </ul>
 +        <button type="button" class="btn btn-outline-danger" :disabled="!pairedTvs.length" @click="unpairTvs">
 +          <x :size="18" class="icon"></x>
@@ -33,7 +28,7 @@ index 95330fa4..fcd19eaa 100644
    </div>
  </template>
  
-@@ -61,6 +85,7 @@
+@@ -61,6 +80,7 @@
      Forward,
      Hash,
      Monitor,
@@ -41,7 +36,7 @@ index 95330fa4..fcd19eaa 100644
      UserRoundSearch,
      X,
    } from '@lucide/vue'
-@@ -71,6 +96,7 @@
+@@ -71,6 +91,7 @@
        Forward,
        Hash,
        Monitor,
@@ -49,25 +44,25 @@ index 95330fa4..fcd19eaa 100644
        UserRoundSearch,
        X,
      },
-@@ -83,11 +109,30 @@
+@@ -82,12 +103,30 @@
+         pin: '',
          refreshTimer: null,
          selectedPairingId: '',
++        suggestedName: '',
          status: null,
 +        pairedTvs: [],
-+        tvPairing: 'tv-pairing-idle',
-+        tvPin: '',
 +        tvStatus: null,
        };
      },
-+    computed: {
-+      tvStatusText() {
-+        const keys = {
-+          'tv-pairing-waiting': 'pin.tv_waiting',
-+          'tv-paired': 'pin.tv_paired',
-+          'tv-pairing-expired': 'pin.tv_expired',
-+          'tv-pairing-locked': 'pin.tv_locked',
-+        };
-+        return keys[this.tvPairing] ? this.i18n.t(keys[this.tvPairing]) : '';
++    watch: {
++      /**
++       * Suggest the name the selected device reported, keeping one the operator typed.
++       */
++      selectedPairingId(id) {
++        if (!this.name || this.name === this.suggestedName) {
++          this.name = this.pendingPairings.find((pairing) => pairing.id === id)?.name || '';
++          this.suggestedName = this.name;
++        }
 +      },
 +    },
      mounted() {
@@ -81,12 +76,20 @@ index 95330fa4..fcd19eaa 100644
      },
      beforeUnmount() {
        window.clearInterval(this.refreshTimer);
-@@ -147,6 +192,53 @@
+@@ -141,12 +180,42 @@
+           this.status = {type: 'success', message: this.i18n.t('pin.pair_success')};
+           this.pin = '';
+           this.name = '';
++          this.suggestedName = '';
++          await this.loadTvs();
+         } else {
+           this.status = {type: 'danger', message: this.i18n.t('pin.pair_failure')};
+         }
          await this.loadPendingPairings();
        },
  
 +      /**
-+       * Refresh the Moonlight WebRTC TVs and the state of an open TV pairing window.
++       * Refresh the paired Moonlight WebRTC TVs.
 +       */
 +      async loadTvs() {
 +        try {
@@ -96,27 +99,8 @@ index 95330fa4..fcd19eaa 100644
 +          }
 +          const body = await response.json();
 +          this.pairedTvs = body.tvs || [];
-+          this.tvPairing = body.pairing || 'tv-pairing-idle';
-+          if (this.tvPairing !== 'tv-pairing-waiting' && this.tvPairing !== 'tv-paired') {
-+            this.tvPin = '';
-+          }
 +        } catch (error) {
 +          console.error('Failed to load Moonlight WebRTC TVs', error);
-+        }
-+      },
-+
-+      /**
-+       * Open a two-minute window and show the PIN to enter on the TV.
-+       */
-+      async pairTv() {
-+        this.tvStatus = null;
-+        const response = await apiFetch('./api/webrtc/pair', {method: 'POST'});
-+        const result = await response.json();
-+        if (result.status === true) {
-+          this.tvPin = result.pin;
-+          this.tvPairing = 'tv-pairing-waiting';
-+        } else {
-+          this.tvStatus = {type: 'danger', message: this.i18n.t('pin.tv_pair_failure')};
 +        }
 +      },
 +
@@ -176,7 +160,7 @@ index 9988dcc7..77ec2816 100644
    </div>
  </template>
 diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
-index 030f733c..78500a0a 100644
+index 030f733c..6cca08e9 100644
 --- a/src_assets/common/assets/web/public/assets/locale/en.json
 +++ b/src_assets/common/assets/web/public/assets/locale/en.json
 @@ -433,6 +433,10 @@
@@ -190,22 +174,16 @@ index 030f733c..78500a0a 100644
      "vaapi_blbrc": "Block level based bitrate control (BLBRC)",
      "vaapi_blbrc_desc": "Enable block level rate control, which assigns different bitrate block by block. Can be combined with CBR/VBR-type rate control methods on supported encoders.",
      "vaapi_quality": "VA-API Quality",
-@@ -583,6 +587,18 @@
+@@ -583,6 +587,12 @@
      "select_pairing": "Select the device requesting approval",
      "select_pairing_required": "Select the device you intend to pair",
      "send": "Send",
-+    "tv_expired": "The PIN expired before a TV used it",
-+    "tv_locked": "Too many incorrect PINs were entered on the TV",
 +    "tv_none": "No TVs are paired",
-+    "tv_pair": "Pair TV",
-+    "tv_pair_failure": "TV pairing could not be started. Is the Moonlight WebRTC TV server enabled?",
-+    "tv_paired": "The TV was paired",
 +    "tv_pairing": "Moonlight WebRTC TVs",
-+    "tv_pairing_desc": "Samsung TVs running the Moonlight WebRTC app stream directly from Sunshine. Choose Pair TV, then enter the PIN on the TV within two minutes.",
++    "tv_pairing_desc": "Samsung TVs running the Moonlight WebRTC app stream directly from Sunshine. To pair one, select it above and enter the PIN the TV shows.",
 +    "tv_unpair_all": "Forget All TVs",
 +    "tv_unpair_failure": "Paired TVs could not be removed",
 +    "tv_unpair_success": "Every TV was removed",
-+    "tv_waiting": "Enter this PIN on the TV",
      "unknown_address": "Unknown address",
      "unknown_device": "Unknown device",
      "warning_msg": "Make sure you have access to the client you are pairing with. This software can give total control to your computer, so be careful!"

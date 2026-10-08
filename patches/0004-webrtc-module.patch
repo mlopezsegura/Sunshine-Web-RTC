@@ -1093,10 +1093,10 @@ index 00000000..6acae118
 +}  // namespace webrtc_stream
 diff --git a/src/webrtc/protocol.cpp b/src/webrtc/protocol.cpp
 new file mode 100644
-index 00000000..36a3f4f4
+index 00000000..7df7e513
 --- /dev/null
 +++ b/src/webrtc/protocol.cpp
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,428 @@
 +/**
 + * @file src/webrtc/protocol.cpp
 + * @brief Definitions for the Moonlight WebRTC TV protocol (version 2).
@@ -1348,16 +1348,22 @@ index 00000000..36a3f4f4
 +        }
 +        return {type, authenticate_t {std::move(client_id), std::move(proof)}};
 +      }
-+      if (type == "pair-client") {
++      if (type == "request-pairing") {
 +        auto pin = message.at("pin").get<std::string>();
-+        if (pin.size() != 4) {
++        if (pin.size() != 4 || !std::ranges::all_of(pin, [](unsigned char digit) {
++              return std::isdigit(digit);
++            })) {
 +          throw protocol_error_t("invalid-message", "pin must have four digits");
 +        }
 +        std::string client_name;
 +        if (message.contains("clientName")) {
 +          client_name = message.at("clientName").get<std::string>();
 +        }
-+        return {type, pair_client_t {std::move(pin), std::move(client_name)}};
++        return {type, request_pairing_t {std::move(pin), std::move(client_name)}};
++      }
++      if (type == "pair-client") {
++        // TV apps from before Sunshine took over the Gateway entered a PIN shown on the PC.
++        throw protocol_error_t("unsupported-pairing", "Update the TV app: Sunshine pairs TVs with a PIN shown on the TV");
 +      }
 +      if (type == "get-apps") {
 +        return {type, get_apps_t {}};
@@ -1394,6 +1400,7 @@ index 00000000..36a3f4f4
 +  json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available) {
 +    auto message = envelope("auth-required");
 +    message["nonce"] = nonce;
++    message["pairing"] = "client-pin";
 +    if (mac_address) {
 +      message["macAddress"] = *mac_address;
 +    }
@@ -1520,10 +1527,10 @@ index 00000000..36a3f4f4
 +}  // namespace webrtc_stream::protocol
 diff --git a/src/webrtc/protocol.h b/src/webrtc/protocol.h
 new file mode 100644
-index 00000000..d2c92b03
+index 00000000..df7db3a4
 --- /dev/null
 +++ b/src/webrtc/protocol.h
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,384 @@
 +/**
 + * @file src/webrtc/protocol.h
 + * @brief Declarations for the Moonlight WebRTC TV protocol (version 2).
@@ -1686,10 +1693,10 @@ index 00000000..d2c92b03
 +  };
 +
 +  /**
-+   * @brief A TV pairing with the PIN shown on the PC.
++   * @brief A TV asking to pair, showing a PIN for the user to enter in Sunshine's Web UI.
 +   */
-+  struct pair_client_t {
-+    std::string pin;  ///< Four-digit PIN.
++  struct request_pairing_t {
++    std::string pin;  ///< Four-digit PIN the TV shows.
 +    std::string client_name;  ///< Display name of the TV.
 +  };
 +
@@ -1751,7 +1758,7 @@ index 00000000..d2c92b03
 +  /**
 +   * @brief Any message the TV may send.
 +   */
-+  using client_payload_t = std::variant<authenticate_t, pair_client_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
++  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
 +
 +  /**
 +   * @brief A parsed TV message.
@@ -1799,6 +1806,10 @@ index 00000000..d2c92b03
 +
 +  /**
 +   * @brief Build the greeting carrying the authentication nonce.
++   *
++   * It also announces `"pairing": "client-pin"`: an unpaired TV shows its own PIN and sends
++   * `request-pairing`, rather than asking for a PIN shown on the PC as the standalone Gateway does.
++   *
 +   * @param nonce Single-use nonce in lower-case hex.
 +   * @param mac_address Wake-on-LAN address, offered before authentication like ARP does.
 +   * @param sunshine_available Whether streaming is possible, for the TV's reachability probe.
@@ -2169,10 +2180,10 @@ index 00000000..6820164e
 +}  // namespace webrtc_stream::sdp
 diff --git a/src/webrtc/tv_auth.cpp b/src/webrtc/tv_auth.cpp
 new file mode 100644
-index 00000000..7d71894b
+index 00000000..4464d684
 --- /dev/null
 +++ b/src/webrtc/tv_auth.cpp
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,270 @@
 +/**
 + * @file src/webrtc/tv_auth.cpp
 + * @brief Definitions for pairing and authenticating Moonlight WebRTC TVs.
@@ -2259,35 +2270,6 @@ index 00000000..7d71894b
 +        bytes[index] = static_cast<unsigned char>((high << 4) | low);
 +      }
 +      return bytes;
-+    }
-+
-+    /**
-+     * @brief Generate a uniformly distributed four-digit PIN.
-+     * @return The PIN.
-+     */
-+    std::string random_pin() {
-+      // Rejection sampling keeps every PIN equally likely.
-+      for (;;) {
-+        std::uint16_t value = 0;
-+        if (RAND_bytes(reinterpret_cast<unsigned char *>(&value), sizeof(value)) != 1) {
-+          throw std::runtime_error("OpenSSL failed to generate a TV pairing PIN");
-+        }
-+        if (value < 60000) {
-+          const std::string pin = std::to_string(value % 10000);
-+          return std::string(4 - pin.size(), '0') + pin;
-+        }
-+      }
-+    }
-+
-+    /**
-+     * @brief Check that a PIN has four digits.
-+     * @param pin PIN to check.
-+     * @return True when it is valid.
-+     */
-+    bool is_valid_pin(std::string_view pin) {
-+      return pin.size() == 4 && std::ranges::all_of(pin, [](char digit) {
-+               return digit >= '0' && digit <= '9';
-+             });
 +    }
 +
 +    /**
@@ -2452,57 +2434,32 @@ index 00000000..7d71894b
 +    return _clients.size();
 +  }
 +
-+  std::string tv_pairing_window_t::open(clock::time_point now) {
-+    _pin = random_pin();
-+    _expires_at = now + PAIRING_WINDOW_LIFETIME;
-+    _failed_attempts = 0;
-+    _state = pairing_state_e::waiting;
-+    return _pin;
++  bool is_valid_pin(std::string_view pin) {
++    return pin.size() == 4 && std::ranges::all_of(pin, [](char digit) {
++             return digit >= '0' && digit <= '9';
++           });
 +  }
 +
-+  void tv_pairing_window_t::expire(clock::time_point now) {
-+    if (_state == pairing_state_e::waiting && now >= _expires_at) {
-+      _state = pairing_state_e::expired;
-+      _pin.clear();
++  std::optional<pairing_request_t> make_pairing_request(std::string_view pin, std::string_view client_name, std::string address, pairing_request_t::clock::time_point now) {
++    if (!is_valid_pin(pin)) {
++      return std::nullopt;
 +    }
++    return pairing_request_t {random_hex(PAIRING_ID_BYTES), std::string(pin), sanitize_client_name(client_name), std::move(address), now + PAIRING_REQUEST_LIFETIME};
 +  }
 +
-+  pairing_attempt_e tv_pairing_window_t::attempt(std::string_view pin, clock::time_point now) {
-+    expire(now);
-+    if (_state != pairing_state_e::waiting) {
-+      return pairing_attempt_e::not_open;
++  pairing_check_e check_pairing_pin(const pairing_request_t &request, std::string_view pin, pairing_request_t::clock::time_point now) {
++    if (now >= request.expires_at) {
++      return pairing_check_e::expired;
 +    }
-+    if (is_valid_pin(pin) && constant_time_equals(pin, _pin)) {
-+      _state = pairing_state_e::paired;
-+      _pin.clear();
-+      return pairing_attempt_e::accepted;
-+    }
-+    if (++_failed_attempts >= MAXIMUM_PIN_ATTEMPTS) {
-+      _state = pairing_state_e::failed;
-+      _pin.clear();
-+      return pairing_attempt_e::too_many_attempts;
-+    }
-+    return pairing_attempt_e::incorrect_pin;
-+  }
-+
-+  pairing_state_e tv_pairing_window_t::state(clock::time_point now) {
-+    expire(now);
-+    return _state;
-+  }
-+
-+  void tv_pairing_window_t::close() {
-+    if (_state == pairing_state_e::waiting) {
-+      _state = pairing_state_e::idle;
-+    }
-+    _pin.clear();
++    return is_valid_pin(pin) && constant_time_equals(pin, request.pin) ? pairing_check_e::accepted : pairing_check_e::incorrect_pin;
 +  }
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/tv_auth.h b/src/webrtc/tv_auth.h
 new file mode 100644
-index 00000000..44cc6a84
+index 00000000..6b69318f
 --- /dev/null
 +++ b/src/webrtc/tv_auth.h
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,191 @@
 +/**
 + * @file src/webrtc/tv_auth.h
 + * @brief Declarations for pairing and authenticating Moonlight WebRTC TVs.
@@ -2525,8 +2482,8 @@ index 00000000..44cc6a84
 +  constexpr std::size_t NONCE_BYTES = 32;  ///< Length of a connection nonce.
 +  constexpr std::size_t MAXIMUM_CLIENTS = 32;  ///< Paired TVs kept; the oldest is dropped beyond this.
 +  constexpr std::size_t MAXIMUM_CLIENT_NAME_LENGTH = 64;  ///< Longest stored TV name.
-+  constexpr int MAXIMUM_PIN_ATTEMPTS = 3;  ///< Wrong PINs that close a pairing window.
-+  constexpr std::chrono::seconds PAIRING_WINDOW_LIFETIME {120};  ///< How long a PIN stays valid.
++  constexpr std::size_t PAIRING_ID_BYTES = 16;  ///< Length of a pairing request ID.
++  constexpr std::chrono::seconds PAIRING_REQUEST_LIFETIME {300};  ///< How long a TV's PIN waits for approval.
 +
 +  /**
 +   * @brief Generate random bytes as lower-case hex.
@@ -2643,82 +2600,63 @@ index 00000000..44cc6a84
 +  };
 +
 +  /**
-+   * @brief Outcome of one PIN entered on a TV.
++   * @brief Check that a PIN has four digits.
++   * @param pin PIN to check.
++   * @return True when it is valid.
 +   */
-+  enum class pairing_attempt_e {
-+    accepted,  ///< The PIN matched.
-+    incorrect_pin,  ///< The PIN did not match; the window stays open.
-+    not_open,  ///< No pairing window is open.
-+    too_many_attempts,  ///< The PIN did not match and the window closed.
++  bool is_valid_pin(std::string_view pin);
++
++  /**
++   * @brief Outcome of the PIN entered in Sunshine's Web UI for a TV's pairing request.
++   */
++  enum class pairing_check_e {
++    accepted,  ///< The PIN matched the one the TV shows.
++    incorrect_pin,  ///< The PIN did not match; the request ends.
++    expired,  ///< The request outlived @ref PAIRING_REQUEST_LIFETIME.
 +  };
 +
 +  /**
-+   * @brief State of the pairing window as shown on the PC.
-+   */
-+  enum class pairing_state_e {
-+    idle,  ///< No window was opened.
-+    waiting,  ///< A PIN is waiting for a TV.
-+    paired,  ///< A TV paired.
-+    expired,  ///< The PIN expired unused.
-+    failed,  ///< Too many wrong PINs were entered.
-+  };
-+
-+  /**
-+   * @brief A short, explicitly opened window in which one TV may pair with the PIN shown on the PC.
++   * @brief A TV asking to pair, showing a PIN that the user enters in Sunshine's Web UI.
 +   *
-+   * It closes on success, on expiry, or after @ref MAXIMUM_PIN_ATTEMPTS wrong PINs, so a device
-+   * on the network cannot guess its way through the 10,000 possible PINs.
++   * Pairing works like Moonlight's: the TV picks the PIN and shows it, and only a user signed in
++   * to the Web UI can approve it. The TV is selected there by this request's unguessable ID, so a
++   * device that copies the TV's name and PIN still cannot take its place.
 +   */
-+  class tv_pairing_window_t {
-+  public:
++  struct pairing_request_t {
 +    using clock = std::chrono::steady_clock;  ///< Clock used for expiry.
 +
-+    /**
-+     * @brief Open the window with a new PIN.
-+     * @param now Current time.
-+     * @return The PIN to show on the PC.
-+     */
-+    std::string open(clock::time_point now);
-+
-+    /**
-+     * @brief Check a PIN entered on a TV.
-+     * @param pin PIN sent by the TV.
-+     * @param now Current time.
-+     * @return The outcome.
-+     */
-+    pairing_attempt_e attempt(std::string_view pin, clock::time_point now);
-+
-+    /**
-+     * @brief Report the window state.
-+     * @param now Current time.
-+     * @return The state.
-+     */
-+    pairing_state_e state(clock::time_point now);
-+
-+    /**
-+     * @brief Close an open window.
-+     */
-+    void close();
-+
-+  private:
-+    /**
-+     * @brief Expire the window when its PIN is past its lifetime.
-+     * @param now Current time.
-+     */
-+    void expire(clock::time_point now);
-+
-+    std::string _pin;  ///< Current PIN.
-+    clock::time_point _expires_at {};  ///< When the PIN expires.
-+    int _failed_attempts = 0;  ///< Wrong PINs entered so far.
-+    pairing_state_e _state = pairing_state_e::idle;  ///< Current state.
++    std::string id;  ///< Unguessable approval ID shown to the Web UI.
++    std::string pin;  ///< PIN the TV shows.
++    std::string client_name;  ///< Sanitized TV name.
++    std::string address;  ///< TV address, for the Web UI.
++    clock::time_point expires_at;  ///< When the request lapses.
 +  };
++
++  /**
++   * @brief Start a pairing request for a PIN the TV shows.
++   * @param pin PIN chosen by the TV.
++   * @param client_name Name sent by the TV.
++   * @param address TV address.
++   * @param now Current time.
++   * @return The request, or nothing when the PIN is not four digits.
++   */
++  std::optional<pairing_request_t> make_pairing_request(std::string_view pin, std::string_view client_name, std::string address, pairing_request_t::clock::time_point now);
++
++  /**
++   * @brief Check the PIN entered in the Web UI against a request.
++   * @param request Pairing request.
++   * @param pin PIN entered in the Web UI.
++   * @param now Current time.
++   * @return The outcome; every outcome but acceptance ends the request.
++   */
++  pairing_check_e check_pairing_pin(const pairing_request_t &request, std::string_view pin, pairing_request_t::clock::time_point now);
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/webrtc_stream.cpp b/src/webrtc/webrtc_stream.cpp
 new file mode 100644
-index 00000000..28d75941
+index 00000000..173f79d0
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.cpp
-@@ -0,0 +1,1714 @@
+@@ -0,0 +1,1786 @@
 +/**
 + * @file src/webrtc/webrtc_stream.cpp
 + * @brief Definitions for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -2942,6 +2880,19 @@ index 00000000..28d75941
 +    }
 +
 +    /**
++     * @brief Drop the port from a peer address.
++     * @param remote_address Peer address as "host:port" or "[host]:port".
++     * @return The host.
++     */
++    std::string peer_host(const std::string &remote_address) {
++      auto host = remote_address.substr(0, remote_address.rfind(':'));
++      if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
++        host = host.substr(1, host.size() - 2);
++      }
++      return host;
++    }
++
++    /**
 +     * @brief Find the Wake-on-LAN address of the adapter that routes to a peer.
 +     * @param remote_address Peer address as "host:port".
 +     * @return Upper-case colon-separated MAC address, or nothing when unknown.
@@ -2951,10 +2902,7 @@ index 00000000..28d75941
 +        return std::nullopt;
 +      }
 +      try {
-+        auto host = remote_address->substr(0, remote_address->rfind(':'));
-+        if (host.size() > 2 && host.front() == '[' && host.back() == ']') {
-+          host = host.substr(1, host.size() - 2);
-+        }
++        const auto host = peer_host(*remote_address);
 +        // Connecting a UDP socket only selects the route; it sends nothing.
 +        boost::asio::io_context io;
 +        boost::asio::ip::udp::socket socket(io);
@@ -3073,6 +3021,7 @@ index 00000000..28d75941
 +      std::optional<std::string> mac_address;  ///< Wake-on-LAN address facing this TV.
 +      std::string client_id;  ///< Authenticated TV ID.
 +      std::string client_name;  ///< Authenticated TV name.
++      std::optional<tv_auth::pairing_request_t> pairing;  ///< Pairing request awaiting approval in the Web UI.
 +      std::shared_ptr<stream_t> stream;  ///< Current stream.
 +      bool host_operation_active = false;  ///< A stop or switch is in progress.
 +    };
@@ -3124,6 +3073,7 @@ index 00000000..28d75941
 +        auto shutdown_event = mail::man->event<bool>(mail::shutdown);
 +        auto next_check = std::chrono::steady_clock::now() + CODEC_CHECK_INTERVAL;
 +        while (!shutdown_event->view(500ms)) {
++          expire_pairings();
 +          if (std::chrono::steady_clock::now() < next_check) {
 +            continue;
 +          }
@@ -3147,38 +3097,86 @@ index 00000000..28d75941
 +      }
 +
 +      /**
-+       * @brief Open the TV pairing window.
-+       * @return The PIN.
++       * @brief List the TVs waiting for their PIN to be entered in the Web UI.
++       * @return Pending pairing requests.
 +       */
-+      std::string open_pairing() {
-+        std::string pin;
-+        {
-+          std::lock_guard lock(_pairing_mutex);
-+          pin = _pairing.open(tv_auth::tv_pairing_window_t::clock::now());
++      std::vector<pending_tv_pairing_t> pending_pairings() {
++        std::vector<pending_tv_pairing_t> result;
++        const auto now = tv_auth::pairing_request_t::clock::now();
++        for (const auto &connection : pending_connections()) {
++          std::lock_guard lock(connection->mutex);
++          if (connection->pairing && now < connection->pairing->expires_at) {
++            result.push_back({connection->pairing->id, connection->pairing->client_name, connection->pairing->address});
++          }
 +        }
-+        BOOST_LOG(info) << "WebRTC: TV pairing opened for two minutes"sv;
-+        return pin;
++        return result;
 +      }
 +
 +      /**
-+       * @brief Report the TV pairing window state.
-+       * @return The state code.
++       * @brief Approve a TV's pairing request with the PIN the TV shows.
++       * @param id Pairing request ID.
++       * @param pin PIN entered in the Web UI.
++       * @param name Name to store; the TV's own name when empty.
++       * @return Whether the TV paired, or nothing when no TV made that request.
 +       */
-+      std::string pairing_status() {
-+        std::lock_guard lock(_pairing_mutex);
-+        switch (_pairing.state(tv_auth::tv_pairing_window_t::clock::now())) {
-+          case tv_auth::pairing_state_e::waiting:
-+            return "tv-pairing-waiting";
-+          case tv_auth::pairing_state_e::paired:
-+            return "tv-paired";
-+          case tv_auth::pairing_state_e::expired:
-+            return "tv-pairing-expired";
-+          case tv_auth::pairing_state_e::failed:
-+            return "tv-pairing-locked";
-+          case tv_auth::pairing_state_e::idle:
++      std::optional<bool> approve_pairing(std::string_view id, std::string_view pin, std::string_view name) {
++        const auto connection = find_pairing(id);
++        if (!connection) {
++          return std::nullopt;
++        }
++        tv_auth::pairing_request_t request;
++        {
++          std::lock_guard lock(connection->mutex);
++          if (!connection->pairing || connection->pairing->id != id) {
++            return std::nullopt;
++          }
++          request = *std::exchange(connection->pairing, std::nullopt);
++        }
++        switch (tv_auth::check_pairing_pin(request, pin, tv_auth::pairing_request_t::clock::now())) {
++          case tv_auth::pairing_check_e::expired:
++            send(connection, protocol::make_error("request-pairing", "pairing-expired", "The PIN expired before it was entered in Sunshine"));
++            return false;
++          case tv_auth::pairing_check_e::incorrect_pin:
++            BOOST_LOG(warning) << "WebRTC: TV pairing, incorrect PIN entered in the Web UI"sv;
++            send(connection, protocol::make_error("request-pairing", "incorrect-pin", "The PIN entered in Sunshine did not match the one on this TV"));
++            return false;
++          case tv_auth::pairing_check_e::accepted:
 +            break;
 +        }
-+        return "tv-pairing-idle";
++
++        tv_auth::tv_client_t client;
++        try {
++          client = _tv_clients.add(name.empty() ? request.client_name : name);
++        } catch (const std::exception &e) {
++          BOOST_LOG(error) << "WebRTC: TV pairing could not be saved: "sv << e.what();
++          send(connection, protocol::make_error("request-pairing", "pairing-failed", "Sunshine could not save this TV"));
++          return false;
++        }
++        BOOST_LOG(info) << "WebRTC: TV paired: "sv << client.name;
++        send(connection, protocol::make_paired(client.id, client.secret));
++        promote(connection, client);
++        return true;
++      }
++
++      /**
++       * @brief Decline a TV's pairing request.
++       * @param id Pairing request ID.
++       * @return True when it was declined, or nothing when no TV made that request.
++       */
++      std::optional<bool> cancel_pairing(std::string_view id) {
++        const auto connection = find_pairing(id);
++        if (!connection) {
++          return std::nullopt;
++        }
++        {
++          std::lock_guard lock(connection->mutex);
++          if (!connection->pairing || connection->pairing->id != id) {
++            return std::nullopt;
++          }
++          connection->pairing.reset();
++        }
++        send(connection, protocol::make_error("request-pairing", "pairing-cancelled", "Pairing was cancelled in Sunshine"));
++        return true;
 +      }
 +
 +      /**
@@ -3199,10 +3197,6 @@ index 00000000..28d75941
 +       */
 +      std::size_t forget_tvs() {
 +        const auto removed = _tv_clients.remove_all();
-+        {
-+          std::lock_guard lock(_pairing_mutex);
-+          _pairing.close();
-+        }
 +        std::vector<std::shared_ptr<connection_t>> connections;
 +        {
 +          std::lock_guard lock(_connections_mutex);
@@ -3327,11 +3321,11 @@ index 00000000..28d75941
 +            }
 +            return;
 +          }
-+          if (const auto *request = std::get_if<protocol::pair_client_t>(&message.payload)) {
++          if (const auto *request = std::get_if<protocol::request_pairing_t>(&message.payload)) {
 +            if (authenticated) {
 +              send(connection, protocol::make_error(message.type, "already-authenticated", "This TV is already paired"));
 +            } else {
-+              pair(connection, *request);
++              request_pairing(connection, *request);
 +            }
 +            return;
 +          }
@@ -3389,43 +3383,63 @@ index 00000000..28d75941
 +      }
 +
 +      /**
-+       * @brief Pair a TV with the PIN shown on the PC.
++       * @brief Record a TV's pairing request, replacing its earlier one, until the Web UI answers it.
 +       * @param connection Connection.
 +       * @param request Pairing request.
 +       */
-+      void pair(const std::shared_ptr<connection_t> &connection, const protocol::pair_client_t &request) {
-+        tv_auth::pairing_attempt_e outcome;
-+        {
-+          std::lock_guard lock(_pairing_mutex);
-+          outcome = _pairing.attempt(request.pin, tv_auth::tv_pairing_window_t::clock::now());
-+        }
-+        switch (outcome) {
-+          case tv_auth::pairing_attempt_e::not_open:
-+            send(connection, protocol::make_error("pair-client", "pairing-not-open", "Open Sunshine's Web UI on the PC, choose Pair TV, then enter the PIN it shows"));
-+            return;
-+          case tv_auth::pairing_attempt_e::incorrect_pin:
-+            BOOST_LOG(warning) << "WebRTC: TV pairing, incorrect PIN"sv;
-+            send(connection, protocol::make_error("pair-client", "incorrect-pin", "Incorrect PIN. Check the PIN shown on the PC"));
-+            return;
-+          case tv_auth::pairing_attempt_e::too_many_attempts:
-+            BOOST_LOG(warning) << "WebRTC: TV pairing closed after too many incorrect PINs"sv;
-+            send(connection, protocol::make_error("pair-client", "too-many-attempts", "Too many incorrect PINs. Start pairing again on the PC"));
-+            return;
-+          case tv_auth::pairing_attempt_e::accepted:
-+            break;
-+        }
-+
-+        tv_auth::tv_client_t client;
-+        try {
-+          client = _tv_clients.add(request.client_name);
-+        } catch (const std::exception &e) {
-+          BOOST_LOG(error) << "WebRTC: TV pairing could not be saved: "sv << e.what();
-+          send(connection, protocol::make_error("pair-client", "pairing-failed", "Sunshine could not save this TV"));
++      void request_pairing(const std::shared_ptr<connection_t> &connection, const protocol::request_pairing_t &request) {
++        auto pairing = tv_auth::make_pairing_request(request.pin, request.client_name, peer_host(connection->socket->remoteAddress().value_or("unknown"s)), tv_auth::pairing_request_t::clock::now());
++        if (!pairing) {
++          send(connection, protocol::make_error("request-pairing", "invalid-message", "pin must have four digits"));
 +          return;
 +        }
-+        BOOST_LOG(info) << "WebRTC: TV paired: "sv << client.name;
-+        send(connection, protocol::make_paired(client.id, client.secret));
-+        promote(connection, client);
++        BOOST_LOG(info) << "WebRTC: "sv << pairing->client_name << " at "sv << pairing->address << " asks to pair; enter its PIN in the Web UI"sv;
++        std::lock_guard lock(connection->mutex);
++        connection->pairing = std::move(pairing);
++      }
++
++      /**
++       * @brief Snapshot the connections that have not authenticated.
++       * @return The connections.
++       */
++      std::vector<std::shared_ptr<connection_t>> pending_connections() {
++        std::lock_guard lock(_connections_mutex);
++        return _pending;
++      }
++
++      /**
++       * @brief Find the connection that made a pairing request.
++       * @param id Pairing request ID.
++       * @return The connection, or null.
++       */
++      std::shared_ptr<connection_t> find_pairing(std::string_view id) {
++        for (const auto &connection : pending_connections()) {
++          std::lock_guard lock(connection->mutex);
++          if (connection->pairing && tv_auth::constant_time_equals(connection->pairing->id, id)) {
++            return connection;
++          }
++        }
++        return nullptr;
++      }
++
++      /**
++       * @brief End lapsed pairing requests, telling each TV so it can show a new PIN.
++       */
++      void expire_pairings() {
++        const auto now = tv_auth::pairing_request_t::clock::now();
++        for (const auto &connection : pending_connections()) {
++          bool expired = false;
++          {
++            std::lock_guard lock(connection->mutex);
++            if (connection->pairing && now >= connection->pairing->expires_at) {
++              connection->pairing.reset();
++              expired = true;
++            }
++          }
++          if (expired) {
++            send(connection, protocol::make_error("request-pairing", "pairing-expired", "The PIN expired before it was entered in Sunshine"));
++          }
++        }
 +      }
 +
 +      /**
@@ -4349,8 +4363,6 @@ index 00000000..28d75941
 +      }
 +
 +      tv_auth::tv_client_store_t _tv_clients;  ///< Paired TVs.
-+      std::mutex _pairing_mutex;  ///< Protects @ref _pairing.
-+      tv_auth::tv_pairing_window_t _pairing;  ///< TV pairing window.
 +      std::mutex _connections_mutex;  ///< Protects the connections and codec state.
 +      std::vector<std::shared_ptr<connection_t>> _pending;  ///< Connections not authenticated yet.
 +      std::shared_ptr<connection_t> _active;  ///< The authenticated TV.
@@ -4403,21 +4415,19 @@ index 00000000..28d75941
 +    return active_streams.load();
 +  }
 +
-+  pairing_t open_tv_pairing() {
++  std::vector<pending_tv_pairing_t> pending_tv_pairings() {
 +    std::lock_guard lock(server_mutex);
-+    if (!running_server) {
-+      return {false, {}, "The TV server is not running"};
-+    }
-+    try {
-+      return {true, running_server->open_pairing(), "Enter this PIN on the TV within two minutes"};
-+    } catch (const std::exception &) {
-+      return {false, {}, "TV pairing could not be started"};
-+    }
++    return running_server ? running_server->pending_pairings() : std::vector<pending_tv_pairing_t> {};
 +  }
 +
-+  std::string tv_pairing_status() {
++  std::optional<bool> approve_tv_pairing(std::string_view pairing_id, std::string_view pin, std::string_view name) {
 +    std::lock_guard lock(server_mutex);
-+    return running_server ? running_server->pairing_status() : "tv-pairing-idle"s;
++    return running_server ? running_server->approve_pairing(pairing_id, pin, name) : std::nullopt;
++  }
++
++  std::optional<bool> cancel_tv_pairing(std::string_view pairing_id) {
++    std::lock_guard lock(server_mutex);
++    return running_server ? running_server->cancel_pairing(pairing_id) : std::nullopt;
 +  }
 +
 +  std::vector<paired_tv_t> paired_tvs() {
@@ -4435,10 +4445,10 @@ index 00000000..28d75941
 +}  // namespace webrtc_stream
 diff --git a/src/webrtc/webrtc_stream.h b/src/webrtc/webrtc_stream.h
 new file mode 100644
-index 00000000..ee1930cb
+index 00000000..16658081
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,80 @@
 +/**
 + * @file src/webrtc/webrtc_stream.h
 + * @brief Declarations for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -4453,6 +4463,7 @@ index 00000000..ee1930cb
 +#include <cstddef>
 +#include <optional>
 +#include <string>
++#include <string_view>
 +#include <vector>
 +
 +namespace webrtc_stream {
@@ -4465,12 +4476,12 @@ index 00000000..ee1930cb
 +  };
 +
 +  /**
-+   * @brief Outcome of opening a TV pairing window.
++   * @brief A TV showing a PIN and waiting for it to be entered in the Web UI.
 +   */
-+  struct pairing_t {
-+    bool ok;  ///< Whether a window was opened.
-+    std::string pin;  ///< PIN to show; empty on failure.
-+    std::string message;  ///< User-safe status.
++  struct pending_tv_pairing_t {
++    std::string id;  ///< Pairing request ID, 32 hex digits like a Moonlight request's.
++    std::string name;  ///< Name sent by the TV.
++    std::string address;  ///< TV address.
 +  };
 +
 +  /**
@@ -4485,16 +4496,26 @@ index 00000000..ee1930cb
 +  int session_count();
 +
 +  /**
-+   * @brief Open a two-minute window in which one TV may pair.
-+   * @return The PIN to show, which is never logged.
++   * @brief List the TVs waiting to pair, for the Web UI's PIN page.
++   * @return Pending TV pairing requests.
 +   */
-+  pairing_t open_tv_pairing();
++  std::vector<pending_tv_pairing_t> pending_tv_pairings();
 +
 +  /**
-+   * @brief Report the state of the TV pairing window.
-+   * @return One of "tv-pairing-idle", "tv-pairing-waiting", "tv-paired", "tv-pairing-expired" or "tv-pairing-locked".
++   * @brief Pair the TV that made a request if the PIN matches the one it shows.
++   * @param pairing_id Pairing request ID.
++   * @param pin PIN entered in the Web UI.
++   * @param name Name to store; the TV's own name when empty.
++   * @return Whether the TV paired, or nothing when no TV made that request.
 +   */
-+  std::string tv_pairing_status();
++  std::optional<bool> approve_tv_pairing(std::string_view pairing_id, std::string_view pin, std::string_view name);
++
++  /**
++   * @brief Decline a TV's pairing request.
++   * @param pairing_id Pairing request ID.
++   * @return True when it was declined, or nothing when no TV made that request.
++   */
++  std::optional<bool> cancel_tv_pairing(std::string_view pairing_id);
 +
 +  /**
 +   * @brief List paired TVs.
