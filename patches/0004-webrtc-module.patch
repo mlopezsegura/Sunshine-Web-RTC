@@ -2180,10 +2180,10 @@ index 00000000..6820164e
 +}  // namespace webrtc_stream::sdp
 diff --git a/src/webrtc/tv_auth.cpp b/src/webrtc/tv_auth.cpp
 new file mode 100644
-index 00000000..4464d684
+index 00000000..5e112c87
 --- /dev/null
 +++ b/src/webrtc/tv_auth.cpp
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,308 @@
 +/**
 + * @file src/webrtc/tv_auth.cpp
 + * @brief Definitions for pairing and authenticating Moonlight WebRTC TVs.
@@ -2345,7 +2345,7 @@ index 00000000..4464d684
 +        return;
 +      }
 +      for (const auto &entry : value.at("clients")) {
-+        tv_client_t client {entry.value("id", ""), entry.value("name", ""), entry.value("secret", "")};
++        tv_client_t client {entry.value("id", ""), entry.value("name", ""), entry.value("secret", ""), entry.value("enabled", true)};
 +        if (is_hex(client.id, CLIENT_ID_BYTES) && is_hex(client.secret, CLIENT_SECRET_BYTES)) {
 +          client.name = sanitize_client_name(client.name);
 +          _clients.push_back(std::move(client));
@@ -2360,7 +2360,7 @@ index 00000000..4464d684
 +  void tv_client_store_t::save() const {
 +    json clients = json::array();
 +    for (const auto &client : _clients) {
-+      clients.push_back({{"id", client.id}, {"name", client.name}, {"secret", client.secret}});
++      clients.push_back({{"id", client.id}, {"name", client.name}, {"secret", client.secret}, {"enabled", client.enabled}});
 +    }
 +    const std::string contents = json {{"version", STORE_VERSION}, {"clients", std::move(clients)}}.dump(2);
 +
@@ -2407,6 +2407,44 @@ index 00000000..4464d684
 +    return client;
 +  }
 +
++  bool tv_client_store_t::remove(std::string_view id) {
++    std::lock_guard lock(_mutex);
++    auto updated = _clients;
++    if (std::erase_if(updated, [id](const tv_client_t &client) {
++          return client.id == id;
++        }) == 0) {
++      return false;
++    }
++    std::swap(_clients, updated);
++    try {
++      save();
++    } catch (...) {
++      std::swap(_clients, updated);
++      throw;
++    }
++    return true;
++  }
++
++  bool tv_client_store_t::set_enabled(std::string_view id, bool enabled) {
++    std::lock_guard lock(_mutex);
++    auto updated = _clients;
++    const auto found = std::ranges::find_if(updated, [id](const tv_client_t &client) {
++      return client.id == id;
++    });
++    if (found == updated.end()) {
++      return false;
++    }
++    found->enabled = enabled;
++    std::swap(_clients, updated);
++    try {
++      save();
++    } catch (...) {
++      std::swap(_clients, updated);
++      throw;
++    }
++    return true;
++  }
++
 +  std::size_t tv_client_store_t::remove_all() {
 +    std::lock_guard lock(_mutex);
 +    auto removed = std::move(_clients);
@@ -2424,7 +2462,7 @@ index 00000000..4464d684
 +    std::lock_guard lock(_mutex);
 +    std::vector<tv_client_t> clients;
 +    for (const auto &client : _clients) {
-+      clients.push_back({client.id, client.name, {}});
++      clients.push_back({client.id, client.name, {}, client.enabled});
 +    }
 +    return clients;
 +  }
@@ -2456,10 +2494,10 @@ index 00000000..4464d684
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/tv_auth.h b/src/webrtc/tv_auth.h
 new file mode 100644
-index 00000000..6b69318f
+index 00000000..406ed408
 --- /dev/null
 +++ b/src/webrtc/tv_auth.h
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,207 @@
 +/**
 + * @file src/webrtc/tv_auth.h
 + * @brief Declarations for pairing and authenticating Moonlight WebRTC TVs.
@@ -2535,6 +2573,7 @@ index 00000000..6b69318f
 +    std::string id;  ///< Client ID.
 +    std::string name;  ///< Display name.
 +    std::string secret;  ///< Shared secret.
++    bool enabled = true;  ///< Whether the TV may connect; a disabled TV stays paired.
 +  };
 +
 +  /**
@@ -2566,10 +2605,25 @@ index 00000000..6b69318f
 +    tv_client_t add(std::string_view name);
 +
 +    /**
++     * @brief Forget one paired TV and persist the store.
++     * @param id Client ID.
++     * @return True when the TV was paired.
++     */
++    bool remove(std::string_view id);
++
++    /**
 +     * @brief Forget every paired TV and persist the store.
 +     * @return Number of TVs removed.
 +     */
 +    std::size_t remove_all();
++
++    /**
++     * @brief Allow or refuse a paired TV and persist the store.
++     * @param id Client ID.
++     * @param enabled Whether the TV may connect.
++     * @return True when the TV is paired.
++     */
++    bool set_enabled(std::string_view id, bool enabled);
 +
 +    /**
 +     * @brief List paired TVs without their secrets.
@@ -2653,10 +2707,10 @@ index 00000000..6b69318f
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/webrtc_stream.cpp b/src/webrtc/webrtc_stream.cpp
 new file mode 100644
-index 00000000..173f79d0
+index 00000000..3b07cbaf
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.cpp
-@@ -0,0 +1,1786 @@
+@@ -0,0 +1,1879 @@
 +/**
 + * @file src/webrtc/webrtc_stream.cpp
 + * @brief Definitions for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -3186,7 +3240,7 @@ index 00000000..173f79d0
 +      std::vector<paired_tv_t> paired() const {
 +        std::vector<paired_tv_t> result;
 +        for (const auto &client : _tv_clients.list()) {
-+          result.push_back({client.id, client.name});
++          result.push_back({client.id, client.name, client.enabled});
 +        }
 +        return result;
 +      }
@@ -3210,6 +3264,36 @@ index 00000000..173f79d0
 +        }
 +        BOOST_LOG(info) << "WebRTC: removed "sv << removed << " paired TV(s)"sv;
 +        return removed;
++      }
++
++      /**
++       * @brief Forget one TV, cutting it off if it is connected.
++       * @param id Client ID.
++       * @return True when the TV was paired.
++       */
++      bool forget_tv(std::string_view id) {
++        if (!_tv_clients.remove(id)) {
++          return false;
++        }
++        disconnect_client(id);
++        BOOST_LOG(info) << "WebRTC: removed a paired TV"sv;
++        return true;
++      }
++
++      /**
++       * @brief Allow or refuse a paired TV, cutting it off when it is refused.
++       * @param id Client ID.
++       * @param enabled Whether the TV may connect.
++       * @return True when the TV is paired.
++       */
++      bool enable_tv(std::string_view id, bool enabled) {
++        if (!_tv_clients.set_enabled(id, enabled)) {
++          return false;
++        }
++        if (!enabled) {
++          disconnect_client(id);
++        }
++        return true;
 +      }
 +
 +    private:
@@ -3377,6 +3461,12 @@ index 00000000..173f79d0
 +          send(connection, protocol::make_error("authenticate", "authentication-failed", "This TV is not paired with Sunshine"));
 +          return;
 +        }
++        // Like a disabled Moonlight client, a disabled TV keeps its pairing but is refused.
++        if (!client->enabled) {
++          BOOST_LOG(info) << "WebRTC: refused disabled TV: "sv << client->name;
++          send(connection, protocol::make_error("authenticate", "client-disabled", "This TV is disabled in Sunshine"));
++          return;
++        }
 +        BOOST_LOG(info) << "WebRTC: TV authenticated: "sv << client->name;
 +        send(connection, protocol::make_authenticated());
 +        promote(connection, *client);
@@ -3396,6 +3486,28 @@ index 00000000..173f79d0
 +        BOOST_LOG(info) << "WebRTC: "sv << pairing->client_name << " at "sv << pairing->address << " asks to pair; enter its PIN in the Web UI"sv;
 +        std::lock_guard lock(connection->mutex);
 +        connection->pairing = std::move(pairing);
++      }
++
++      /**
++       * @brief Close the connection of an authenticated TV, ending its stream.
++       * @param id Client ID.
++       */
++      void disconnect_client(std::string_view id) {
++        std::shared_ptr<connection_t> active;
++        {
++          std::lock_guard lock(_connections_mutex);
++          active = _active;
++        }
++        if (!active) {
++          return;
++        }
++        {
++          std::lock_guard lock(active->mutex);
++          if (active->client_id != id) {
++            return;
++          }
++        }
++        active->socket->close();
 +      }
 +
 +      /**
@@ -3466,6 +3578,9 @@ index 00000000..173f79d0
 +          connection->client_name = client.name;
 +        }
 +        if (previous) {
++          // Its close callback holds only a weak reference, which is gone once this function
++          // releases it, so the replaced TV's stream is stopped here rather than on close.
++          stop_stream(previous, false);
 +          previous->socket->close();
 +        }
 +        send(connection, protocol::make_gateway_status(status(connection)));
@@ -3847,6 +3962,12 @@ index 00000000..173f79d0
 +
 +        stream->control_thread = std::jthread([this, weak_connection, stream] {
 +          run_stream(weak_connection, stream);
++          // Releasing the last reference here would make the stream's destructor join this very
++          // thread, which terminates Sunshine. The starter's reference outlives the assignment of
++          // control_thread, so when only this one is left nothing else can join it, and it detaches.
++          if (stream.use_count() == 1 && stream->control_thread.joinable()) {
++            stream->control_thread.detach();
++          }
 +        });
 +
 +        stream->peer->setLocalDescription();
@@ -4435,6 +4556,32 @@ index 00000000..173f79d0
 +    return running_server ? running_server->paired() : std::vector<paired_tv_t> {};
 +  }
 +
++  std::optional<bool> unpair_tv(std::string_view id) {
++    std::lock_guard lock(server_mutex);
++    if (!running_server) {
++      return std::nullopt;
++    }
++    try {
++      return running_server->forget_tv(id);
++    } catch (const std::exception &e) {
++      BOOST_LOG(warning) << "WebRTC: paired TV could not be removed: "sv << e.what();
++      return false;
++    }
++  }
++
++  std::optional<bool> set_tv_enabled(std::string_view id, bool enabled) {
++    std::lock_guard lock(server_mutex);
++    if (!running_server) {
++      return std::nullopt;
++    }
++    try {
++      return running_server->enable_tv(id, enabled);
++    } catch (const std::exception &e) {
++      BOOST_LOG(warning) << "WebRTC: paired TV could not be updated: "sv << e.what();
++      return false;
++    }
++  }
++
 +  std::optional<std::size_t> unpair_all_tvs() {
 +    std::lock_guard lock(server_mutex);
 +    if (!running_server) {
@@ -4445,10 +4592,10 @@ index 00000000..173f79d0
 +}  // namespace webrtc_stream
 diff --git a/src/webrtc/webrtc_stream.h b/src/webrtc/webrtc_stream.h
 new file mode 100644
-index 00000000..16658081
+index 00000000..0fc1795e
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,96 @@
 +/**
 + * @file src/webrtc/webrtc_stream.h
 + * @brief Declarations for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -4473,6 +4620,7 @@ index 00000000..16658081
 +  struct paired_tv_t {
 +    std::string id;  ///< Client ID.
 +    std::string name;  ///< Display name.
++    bool enabled = true;  ///< Whether the TV may connect.
 +  };
 +
 +  /**
@@ -4522,6 +4670,21 @@ index 00000000..16658081
 +   * @return Paired TVs.
 +   */
 +  std::vector<paired_tv_t> paired_tvs();
++
++  /**
++   * @brief Forget one paired TV, disconnecting it if it is connected.
++   * @param id Client ID.
++   * @return True when the TV was paired, or nothing when the server is not running.
++   */
++  std::optional<bool> unpair_tv(std::string_view id);
++
++  /**
++   * @brief Allow or refuse a paired TV, disconnecting it when it is refused.
++   * @param id Client ID.
++   * @param enabled Whether the TV may connect.
++   * @return True when the TV is paired, or nothing when the server is not running.
++   */
++  std::optional<bool> set_tv_enabled(std::string_view id, bool enabled);
 +
 +  /**
 +   * @brief Forget every paired TV and disconnect any connected TV.

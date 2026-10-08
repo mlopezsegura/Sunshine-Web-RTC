@@ -13,20 +13,6 @@ index 2f65f3f9..8bad65ba 100644
  <div align="center">
    <!-- Keep whitespace outside the badge links to avoid an underlined gap. -->
    <!-- Use raw HTML aliases to keep Doxygen's emitted comment delimiters balanced. -->
-diff --git a/docs/api.md b/docs/api.md
-index 9ba23241..b9b37860 100644
---- a/docs/api.md
-+++ b/docs/api.md
-@@ -99,3 +99,9 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
- 
- ## GET /api/virtual-input/status
- @copydoc confighttp::getVirtualInputStatus()
-+
-+## GET /api/webrtc/tvs
-+@copydoc confighttp::getWebrtcTvs()
-+
-+## POST /api/webrtc/unpair-all
-+@copydoc confighttp::unpairAllWebrtcTvs()
 diff --git a/docs/configuration.md b/docs/configuration.md
 index fb6ce69c..7fc37da9 100644
 --- a/docs/configuration.md
@@ -94,10 +80,10 @@ index fb6ce69c..7fc37da9 100644
  ### file_apps
 diff --git a/docs/moonlight_webrtc_tizen.md b/docs/moonlight_webrtc_tizen.md
 new file mode 100644
-index 00000000..db51d128
+index 00000000..78cc992f
 --- /dev/null
 +++ b/docs/moonlight_webrtc_tizen.md
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,106 @@
 +﻿# Moonlight WebRTC for Samsung Tizen
 +
 +This fork of Sunshine streams directly to the
@@ -172,7 +158,9 @@ index 00000000..db51d128
 +  it. A stream that asked for HDR ends with an error instead of silently sending SDR.
 +- **Controllers** are announced to Sunshine as Moonlight controllers, so Sunshine's controller emulation
 +  and rumble work as with any Moonlight client. Holding Start toggles mouse emulation.
-+- **Paired TVs** are stored in `webrtc_tv_clients.json` in Sunshine's configuration directory.
++- **Paired TVs** appear in the client list under **Troubleshooting**, like Moonlight clients: a TV can be
++  disabled there, which keeps it paired but refuses it until it is enabled again, or unpaired. They are
++  stored in `webrtc_tv_clients.json` in Sunshine's configuration directory.
 +
 +## Web UI API
 +
@@ -181,8 +169,10 @@ index 00000000..db51d128
 +| `GET /api/pin`                 | Lists TVs waiting to pair beside Moonlight clients. |
 +| `POST /api/pin`                | Pairs the selected TV when the PIN matches its own. |
 +| `DELETE /api/pin`              | Declines the selected TV's pairing request.         |
-+| `GET /api/webrtc/tvs`          | Paired TVs.                                         |
-+| `POST /api/webrtc/unpair-all`  | Forgets every TV and disconnects the connected one. |
++| `GET /api/clients/list`        | Lists paired TVs beside Moonlight clients.          |
++| `POST /api/clients/update`     | Enables or disables a TV; disabling disconnects it. |
++| `POST /api/clients/unpair`     | Forgets one TV and disconnects it.                  |
++| `POST /api/clients/unpair-all` | Forgets every client, TVs included.                 |
 +
 +## Implementation
 +

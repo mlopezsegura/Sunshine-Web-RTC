@@ -1,57 +1,13 @@
 diff --git a/src_assets/common/assets/web/Pin.vue b/src_assets/common/assets/web/Pin.vue
-index 95330fa4..e5c35e07 100644
+index 95330fa4..38564ab2 100644
 --- a/src_assets/common/assets/web/Pin.vue
 +++ b/src_assets/common/assets/web/Pin.vue
-@@ -51,6 +51,25 @@
-       </div>
-       <div v-if="status" :class="`alert alert-${status.type}`" role="alert">{{ status.message }}</div>
-     </form>
-+
-+    <h2 class="my-4 text-center">{{ $t('pin.tv_pairing') }}</h2>
-+    <div class="d-flex flex-column align-items-center">
-+      <div class="card flex-column d-flex p-4 mb-4">
-+        <p class="mb-3">{{ $t('pin.tv_pairing_desc') }}</p>
-+        <ul class="list-group mb-3">
-+          <li v-if="!pairedTvs.length" class="list-group-item">{{ $t('pin.tv_none') }}</li>
-+          <li v-for="tv in pairedTvs" :key="tv.id" class="list-group-item">
-+            <tv :size="18" class="icon"></tv>
-+            {{ tv.name }}
-+          </li>
-+        </ul>
-+        <button type="button" class="btn btn-outline-danger" :disabled="!pairedTvs.length" @click="unpairTvs">
-+          <x :size="18" class="icon"></x>
-+          {{ $t('pin.tv_unpair_all') }}
-+        </button>
-+      </div>
-+      <div v-if="tvStatus" :class="`alert alert-${tvStatus.type}`" role="alert">{{ tvStatus.message }}</div>
-+    </div>
-   </div>
- </template>
- 
-@@ -61,6 +80,7 @@
-     Forward,
-     Hash,
-     Monitor,
-+    Tv,
-     UserRoundSearch,
-     X,
-   } from '@lucide/vue'
-@@ -71,6 +91,7 @@
-       Forward,
-       Hash,
-       Monitor,
-+      Tv,
-       UserRoundSearch,
-       X,
-     },
-@@ -82,12 +103,30 @@
+@@ -82,9 +82,21 @@
          pin: '',
          refreshTimer: null,
          selectedPairingId: '',
 +        suggestedName: '',
          status: null,
-+        pairedTvs: [],
-+        tvStatus: null,
        };
      },
 +    watch: {
@@ -67,58 +23,15 @@ index 95330fa4..e5c35e07 100644
 +    },
      mounted() {
        this.loadPendingPairings();
--      this.refreshTimer = window.setInterval(() => this.loadPendingPairings(), 2000);
-+      this.loadTvs();
-+      this.refreshTimer = window.setInterval(() => {
-+        this.loadPendingPairings();
-+        this.loadTvs();
-+      }, 2000);
-     },
-     beforeUnmount() {
-       window.clearInterval(this.refreshTimer);
-@@ -141,12 +180,42 @@
+       this.refreshTimer = window.setInterval(() => this.loadPendingPairings(), 2000);
+@@ -141,6 +153,7 @@
            this.status = {type: 'success', message: this.i18n.t('pin.pair_success')};
            this.pin = '';
            this.name = '';
 +          this.suggestedName = '';
-+          await this.loadTvs();
          } else {
            this.status = {type: 'danger', message: this.i18n.t('pin.pair_failure')};
          }
-         await this.loadPendingPairings();
-       },
- 
-+      /**
-+       * Refresh the paired Moonlight WebRTC TVs.
-+       */
-+      async loadTvs() {
-+        try {
-+          const response = await apiFetch('./api/webrtc/tvs', {method: 'GET'});
-+          if (!response.ok) {
-+            throw new Error(`HTTP ${response.status}`);
-+          }
-+          const body = await response.json();
-+          this.pairedTvs = body.tvs || [];
-+        } catch (error) {
-+          console.error('Failed to load Moonlight WebRTC TVs', error);
-+        }
-+      },
-+
-+      /**
-+       * Forget every paired TV; a connected TV is disconnected at once.
-+       */
-+      async unpairTvs() {
-+        const response = await apiFetch('./api/webrtc/unpair-all', {method: 'POST'});
-+        const result = await response.json();
-+        this.tvStatus = result.status === true
-+          ? {type: 'success', message: this.i18n.t('pin.tv_unpair_success')}
-+          : {type: 'danger', message: this.i18n.t('pin.tv_unpair_failure')};
-+        await this.loadTvs();
-+      },
-+
-       /**
-        * Cancel the selected pending request without affecting other clients.
-        */
 diff --git a/src_assets/common/assets/web/configs/config_tabs.json b/src_assets/common/assets/web/configs/config_tabs.json
 index c477936c..924c54ab 100644
 --- a/src_assets/common/assets/web/configs/config_tabs.json
@@ -160,7 +73,7 @@ index 9988dcc7..77ec2816 100644
    </div>
  </template>
 diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
-index 030f733c..6cca08e9 100644
+index 030f733c..801a8bf8 100644
 --- a/src_assets/common/assets/web/public/assets/locale/en.json
 +++ b/src_assets/common/assets/web/public/assets/locale/en.json
 @@ -433,6 +433,10 @@
@@ -174,16 +87,3 @@ index 030f733c..6cca08e9 100644
      "vaapi_blbrc": "Block level based bitrate control (BLBRC)",
      "vaapi_blbrc_desc": "Enable block level rate control, which assigns different bitrate block by block. Can be combined with CBR/VBR-type rate control methods on supported encoders.",
      "vaapi_quality": "VA-API Quality",
-@@ -583,6 +587,12 @@
-     "select_pairing": "Select the device requesting approval",
-     "select_pairing_required": "Select the device you intend to pair",
-     "send": "Send",
-+    "tv_none": "No TVs are paired",
-+    "tv_pairing": "Moonlight WebRTC TVs",
-+    "tv_pairing_desc": "Samsung TVs running the Moonlight WebRTC app stream directly from Sunshine. To pair one, select it above and enter the PIN the TV shows.",
-+    "tv_unpair_all": "Forget All TVs",
-+    "tv_unpair_failure": "Paired TVs could not be removed",
-+    "tv_unpair_success": "Every TV was removed",
-     "unknown_address": "Unknown address",
-     "unknown_device": "Unknown device",
-     "warning_msg": "Make sure you have access to the client you are pairing with. This software can give total control to your computer, so be careful!"
