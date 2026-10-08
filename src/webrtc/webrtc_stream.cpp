@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -350,6 +351,97 @@ namespace webrtc_stream {
     };
 
     /**
+     * @brief Check that a peer is on the local network.
+     * @param address Peer address.
+     * @return True for loopback, private, link-local and unique local addresses.
+     */
+    bool is_local_peer(const boost::asio::ip::address &address) {
+      if (address.is_v6()) {
+        const auto v6 = address.to_v6();
+        if (v6.is_v4_mapped()) {
+          return is_local_peer(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6));
+        }
+        return v6.is_loopback() || v6.is_link_local() || (v6.to_bytes()[0] & 0xFE) == 0xFC;
+      }
+      const auto bytes = address.to_v4().to_bytes();
+      return bytes[0] == 127 || bytes[0] == 10 || (bytes[0] == 172 && (bytes[1] & 0xF0) == 16) ||
+             (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 169 && bytes[1] == 254);
+    }
+
+    /**
+     * @brief Answers TVs looking for Sunshine on the local network.
+     *
+     * A TV broadcasts `{"version":2,"type":"discover"}` to UDP @ref protocol::DISCOVERY_PORT and
+     * learns this PC's address from the reply's source, plus its name, signaling port and
+     * Wake-on-LAN address. Only local peers are answered, with a reply about as small as the request.
+     */
+    class discovery_responder_t {
+    public:
+      explicit discovery_responder_t(std::uint16_t port):
+          _socket(_io) {
+        boost::system::error_code error;
+        _socket.open(boost::asio::ip::udp::v4(), error);
+        if (!error) {
+          _socket.bind({boost::asio::ip::address_v4::any(), port}, error);
+        }
+        if (error) {
+          BOOST_LOG(warning) << "WebRTC: TV discovery unavailable on UDP port "sv << port << ": "sv << error.message();
+          return;
+        }
+        receive();
+        _thread = std::jthread([this] {
+          _io.run();
+        });
+        BOOST_LOG(info) << "WebRTC: answering TV discovery on UDP port "sv << port;
+      }
+
+      ~discovery_responder_t() {
+        _io.stop();
+      }
+
+      discovery_responder_t(const discovery_responder_t &) = delete;
+      discovery_responder_t &operator=(const discovery_responder_t &) = delete;
+
+    private:
+      void receive() {
+        _socket.async_receive_from(boost::asio::buffer(_buffer), _sender, [this](const boost::system::error_code &error, std::size_t size) {
+          if (error == boost::asio::error::operation_aborted) {
+            return;
+          }
+          // Windows reports an ICMP port-unreachable for an earlier reply as connection_reset.
+          if (error && error != boost::asio::error::connection_reset) {
+            BOOST_LOG(warning) << "WebRTC: TV discovery stopped: "sv << error.message();
+            return;
+          }
+          if (!error) {
+            answer(std::string_view(_buffer.data(), size));
+          }
+          receive();
+        });
+      }
+
+      void answer(std::string_view datagram) {
+        const auto address = _sender.address();
+        if (!is_local_peer(address) || !protocol::is_discovery_request(datagram)) {
+          return;
+        }
+        const auto mac = wake_on_lan_address(address.to_string() + ":0");
+        const auto reply = protocol::make_discovery_response(config::nvhttp.sunshine_name, config::webrtc.port, mac).dump();
+        boost::system::error_code error;
+        _socket.send_to(boost::asio::buffer(reply), _sender, 0, error);
+        if (error) {
+          BOOST_LOG(debug) << "WebRTC: discovery reply not sent: "sv << error.message();
+        }
+      }
+
+      boost::asio::io_context _io;  ///< Runs the socket.
+      boost::asio::ip::udp::socket _socket;  ///< Discovery socket.
+      boost::asio::ip::udp::endpoint _sender;  ///< Sender of the datagram being received.
+      std::array<char, 512> _buffer {};  ///< Received datagram.
+      std::jthread _thread;  ///< Runs @ref _io; joined after it stops.
+    };
+
+    /**
      * @brief One TV WebSocket connection.
      */
     struct connection_t {
@@ -384,6 +476,7 @@ namespace webrtc_stream {
           accept(std::move(socket));
         });
         _codecs = current_codec_support();
+        _discovery = std::make_unique<discovery_responder_t>(protocol::DISCOVERY_PORT);
         BOOST_LOG(info) << "WebRTC: TV server listening on port "sv << config::webrtc.port << ", "sv << _tv_clients.count() << " paired TV(s)"sv;
       }
 
@@ -1779,6 +1872,7 @@ namespace webrtc_stream {
       std::unordered_map<std::string, std::optional<std::pair<std::string, std::string>>> _artwork;  ///< MIME type and Base64 by app ID.
       std::atomic<std::uint64_t> _next_session_id {1};  ///< Next session ID.
       std::unique_ptr<rtc::WebSocketServer> _server;  ///< Signaling server.
+      std::unique_ptr<discovery_responder_t> _discovery;  ///< Answers TVs looking for Sunshine.
     };
 
     std::mutex server_mutex;  ///< Protects @ref running_server.

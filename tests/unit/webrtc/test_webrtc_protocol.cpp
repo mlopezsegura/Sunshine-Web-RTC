@@ -100,6 +100,22 @@ TEST(WebrtcProtocolTest, ParsesAuthenticationAndPairing) {
   EXPECT_EQ(protocol_error_code(R"({"version":2,"type":"pair-client","pin":"0421"})"), "unsupported-pairing");
 }
 
+TEST(WebrtcProtocolTest, AnswersTvsLookingForSunshine) {
+  EXPECT_TRUE(is_discovery_request(R"({"version":2,"type":"discover"})"));
+  EXPECT_FALSE(is_discovery_request(R"({"version":1,"type":"discover"})"));
+  EXPECT_FALSE(is_discovery_request(R"({"version":2,"type":"get-apps"})"));
+  EXPECT_FALSE(is_discovery_request("discover"));
+  EXPECT_FALSE(is_discovery_request(""));
+
+  const auto reply = make_discovery_response("Living Room PC", 8001, std::string("2C:F0:5D:7B:E6:D0"));
+  EXPECT_EQ(reply.at("type"), "discovery");
+  EXPECT_EQ(reply.at("version"), 2);
+  EXPECT_EQ(reply.at("name"), "Living Room PC");
+  EXPECT_EQ(reply.at("port"), 8001);
+  EXPECT_EQ(reply.at("macAddress"), "2C:F0:5D:7B:E6:D0");
+  EXPECT_FALSE(make_discovery_response("PC", 8000, std::nullopt).contains("macAddress"));
+}
+
 TEST(WebrtcProtocolTest, AnnouncesThatTheTvShowsThePin) {
   EXPECT_EQ(make_auth_required("00", std::nullopt, true).at("pairing"), "client-pin");
 }

@@ -329,6 +329,24 @@ namespace webrtc_stream::protocol {
     return message;
   }
 
+  bool is_discovery_request(std::string_view datagram) {
+    try {
+      const auto message = json::parse(datagram);
+      return message.is_object() && message.value("version", 0) == VERSION && message.value("type", "") == "discover";
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  json make_discovery_response(std::string_view name, int port, const std::optional<std::string> &mac_address) {
+    auto message = envelope("discovery");
+    message.update({{"name", name}, {"port", port}});
+    if (mac_address) {
+      message["macAddress"] = *mac_address;
+    }
+    return message;
+  }
+
   json make_sunshine_availability(bool sunshine_available) {
     auto message = envelope("sunshine-availability");
     message["sunshineAvailable"] = sunshine_available;

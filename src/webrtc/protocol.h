@@ -297,6 +297,27 @@ namespace webrtc_stream::protocol {
   nlohmann::json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available);
 
   /**
+   * @brief UDP port on which Sunshine answers TVs looking for it, whatever `webrtc_port` is.
+   */
+  constexpr std::uint16_t DISCOVERY_PORT = 8000;
+
+  /**
+   * @brief Check whether a datagram is a TV looking for Sunshine on the local network.
+   * @param datagram Received datagram.
+   * @return True for `{"version":2,"type":"discover"}`.
+   */
+  bool is_discovery_request(std::string_view datagram);
+
+  /**
+   * @brief Build the reply that tells a TV where to connect.
+   * @param name Sunshine's name.
+   * @param port TCP port of the signaling WebSocket.
+   * @param mac_address Wake-on-LAN address facing the TV, if known.
+   * @return The message.
+   */
+  nlohmann::json make_discovery_response(std::string_view name, int port, const std::optional<std::string> &mac_address);
+
+  /**
    * @brief Build the push sent when streaming becomes possible or impossible.
    * @param sunshine_available Whether streaming is possible.
    * @return The message.
