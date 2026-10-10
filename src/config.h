@@ -265,11 +265,22 @@ namespace config {
   };
 
   /**
+   * @brief Streaming protocols Sunshine serves.
+   */
+  enum class stream_protocol_e {
+    moonlight,  ///< Moonlight (GameStream) clients only.
+    webrtc,  ///< Moonlight WebRTC TVs only.
+    both,  ///< Moonlight clients and Moonlight WebRTC TVs.
+  };
+
+  /**
    * @brief Settings of the Moonlight WebRTC TV server.
    */
   struct webrtc_t {
-    bool enabled;  ///< Whether Sunshine serves Moonlight WebRTC TVs directly.
+    stream_protocol_e protocol;  ///< Streaming protocols Sunshine serves.
     int port;  ///< TCP port of the TV signaling WebSocket.
+    int media_port_min;  ///< First UDP port WebRTC media may use, 0 for any.
+    int media_port_max;  ///< Last UDP port WebRTC media may use, 0 for any.
   };
 
   /**
@@ -410,6 +421,28 @@ namespace config {
   extern nvhttp_t nvhttp;
   extern input_t input;
   extern sunshine_t sunshine;
+
+  /**
+   * @brief Parse a `stream_protocol` value.
+   *
+   * @param protocol `moonlight`, `webrtc` or `both`.
+   * @return The protocol, or `both` with a warning for an unknown value.
+   */
+  stream_protocol_e stream_protocol_from_view(std::string_view protocol);
+
+  /**
+   * @brief Whether Sunshine serves Moonlight (GameStream) clients.
+   *
+   * @return True unless `stream_protocol` is `webrtc`.
+   */
+  bool moonlight_enabled();
+
+  /**
+   * @brief Whether Sunshine serves Moonlight WebRTC TVs.
+   *
+   * @return True unless `stream_protocol` is `moonlight`.
+   */
+  bool webrtc_enabled();
 
 #ifdef SUNSHINE_TESTS
   /**

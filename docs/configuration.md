@@ -1880,28 +1880,45 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
-### webrtc_enabled
+### stream_protocol
 
 <table>
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Stream directly to the Moonlight WebRTC app on Samsung Tizen TVs. The TV signals over a
-            WebSocket and receives the encoded video and Opus audio over WebRTC, without a separate
-            Gateway. Pair a TV from the PIN page of the Web UI.
+            Which clients Sunshine serves. The servers and ports of a protocol that is off are not
+            opened: with `webrtc` Sunshine does not publish itself over mDNS and does not listen on the
+            GameStream ports; with `moonlight` the Moonlight WebRTC TV server does not start.
+            @note{This replaces `webrtc_enabled`. A configuration file that still says
+            `webrtc_enabled = disabled` and has no `stream_protocol` serves Moonlight only.}
         </td>
     </tr>
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            enabled
+            both
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            webrtc_enabled = disabled
+            stream_protocol = webrtc
             @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>moonlight</td>
+        <td>Moonlight (GameStream) clients only.</td>
+    </tr>
+    <tr>
+        <td>webrtc</td>
+        <td>Moonlight WebRTC on Samsung Tizen TVs only. The TV signals over a WebSocket and receives the
+            encoded video and Opus audio over WebRTC, without a separate Gateway. Pair a TV from the PIN
+            page of the Web UI.</td>
+    </tr>
+    <tr>
+        <td>both</td>
+        <td>Moonlight clients and Moonlight WebRTC TVs.</td>
     </tr>
 </table>
 
@@ -1911,8 +1928,8 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Description</td>
         <td colspan="2">
-            TCP port of the WebSocket the Moonlight WebRTC TV app connects to. Media uses
-            ephemeral UDP ports negotiated by WebRTC.
+            TCP port of the WebSocket the Moonlight WebRTC TV app connects to. Media uses the UDP
+            ports set by `webrtc_media_port_min` and `webrtc_media_port_max`.
             @note{The TV app uses 8000 unless another port is entered with the PC's address.}
         </td>
     </tr>
@@ -1930,6 +1947,63 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Example</td>
         <td colspan="2">@code{}
             webrtc_port = 8000
+            @endcode</td>
+    </tr>
+</table>
+
+### webrtc_media_port_min
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            First UDP port WebRTC video and audio may use, so that a firewall only needs that range
+            open. Each TV stream uses a few ports of the range.
+            @note{When both this and `webrtc_media_port_max` are 0, WebRTC picks any port. When only
+            one of them is 0, that end of the range is open: 1024 for the first port, 65535 for the last.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-65535</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            webrtc_media_port_min = 40000
+            @endcode</td>
+    </tr>
+</table>
+
+### webrtc_media_port_max
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Last UDP port WebRTC video and audio may use. See `webrtc_media_port_min`.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-65535</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            webrtc_media_port_max = 40019
             @endcode</td>
     </tr>
 </table>

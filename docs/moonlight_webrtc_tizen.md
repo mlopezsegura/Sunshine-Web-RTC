@@ -49,16 +49,25 @@ available while Sunshine is running.
 
 ## Configuration
 
-| Option           | Default   | Description                                                   |
-|------------------|-----------|---------------------------------------------------------------|
-| `webrtc_enabled` | `enabled` | Serve Moonlight WebRTC TVs.                                   |
-| `webrtc_port`    | `8000`    | TCP port of the signaling WebSocket. Media uses ephemeral UDP. |
+| Option                  | Default | Description                                                              |
+|-------------------------|---------|--------------------------------------------------------------------------|
+| `stream_protocol`       | `both`  | `moonlight`, `webrtc` or `both`: which clients Sunshine serves.          |
+| `webrtc_port`           | `8000`  | TCP port of the signaling WebSocket.                                     |
+| `webrtc_media_port_min` | `0`     | First UDP port for WebRTC video and audio; 0 with the next one for any.  |
+| `webrtc_media_port_max` | `0`     | Last UDP port for WebRTC video and audio.                                |
+
+`stream_protocol` is the switch at the top of the **Network** tab of the configuration page; the other
+options are further down the same tab, whose port table lists the ports each enabled protocol needs.
+With `webrtc`, Sunshine neither publishes itself over mDNS nor listens on the GameStream ports, so a PC
+can serve TVs only; with `moonlight` the TV server does not start. It replaces `webrtc_enabled`: a
+configuration file that still says `webrtc_enabled = disabled` and has no `stream_protocol` serves
+Moonlight only.
 
 TV discovery always listens on UDP port 8000, whatever `webrtc_port` is, and answers only peers on the
-local network: loopback, private, link-local and unique local addresses. Sunshine's firewall rule, which
-allows its executable, already covers it.
-
-Both are on the **Network** tab of the configuration page.
+local network: loopback, private, link-local and unique local addresses. The socket is shared, so
+several Sunshine instances on one PC, each with its own `webrtc_port`, all answer a TV's broadcast.
+Sunshine's firewall rule, which allows its executable, already covers discovery; a firewall that opens
+ports instead needs TCP `webrtc_port`, UDP 8000 and the media range.
 
 ## Behaviour
 

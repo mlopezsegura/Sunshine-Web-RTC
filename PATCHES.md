@@ -11,7 +11,7 @@ how to carry it to a newer Sunshine. The user-facing guide is
 | Upstream base | `0594f62d` — *chore: update global workflows (#5868)*, tag `v2026.1006.152353` |
 | Fork branch | `master` (development on `webrtc-tizen`) |
 | WebRTC library | libdatachannel v0.24.6, built from source when no system package exists |
-| Footprint in upstream files | 18 files, +360 / −9 lines; the rest is new files |
+| Footprint in upstream files | 17 files, +441 / −14 lines; the rest is new files |
 
 ## Design in one paragraph
 
@@ -21,7 +21,9 @@ mailbox; the WebRTC stream does, so its frames go from the encoder straight to l
 packetizer and never reach the GameStream sender. Everything else, the TV protocol, pairing, sessions,
 input and the WebSocket server, lives in the new `src/webrtc/` directory and only calls Sunshine's
 existing APIs (`video::capture`, `audio::capture`, `input::alloc/passthrough`, `proc::proc`,
-`display_device`). Moonlight clients behave exactly as on upstream.
+`display_device`). Moonlight clients behave exactly as on upstream. One option, `stream_protocol`,
+chooses which of the two Sunshine serves (`moonlight`, `webrtc` or `both`); the servers of the other
+one are not started, so their ports stay closed.
 
 ## The patch set
 
@@ -64,9 +66,9 @@ global queue as before: behaviour is unchanged.
 
 | File | Change | Why |
 |---|---|---|
-| `src/config.h`, `src/config.cpp` | New `config::webrtc_t { enabled, port }`, defaults `true` / `8000`, parsed from `webrtc_enabled` and `webrtc_port` (1024–65535). | 8000 is the TV app's default port. |
-| `src/main.cpp` | Starts `webrtc_stream::start` on its own `std::jthread` next to the nvhttp, confighttp and RTSP threads. | The server returns when `mail::shutdown` is raised, so shutdown joins it like the others. |
-| `src/nvhttp.cpp` | `launch` and `resume` treat a running TV stream like a running Moonlight session (`webrtc_stream::session_count()`). | Otherwise a Moonlight launch while a TV streams would reconfigure the display and re-probe encoders under the TV. |
+| `src/config.h`, `src/config.cpp` | New `config::stream_protocol_e { moonlight, webrtc, both }` and `config::webrtc_t { protocol, port, media_port_min, media_port_max }`, defaults `both` / `8000` / `0` / `0`, parsed from `stream_protocol`, `webrtc_port` (1024–65535) and `webrtc_media_port_min/max` (0–65535); `config::moonlight_enabled()` and `config::webrtc_enabled()`. A legacy `webrtc_enabled = disabled` without `stream_protocol` still means `moonlight`. | 8000 is the TV app's default port. A media range lets a firewall that opens ports, rather than allowing the executable, admit WebRTC; several instances on one PC (OpenStreamMS) each get their own range. |
+| `src/main.cpp` | Starts `webrtc_stream::start` on its own `std::jthread` next to the nvhttp, confighttp and RTSP threads. With `stream_protocol = webrtc` it starts neither the RTSP thread nor mDNS publishing nor UPnP. | The server returns when `mail::shutdown` is raised, so shutdown joins it like the others. A TV-only host leaves every GameStream port closed and is not advertised to Moonlight. |
+| `src/nvhttp.cpp` | `launch` and `resume` treat a running TV stream like a running Moonlight session (`webrtc_stream::session_count()`). With `stream_protocol = webrtc`, `start()` loads the paired clients and certificates, then waits for shutdown without listening. | Otherwise a Moonlight launch while a TV streams would reconfigure the display and re-probe encoders under the TV. The Web UI still lists, and `unpair-all` still saves, the Moonlight clients when Moonlight is off, instead of overwriting them with an empty list. |
 | `src/confighttp.cpp` | No new endpoints: `GET`/`POST`/`DELETE /api/pin` also list, approve and decline TVs waiting to pair, and `/api/clients/list`, `update`, `unpair` and `unpair-all` also list, enable or disable, and unpair paired TVs. | TV pairing used to live in the Gateway's tray; TVs are now paired and managed exactly like Moonlight clients, in the same Web UI. |
 
 The reverse coordination is in the new module: a TV stream configures the display and probes encoders
@@ -87,7 +89,7 @@ MSYS2 does not package libdatachannel, so Windows builds always take the FetchCo
 
 | File | Contents |
 |---|---|
-| `src/webrtc/webrtc_stream.{h,cpp}` | The server: libdatachannel `WebSocketServer`, TV connections (up to 8 unauthenticated, one active), sessions, PeerConnection with send-only H.264/H.265/AV1 + Opus tracks and the `control` (reliable) and `gamepad` (unordered, no retransmits) DataChannels, application launch/resume/stop/switch through `proc::proc`, display configuration, the capture pipeline and the Web UI hooks. |
+| `src/webrtc/webrtc_stream.{h,cpp}` | The server: libdatachannel `WebSocketServer`, TV connections (up to 8 unauthenticated, one active), sessions, PeerConnection with send-only H.264/H.265/AV1 + Opus tracks and the `control` (reliable) and `gamepad` (unordered, no retransmits) DataChannels, application launch/resume/stop/switch through `proc::proc`, display configuration, the capture pipeline and the Web UI hooks. `media_port_range()` turns `webrtc_media_port_min/max` into the PeerConnection's UDP port range; the discovery socket is opened with `SO_REUSEADDR`, so every Sunshine instance on a PC answers a TV's broadcast with its own name and port. |
 | `src/webrtc/protocol.{h,cpp}` | Gateway protocol version 2, ported and extended: stream settings and supported modes (now with 30/60/90/120 fps per mode), message parsing and construction, TV-shown PIN pairing and LAN discovery messages. |
 | `src/webrtc/tv_auth.{h,cpp}` | Pairing requests (the TV shows a 4-digit PIN that the Web UI approves; one attempt, 5 minutes), paired-TV store (`webrtc_tv_clients.json` in Sunshine's config directory) and HMAC-SHA256 nonce authentication. |
 | `src/webrtc/sdp.{h,cpp}` | Samsung Game Mode `imageattr`, single-codec offers, HEVC Main10 `fmtp` and level checks. |
@@ -111,15 +113,15 @@ Stream parameters, chosen to match what the Gateway negotiated through moonlight
 | File | Change |
 |---|---|
 | `src_assets/common/assets/web/Pin.vue` | TVs waiting to pair join the existing PIN form, which now suggests the name the selected device reported. Paired TVs need no UI change: they appear in the existing client list under Troubleshooting. |
-| `configs/config_tabs.json`, `configs/tabs/Network.vue` | `webrtc_enabled` checkbox and `webrtc_port` field on the Network tab. |
-| `public/assets/locale/en.json` | Strings for both. Other languages fall back to English, as upstream requires. |
+| `configs/config_tabs.json`, `configs/tabs/Network.vue` | A Moonlight / WebRTC / Both switch (`stream_protocol`) at the top of the Network tab; the port table lists the ports each enabled protocol needs (the Web UI alone when Moonlight is off, plus WebRTC signaling, discovery and media); `webrtc_port`, `webrtc_media_port_min` and `webrtc_media_port_max` fields, disabled when WebRTC is off. |
+| `public/assets/locale/en.json` | Strings for all of them. Other languages fall back to English, as upstream requires. |
 
 ### 0006 — Tests
 
-- `tests/unit/webrtc/` — 34 GoogleTest cases: protocol parsing and capabilities, SDP checks, TV auth
+- `tests/unit/webrtc/` — 46 GoogleTest cases: protocol parsing and capabilities, SDP checks, TV auth
   (including the HMAC vector shared with the TV's JavaScript), and the input bridge, whose packets
   are validated by Sunshine's own `input::testing::is_valid_input_packet()`, plus the packet routing of
-  patch 0001.
+  patch 0001, `stream_protocol` parsing (including the legacy `webrtc_enabled`) and the media port range.
 - `tests/webrtc_e2e/` — a headless-Edge stand-in for the TV that shows a PIN, gets paired through
   `/api/pin` like a user would, authenticates, streams and measures `getStats()` against a running Sunshine.
 
@@ -128,14 +130,18 @@ The upstream config-consistency test requires every new option in `config_tabs.j
 
 ### 0007 — Documentation
 
-`README.md` gets a note pointing at the guide; `docs/configuration.md` documents both options;
+`README.md` gets a note pointing at the guide; `docs/configuration.md` documents the four options;
 `docs/api.md` is untouched, since TVs use the existing endpoints; `docs/moonlight_webrtc_tizen.md` is the guide.
 
 ## Verification of this revision
 
 - Builds with MSYS2 UCRT64 (GCC) without warnings.
-- `test_sunshine`: 686 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
+- `test_sunshine`: 698 passed, 5 skipped for the environment (no NVIDIA or Intel GPU, no tray build,
   no virtual HID licence, no external shell command), 0 failed.
+- Protocols: Sunshine started with each `stream_protocol` listens only on that protocol's ports. With
+  `webrtc`: the Web UI (TCP port+1), the TV WebSocket and UDP 8000, and no GameStream HTTP/HTTPS or RTSP
+  port; with `moonlight`: the GameStream ports and the Web UI, and neither the TV WebSocket nor UDP 8000;
+  with `both`: all of them.
 - End to end on an AMD RX 9060 XT (AMF) with headless Edge: pairing through the Web UI PIN form (the TV listed in
   `/api/pin`, a wrong PIN, a cancellation and a stale request ID refused, the right PIN pairing it under
   the name typed in the Web UI; unauthenticated requests refused), the real Tizen app showing its PIN

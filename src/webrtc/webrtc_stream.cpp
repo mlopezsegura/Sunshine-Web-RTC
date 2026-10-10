@@ -382,6 +382,10 @@ namespace webrtc_stream {
         boost::system::error_code error;
         _socket.open(boost::asio::ip::udp::v4(), error);
         if (!error) {
+          // Several Sunshine instances on one PC (one per user session) each answer the broadcast.
+          _socket.set_option(boost::asio::socket_base::reuse_address(true), error);
+        }
+        if (!error) {
           _socket.bind({boost::asio::ip::address_v4::any(), port}, error);
         }
         if (error) {
@@ -1140,6 +1144,10 @@ namespace webrtc_stream {
 
         rtc::Configuration configuration;
         configuration.disableAutoNegotiation = true;
+        if (const auto range = media_port_range(config::webrtc.media_port_min, config::webrtc.media_port_max)) {
+          configuration.portRangeBegin = range->first;
+          configuration.portRangeEnd = range->second;
+        }
         stream->peer = std::make_shared<rtc::PeerConnection>(configuration);
 
         stream->peer->onStateChange([weak_stream](rtc::PeerConnection::State state) {
@@ -1879,9 +1887,22 @@ namespace webrtc_stream {
     server_t *running_server = nullptr;  ///< The server while it runs.
   }  // namespace
 
+  std::optional<std::pair<std::uint16_t, std::uint16_t>> media_port_range(int min, int max) {
+    if (min == 0 && max == 0) {
+      return std::nullopt;
+    }
+    const int first = min == 0 ? 1024 : min;
+    const int last = max == 0 ? 65535 : max;
+    if (first < 1 || last > 65535 || first > last) {
+      BOOST_LOG(warning) << "WebRTC: media port range "sv << min << '-' << max << " is empty, any port is used"sv;
+      return std::nullopt;
+    }
+    return std::pair {static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)};
+  }
+
   void start() {
-    if (!config::webrtc.enabled) {
-      BOOST_LOG(info) << "WebRTC: TV server disabled"sv;
+    if (!config::webrtc_enabled()) {
+      BOOST_LOG(info) << "WebRTC: TV server disabled by stream_protocol"sv;
       return;
     }
     rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string &message) {

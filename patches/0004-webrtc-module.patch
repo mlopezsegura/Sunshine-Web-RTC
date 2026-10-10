@@ -2795,10 +2795,10 @@ index 00000000..406ed408
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/webrtc_stream.cpp b/src/webrtc/webrtc_stream.cpp
 new file mode 100644
-index 00000000..9fd44130
+index 00000000..2770fca1
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.cpp
-@@ -0,0 +1,1973 @@
+@@ -0,0 +1,1994 @@
 +/**
 + * @file src/webrtc/webrtc_stream.cpp
 + * @brief Definitions for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -3182,6 +3182,10 @@ index 00000000..9fd44130
 +          _socket(_io) {
 +        boost::system::error_code error;
 +        _socket.open(boost::asio::ip::udp::v4(), error);
++        if (!error) {
++          // Several Sunshine instances on one PC (one per user session) each answer the broadcast.
++          _socket.set_option(boost::asio::socket_base::reuse_address(true), error);
++        }
 +        if (!error) {
 +          _socket.bind({boost::asio::ip::address_v4::any(), port}, error);
 +        }
@@ -3941,6 +3945,10 @@ index 00000000..9fd44130
 +
 +        rtc::Configuration configuration;
 +        configuration.disableAutoNegotiation = true;
++        if (const auto range = media_port_range(config::webrtc.media_port_min, config::webrtc.media_port_max)) {
++          configuration.portRangeBegin = range->first;
++          configuration.portRangeEnd = range->second;
++        }
 +        stream->peer = std::make_shared<rtc::PeerConnection>(configuration);
 +
 +        stream->peer->onStateChange([weak_stream](rtc::PeerConnection::State state) {
@@ -4680,9 +4688,22 @@ index 00000000..9fd44130
 +    server_t *running_server = nullptr;  ///< The server while it runs.
 +  }  // namespace
 +
++  std::optional<std::pair<std::uint16_t, std::uint16_t>> media_port_range(int min, int max) {
++    if (min == 0 && max == 0) {
++      return std::nullopt;
++    }
++    const int first = min == 0 ? 1024 : min;
++    const int last = max == 0 ? 65535 : max;
++    if (first < 1 || last > 65535 || first > last) {
++      BOOST_LOG(warning) << "WebRTC: media port range "sv << min << '-' << max << " is empty, any port is used"sv;
++      return std::nullopt;
++    }
++    return std::pair {static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)};
++  }
++
 +  void start() {
-+    if (!config::webrtc.enabled) {
-+      BOOST_LOG(info) << "WebRTC: TV server disabled"sv;
++    if (!config::webrtc_enabled()) {
++      BOOST_LOG(info) << "WebRTC: TV server disabled by stream_protocol"sv;
 +      return;
 +    }
 +    rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string &message) {
@@ -4774,10 +4795,10 @@ index 00000000..9fd44130
 +}  // namespace webrtc_stream
 diff --git a/src/webrtc/webrtc_stream.h b/src/webrtc/webrtc_stream.h
 new file mode 100644
-index 00000000..0fc1795e
+index 00000000..d137a326
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,110 @@
 +/**
 + * @file src/webrtc/webrtc_stream.h
 + * @brief Declarations for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -4790,9 +4811,11 @@ index 00000000..0fc1795e
 +
 +// standard includes
 +#include <cstddef>
++#include <cstdint>
 +#include <optional>
 +#include <string>
 +#include <string_view>
++#include <utility>
 +#include <vector>
 +
 +namespace webrtc_stream {
@@ -4818,6 +4841,18 @@ index 00000000..0fc1795e
 +   * @brief Run the TV signaling server until Sunshine shuts down.
 +   */
 +  void start();
++
++  /**
++   * @brief UDP ports WebRTC media may use, from `webrtc_media_port_min` and `webrtc_media_port_max`.
++   *
++   * A firewall then only needs that range open. 0 leaves its end of the range open: 1024 for the
++   * first port and 65535 for the last.
++   *
++   * @param min First port, 0 for any.
++   * @param max Last port, 0 for any.
++   * @return First and last port, or nothing when both are 0 or the range is empty.
++   */
++  std::optional<std::pair<std::uint16_t, std::uint16_t>> media_port_range(int min, int max);
 +
 +  /**
 +   * @brief Count TV streams that are capturing.

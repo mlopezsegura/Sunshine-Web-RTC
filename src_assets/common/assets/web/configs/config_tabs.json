@@ -77,8 +77,10 @@
       "wan_encryption_mode": 1,
       "ping_timeout": 10000,
       "packetsize": 0,
-      "webrtc_enabled": "enabled",
-      "webrtc_port": 8000
+      "stream_protocol": "both",
+      "webrtc_port": 8000,
+      "webrtc_media_port_min": 0,
+      "webrtc_media_port_max": 0
     }
   },
   {

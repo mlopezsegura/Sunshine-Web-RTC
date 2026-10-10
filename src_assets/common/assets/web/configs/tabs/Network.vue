@@ -13,12 +13,43 @@ const props = defineProps({
 
 const defaultMoonlightPort = 47989
 
+const defaultWebrtcPort = 8000
+const webrtcDiscoveryPort = 8000
+const streamProtocols = ['moonlight', 'webrtc', 'both']
+
 const config = ref(props.config)
 const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlightPort))
+const streamProtocol = computed(() => config.value?.stream_protocol || 'both')
+const moonlightEnabled = computed(() => streamProtocol.value !== 'webrtc')
+const webrtcEnabled = computed(() => streamProtocol.value !== 'moonlight')
+const effectiveWebrtcPort = computed(() => Number(config.value?.webrtc_port || defaultWebrtcPort))
+const webrtcMediaPorts = computed(() => {
+  const min = Number(config.value?.webrtc_media_port_min || 0)
+  const max = Number(config.value?.webrtc_media_port_max || 0)
+  if (!min && !max) {
+    return null
+  }
+  return `${min || 1024} - ${max || 65535}`
+})
 </script>
 
 <template>
   <div id="network" class="config-page">
+    <!-- Streaming protocols -->
+    <div class="mb-3">
+      <label class="form-label">{{ $t('config.stream_protocol') }}</label>
+      <div id="stream_protocol" class="btn-group w-100" role="group" :aria-label="$t('config.stream_protocol')">
+        <template v-for="protocol in streamProtocols" :key="protocol">
+          <input type="radio" class="btn-check" name="stream_protocol" autocomplete="off"
+                 :id="`stream_protocol_${protocol}`" :value="protocol" v-model="config.stream_protocol" />
+          <label class="btn btn-outline-primary" :for="`stream_protocol_${protocol}`">
+            {{ $t(`config.stream_protocol_${protocol}`) }}
+          </label>
+        </template>
+      </div>
+      <div class="form-text">{{ $t('config.stream_protocol_desc') }}</div>
+    </div>
+
     <!-- UPnP -->
     <Checkbox class="mb-3"
               id="upnp"
@@ -68,6 +99,7 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
         </tr>
         </thead>
         <tbody>
+        <template v-if="moonlightEnabled">
         <tr>
           <!-- HTTPS -->
           <td>{{ $t('config.port_tcp') }}</td>
@@ -102,6 +134,33 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
           <td>{{+effectivePort + 9}} - {{+effectivePort + 11}}</td>
           <td></td>
         </tr>
+        </template>
+        <tr v-else>
+          <!-- Web UI alone when Moonlight is off -->
+          <td>{{ $t('config.port_tcp') }}</td>
+          <td>{{+effectivePort + 1}}</td>
+          <td>{{ $t('config.port_web_ui') }}</td>
+        </tr>
+        <template v-if="webrtcEnabled">
+        <tr>
+          <!-- WebRTC signaling -->
+          <td>{{ $t('config.port_tcp') }}</td>
+          <td>{{ effectiveWebrtcPort }}</td>
+          <td>{{ $t('config.port_webrtc_signaling') }}</td>
+        </tr>
+        <tr>
+          <!-- WebRTC TV discovery -->
+          <td>{{ $t('config.port_udp') }}</td>
+          <td>{{ webrtcDiscoveryPort }}</td>
+          <td>{{ $t('config.port_webrtc_discovery') }}</td>
+        </tr>
+        <tr>
+          <!-- WebRTC media -->
+          <td>{{ $t('config.port_udp') }}</td>
+          <td>{{ webrtcMediaPorts || $t('config.port_webrtc_media_any') }}</td>
+          <td>{{ $t('config.port_webrtc_media') }}</td>
+        </tr>
+        </template>
         </tbody>
       </table>
       <!-- add warning about exposing web ui to the internet -->
@@ -174,19 +233,26 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
       <div class="form-text">{{ $t('config.packetsize_desc') }}</div>
     </div>
 
-    <!-- Moonlight WebRTC TV server -->
-    <Checkbox class="mb-3"
-              id="webrtc_enabled"
-              locale-prefix="config"
-              v-model="config.webrtc_enabled"
-              default="true"
-    ></Checkbox>
-
     <!-- Moonlight WebRTC TV port -->
     <div class="mb-3">
       <label for="webrtc_port" class="form-label">{{ $t('config.webrtc_port') }}</label>
-      <input type="number" min="1024" max="65535" class="form-control" id="webrtc_port" placeholder="8000" v-model="config.webrtc_port" />
+      <input type="number" min="1024" max="65535" class="form-control" id="webrtc_port" :placeholder="defaultWebrtcPort"
+             :disabled="!webrtcEnabled" v-model="config.webrtc_port" />
       <div class="form-text">{{ $t('config.webrtc_port_desc') }}</div>
+    </div>
+
+    <!-- Moonlight WebRTC media ports -->
+    <div class="mb-3">
+      <label for="webrtc_media_port_min" class="form-label">{{ $t('config.webrtc_media_port_min') }}</label>
+      <input type="number" min="0" max="65535" class="form-control" id="webrtc_media_port_min" placeholder="0"
+             :disabled="!webrtcEnabled" v-model="config.webrtc_media_port_min" />
+      <div class="form-text">{{ $t('config.webrtc_media_port_min_desc') }}</div>
+    </div>
+    <div class="mb-3">
+      <label for="webrtc_media_port_max" class="form-label">{{ $t('config.webrtc_media_port_max') }}</label>
+      <input type="number" min="0" max="65535" class="form-control" id="webrtc_media_port_max" placeholder="0"
+             :disabled="!webrtcEnabled" v-model="config.webrtc_media_port_max" />
+      <div class="form-text">{{ $t('config.webrtc_media_port_max_desc') }}</div>
     </div>
 
   </div>

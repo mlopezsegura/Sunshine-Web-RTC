@@ -1629,6 +1629,13 @@ namespace nvhttp {
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
     setup(pkey, cert);
 
+    // With stream_protocol = webrtc the paired clients stay loaded for the Web UI, but nothing listens.
+    if (!config::moonlight_enabled()) {
+      BOOST_LOG(info) << "Moonlight clients disabled by stream_protocol"sv;
+      shutdown_event->view();
+      return;
+    }
+
     // resume doesn't always get the parameter "localAudioPlayMode"
     // launch will store it in host_audio
     bool host_audio {};
