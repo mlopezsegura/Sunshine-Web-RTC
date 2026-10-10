@@ -938,6 +938,40 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### external_audio
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enables capture-only operation when an external audio router manages application playback.
+            An explicit [audio_sink](#audio_sink) is required; use an endpoint ID when names are ambiguous.
+            Sunshine captures that endpoint directly without changing or restoring Windows default devices
+            or endpoint formats.
+            <br>
+            <br>
+            In this mode, [virtual_sink](#virtual_sink), automatic Steam audio driver installation,
+            and Moonlight's host-playback toggle do not affect routing. Configure local playback and the audio
+            sent to the selected endpoint in your external mixer. If the endpoint is unavailable, audio capture
+            fails rather than falling back to another endpoint. Video streaming can continue without audio.
+            @note{This option is only supported on Windows. Other platforms retain their existing behavior.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            external_audio = enabled
+            audio_sink = My Streaming Mix
+            @endcode</td>
+    </tr>
+</table>
+
 ### adapter_name
 
 <table>
@@ -2275,7 +2309,10 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>wlr</td>
         <td>Capture for wlroots based Wayland compositors via wlr-screencopy-unstable-v1. It is possible to capture
-            virtual displays in e.g. Hyprland using this method.
+            virtual displays in e.g. Hyprland using this method. On an output that refreshes at least 1.5 times
+            as fast as the stream, frames are captured when the compositor has a new one instead of on a clock of
+            Sunshine's own, which avoids repeated frames; a virtual display at twice the stream's frame rate
+            qualifies.
             @note{Applies to Linux only.}</td>
     </tr>
     <tr>

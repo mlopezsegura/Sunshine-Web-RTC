@@ -23,6 +23,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "kms_plane.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -575,6 +576,109 @@ namespace platf {
       std::uint64_t prop_src_h;  ///< Prop src h.
       std::uint32_t fb_id;  ///< Fb ID.
     };
+
+    /**
+     * @brief Return whether a DRM fourcc value is a supported 32-bit KMS cursor format.
+     *
+     * @param fmt DRM pixel format to inspect.
+     * @return True when the format is one of the 8 accepted 32-bit cursor layouts,
+     *         otherwise false.
+     */
+    bool is_cursor_32bpp_format(uint32_t fmt) {
+      return fmt == DRM_FORMAT_XRGB8888 ||
+             fmt == DRM_FORMAT_XBGR8888 ||
+             fmt == DRM_FORMAT_RGBX8888 ||
+             fmt == DRM_FORMAT_BGRX8888 ||
+             fmt == DRM_FORMAT_ARGB8888 ||
+             fmt == DRM_FORMAT_ABGR8888 ||
+             fmt == DRM_FORMAT_RGBA8888 ||
+             fmt == DRM_FORMAT_BGRA8888;
+    }
+
+    /**
+     * @brief Convert a single 32-bit pixel to the little-endian ARGB8888 layout used by the capture pipeline.
+     *
+     * Rewrites the pixel in place to [B, G, R, A] byte order.
+     *
+     * @param[in,out] p Pointer to the source pixel bytes in the given format.
+     * @param[in] fmt DRM pixel format of the source pixel.
+     * @param[in] x_is_alpha True for cursor buffers where the kernel hardcodes DRM_FORMAT_HOST_XRGB8888
+     *                   (see virtgpu_gem.c) but the fourth byte actually carries per-pixel alpha.
+     *                   Set false for scanout buffers or formats with real alpha channels.
+     * @return true if the format is supported; false otherwise.
+     */
+    bool convert_pixel_to_argb8888(std::uint8_t *p, std::uint32_t fmt, bool x_is_alpha = false) {
+      const auto c0 = p[0];
+      const auto c1 = p[1];
+      const auto c2 = p[2];
+      const auto c3 = p[3];
+
+      std::uint8_t b;
+      std::uint8_t g;
+      std::uint8_t r;
+      std::uint8_t a;
+
+      switch (fmt) {
+        case DRM_FORMAT_XRGB8888:
+          b = c0;
+          g = c1;
+          r = c2;
+          a = x_is_alpha ? c3 : 255;
+          break;
+        case DRM_FORMAT_XBGR8888:
+          b = c2;
+          g = c1;
+          r = c0;
+          a = x_is_alpha ? c3 : 255;
+          break;
+        case DRM_FORMAT_RGBX8888:
+          b = c1;
+          g = c2;
+          r = c3;
+          a = x_is_alpha ? c0 : 255;
+          break;
+        case DRM_FORMAT_BGRX8888:
+          b = c3;
+          g = c2;
+          r = c1;
+          a = x_is_alpha ? c0 : 255;
+          break;
+
+        case DRM_FORMAT_ARGB8888:
+          b = c0;
+          g = c1;
+          r = c2;
+          a = c3;
+          break;
+        case DRM_FORMAT_ABGR8888:
+          b = c2;
+          g = c1;
+          r = c0;
+          a = c3;
+          break;
+        case DRM_FORMAT_RGBA8888:
+          b = c1;
+          g = c2;
+          r = c3;
+          a = c0;
+          break;
+        case DRM_FORMAT_BGRA8888:
+          b = c3;
+          g = c2;
+          r = c1;
+          a = c0;
+          break;
+
+        default:
+          return false;
+      }
+
+      p[0] = b;
+      p[1] = g;
+      p[2] = r;
+      p[3] = a;
+      return true;
+    }
 
     /**
      * @brief DRM card, render node, and plane metadata used for KMS capture.
@@ -1430,9 +1534,9 @@ namespace platf {
             return;
           }
 
-          // All known cursor planes in the wild are ARGB8888
-          if (fb->pixel_format != DRM_FORMAT_ARGB8888) {
-            BOOST_LOG(error) << "Unsupported non-ARGB8888 cursor format: "sv << fb->pixel_format;
+          // All known cursor planes in the wild are 32 bpp
+          if (!is_cursor_32bpp_format(fb->pixel_format)) {
+            BOOST_LOG(error) << "Unsupported cursor format: "sv << fb->pixel_format;
             captured_cursor.visible = false;
             cursor_plane_id = -1;
             return;
@@ -1512,6 +1616,17 @@ namespace platf {
 
           munmap(mapped_data, mapped_size);
 
+          if (fb->pixel_format != DRM_FORMAT_ARGB8888) {
+            // Convert the copied pixels to the format expected by the rest of code.
+            for (std::size_t i = 0; i < captured_cursor.pixels.size(); i += 4) {
+              convert_pixel_to_argb8888(
+                captured_cursor.pixels.data() + i,
+                fb->pixel_format,
+                true
+              );
+            }
+          }
+
           captured_cursor.visible = true;
           captured_cursor.src_w = src_w;
           captured_cursor.src_h = src_h;
@@ -1544,6 +1659,14 @@ namespace platf {
 
         plane_t plane = drmModeGetPlane(card.fd.el, plane_id);
         frame_timestamp = std::chrono::steady_clock::now();
+
+        // A plane that stays without a framebuffer will not get the picture back by itself:
+        // the compositor has moved it to another plane, or restarted. Pick a plane again.
+        if (const auto now = std::chrono::steady_clock::now(); empty_plane_timer.update(plane->fb_id != 0, now)) {
+          BOOST_LOG(info) << "Reinitializing capture: plane ["sv << plane_id << "] has had no framebuffer for "sv
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(empty_plane_timer.empty_for(now)).count() << "ms"sv;
+          return capture_e::reinit;
+        }
 
         auto fb = card.fb(plane.get());
         if (!fb) {
@@ -1604,6 +1727,8 @@ namespace platf {
       int img_height;  ///< Img height.
       int img_offset_x;  ///< Img offset x.
       int img_offset_y;  ///< Img offset y.
+
+      kms::empty_plane_timer_t empty_plane_timer {250ms};  ///< Reinitializes capture once the captured plane stays empty.
 
       int plane_id;  ///< Plane ID.
       int crtc_id;  ///< Crtc ID.
