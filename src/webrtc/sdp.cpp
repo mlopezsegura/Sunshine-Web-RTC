@@ -5,6 +5,7 @@
 // standard includes
 #include <array>
 #include <charconv>
+#include <cstdint>
 
 // local includes
 #include "sdp.h"
@@ -139,11 +140,29 @@ namespace webrtc_stream::sdp {
     if (settings.codec != protocol::video_codec_e::hevc || !settings.hdr) {
       return std::nullopt;
     }
-    int level_id = 123;
-    if (settings.width == 2560) {
-      level_id = 150;
-    } else if (settings.width == 3840) {
-      level_id = 153;
+
+    // The lowest Main-tier level whose picture size and luma sample rate hold the stream
+    // (H.265 table A.8): 4.1 for 1080p60, 5.0 for 1440p60, 5.1 for 4K60, 5.2 for 4K120.
+    struct level_t {
+      int id;  // level-id, 30 times the level number.
+      std::int64_t max_picture_size;
+      std::int64_t max_sample_rate;
+    };
+
+    constexpr std::array LEVELS {
+      level_t {123, 2228224, 133693440},
+      level_t {150, 8912896, 267386880},
+      level_t {153, 8912896, 534773760},
+      level_t {156, 8912896, 1069547520},
+    };
+    const std::int64_t picture_size = static_cast<std::int64_t>(settings.width) * settings.height;
+    const std::int64_t sample_rate = picture_size * settings.fps;
+    int level_id = LEVELS.back().id;
+    for (const auto &level : LEVELS) {
+      if (picture_size <= level.max_picture_size && sample_rate <= level.max_sample_rate) {
+        level_id = level.id;
+        break;
+      }
     }
     return "profile-id=2;tier-flag=0;level-id=" + std::to_string(level_id);
   }

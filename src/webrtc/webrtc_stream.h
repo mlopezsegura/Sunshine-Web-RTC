@@ -10,9 +10,11 @@
 
 // standard includes
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace webrtc_stream {
@@ -38,6 +40,18 @@ namespace webrtc_stream {
    * @brief Run the TV signaling server until Sunshine shuts down.
    */
   void start();
+
+  /**
+   * @brief UDP ports WebRTC media may use, from `webrtc_media_port_min` and `webrtc_media_port_max`.
+   *
+   * A firewall then only needs that range open. 0 leaves its end of the range open: 1024 for the
+   * first port and 65535 for the last.
+   *
+   * @param min First port, 0 for any.
+   * @param max Last port, 0 for any.
+   * @return First and last port, or nothing when both are 0 or the range is empty.
+   */
+  std::optional<std::pair<std::uint16_t, std::uint16_t>> media_port_range(int min, int max);
 
   /**
    * @brief Count TV streams that are capturing.

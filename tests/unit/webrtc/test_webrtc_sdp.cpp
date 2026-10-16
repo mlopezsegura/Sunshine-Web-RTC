@@ -51,6 +51,16 @@ TEST(WebrtcSdpTest, RequestsHevcMain10AtTheLevelOfTheResolution) {
   EXPECT_EQ(sdp::hevc_format_parameters(settings(1920, 1080, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=123");
   EXPECT_EQ(sdp::hevc_format_parameters(settings(2560, 1440, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=150");
   EXPECT_EQ(sdp::hevc_format_parameters(settings(3840, 2160, protocol::video_codec_e::hevc, true)), "profile-id=2;tier-flag=0;level-id=153");
+  // The level follows the luma sample rate, so higher frame rates need higher levels.
+  auto fast = settings(1920, 1080, protocol::video_codec_e::hevc, true);
+  fast.fps = 120;
+  EXPECT_EQ(sdp::hevc_format_parameters(fast), "profile-id=2;tier-flag=0;level-id=150");
+  fast = settings(2560, 1440, protocol::video_codec_e::hevc, true);
+  fast.fps = 120;
+  EXPECT_EQ(sdp::hevc_format_parameters(fast), "profile-id=2;tier-flag=0;level-id=153");
+  fast = settings(3840, 2160, protocol::video_codec_e::hevc, true);
+  fast.fps = 120;
+  EXPECT_EQ(sdp::hevc_format_parameters(fast), "profile-id=2;tier-flag=0;level-id=156");
 }
 
 TEST(WebrtcSdpTest, ChecksThatTheAnswerKeepsMain10) {

@@ -33,55 +33,175 @@ index 95330fa4..38564ab2 100644
            this.status = {type: 'danger', message: this.i18n.t('pin.pair_failure')};
          }
 diff --git a/src_assets/common/assets/web/configs/config_tabs.json b/src_assets/common/assets/web/configs/config_tabs.json
-index c477936c..924c54ab 100644
+index c477936c..51c0b628 100644
 --- a/src_assets/common/assets/web/configs/config_tabs.json
 +++ b/src_assets/common/assets/web/configs/config_tabs.json
-@@ -76,7 +76,9 @@
+@@ -76,7 +76,11 @@
        "lan_encryption_mode": 0,
        "wan_encryption_mode": 1,
        "ping_timeout": 10000,
 -      "packetsize": 0
 +      "packetsize": 0,
-+      "webrtc_enabled": "enabled",
-+      "webrtc_port": 8000
++      "stream_protocol": "both",
++      "webrtc_port": 8000,
++      "webrtc_media_port_min": 0,
++      "webrtc_media_port_max": 0
      }
    },
    {
 diff --git a/src_assets/common/assets/web/configs/tabs/Network.vue b/src_assets/common/assets/web/configs/tabs/Network.vue
-index 9988dcc7..77ec2816 100644
+index 9988dcc7..d8f8ba50 100644
 --- a/src_assets/common/assets/web/configs/tabs/Network.vue
 +++ b/src_assets/common/assets/web/configs/tabs/Network.vue
-@@ -174,5 +174,20 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
+@@ -13,12 +13,43 @@ const props = defineProps({
+ 
+ const defaultMoonlightPort = 47989
+ 
++const defaultWebrtcPort = 8000
++const webrtcDiscoveryPort = 8000
++const streamProtocols = ['moonlight', 'webrtc', 'both']
++
+ const config = ref(props.config)
+ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlightPort))
++const streamProtocol = computed(() => config.value?.stream_protocol || 'both')
++const moonlightEnabled = computed(() => streamProtocol.value !== 'webrtc')
++const webrtcEnabled = computed(() => streamProtocol.value !== 'moonlight')
++const effectiveWebrtcPort = computed(() => Number(config.value?.webrtc_port || defaultWebrtcPort))
++const webrtcMediaPorts = computed(() => {
++  const min = Number(config.value?.webrtc_media_port_min || 0)
++  const max = Number(config.value?.webrtc_media_port_max || 0)
++  if (!min && !max) {
++    return null
++  }
++  return `${min || 1024} - ${max || 65535}`
++})
+ </script>
+ 
+ <template>
+   <div id="network" class="config-page">
++    <!-- Streaming protocols -->
++    <div class="mb-3">
++      <label class="form-label">{{ $t('config.stream_protocol') }}</label>
++      <div id="stream_protocol" class="btn-group w-100" role="group" :aria-label="$t('config.stream_protocol')">
++        <template v-for="protocol in streamProtocols" :key="protocol">
++          <input type="radio" class="btn-check" name="stream_protocol" autocomplete="off"
++                 :id="`stream_protocol_${protocol}`" :value="protocol" v-model="config.stream_protocol" />
++          <label class="btn btn-outline-primary" :for="`stream_protocol_${protocol}`">
++            {{ $t(`config.stream_protocol_${protocol}`) }}
++          </label>
++        </template>
++      </div>
++      <div class="form-text">{{ $t('config.stream_protocol_desc') }}</div>
++    </div>
++
+     <!-- UPnP -->
+     <Checkbox class="mb-3"
+               id="upnp"
+@@ -68,6 +99,7 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
+         </tr>
+         </thead>
+         <tbody>
++        <template v-if="moonlightEnabled">
+         <tr>
+           <!-- HTTPS -->
+           <td>{{ $t('config.port_tcp') }}</td>
+@@ -102,6 +134,33 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
+           <td>{{+effectivePort + 9}} - {{+effectivePort + 11}}</td>
+           <td></td>
+         </tr>
++        </template>
++        <tr v-else>
++          <!-- Web UI alone when Moonlight is off -->
++          <td>{{ $t('config.port_tcp') }}</td>
++          <td>{{+effectivePort + 1}}</td>
++          <td>{{ $t('config.port_web_ui') }}</td>
++        </tr>
++        <template v-if="webrtcEnabled">
++        <tr>
++          <!-- WebRTC signaling -->
++          <td>{{ $t('config.port_tcp') }}</td>
++          <td>{{ effectiveWebrtcPort }}</td>
++          <td>{{ $t('config.port_webrtc_signaling') }}</td>
++        </tr>
++        <tr>
++          <!-- WebRTC TV discovery -->
++          <td>{{ $t('config.port_udp') }}</td>
++          <td>{{ webrtcDiscoveryPort }}</td>
++          <td>{{ $t('config.port_webrtc_discovery') }}</td>
++        </tr>
++        <tr>
++          <!-- WebRTC media -->
++          <td>{{ $t('config.port_udp') }}</td>
++          <td>{{ webrtcMediaPorts || $t('config.port_webrtc_media_any') }}</td>
++          <td>{{ $t('config.port_webrtc_media') }}</td>
++        </tr>
++        </template>
+         </tbody>
+       </table>
+       <!-- add warning about exposing web ui to the internet -->
+@@ -174,5 +233,27 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
        <div class="form-text">{{ $t('config.packetsize_desc') }}</div>
      </div>
  
-+    <!-- Moonlight WebRTC TV server -->
-+    <Checkbox class="mb-3"
-+              id="webrtc_enabled"
-+              locale-prefix="config"
-+              v-model="config.webrtc_enabled"
-+              default="true"
-+    ></Checkbox>
-+
 +    <!-- Moonlight WebRTC TV port -->
 +    <div class="mb-3">
 +      <label for="webrtc_port" class="form-label">{{ $t('config.webrtc_port') }}</label>
-+      <input type="number" min="1024" max="65535" class="form-control" id="webrtc_port" placeholder="8000" v-model="config.webrtc_port" />
++      <input type="number" min="1024" max="65535" class="form-control" id="webrtc_port" :placeholder="defaultWebrtcPort"
++             :disabled="!webrtcEnabled" v-model="config.webrtc_port" />
 +      <div class="form-text">{{ $t('config.webrtc_port_desc') }}</div>
++    </div>
++
++    <!-- Moonlight WebRTC media ports -->
++    <div class="mb-3">
++      <label for="webrtc_media_port_min" class="form-label">{{ $t('config.webrtc_media_port_min') }}</label>
++      <input type="number" min="0" max="65535" class="form-control" id="webrtc_media_port_min" placeholder="0"
++             :disabled="!webrtcEnabled" v-model="config.webrtc_media_port_min" />
++      <div class="form-text">{{ $t('config.webrtc_media_port_min_desc') }}</div>
++    </div>
++    <div class="mb-3">
++      <label for="webrtc_media_port_max" class="form-label">{{ $t('config.webrtc_media_port_max') }}</label>
++      <input type="number" min="0" max="65535" class="form-control" id="webrtc_media_port_max" placeholder="0"
++             :disabled="!webrtcEnabled" v-model="config.webrtc_media_port_max" />
++      <div class="form-text">{{ $t('config.webrtc_media_port_max_desc') }}</div>
 +    </div>
 +
    </div>
  </template>
 diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
-index 030f733c..801a8bf8 100644
+index 030f733c..8f31e19c 100644
 --- a/src_assets/common/assets/web/public/assets/locale/en.json
 +++ b/src_assets/common/assets/web/public/assets/locale/en.json
-@@ -433,6 +433,10 @@
+@@ -389,6 +389,10 @@
+     "port_udp": "UDP",
+     "port_warning": "Exposing the Web UI to the internet is a security risk! Proceed at your own risk!",
+     "port_web_ui": "Web UI",
++    "port_webrtc_discovery": "Moonlight WebRTC TV discovery",
++    "port_webrtc_media": "Moonlight WebRTC video and audio",
++    "port_webrtc_media_any": "Any",
++    "port_webrtc_signaling": "Moonlight WebRTC TV connection",
+     "qp": "Quantization Parameter",
+     "qp_desc": "Some devices may not support Constant Bit Rate. For those devices, QP is used instead. Higher value means more compression, but less quality.",
+     "qsv_coder": "QuickSync Coder (H264)",
+@@ -406,6 +410,11 @@
+     "search_options": "Search configuration options...",
+     "stream_audio": "Stream Audio",
+     "stream_audio_desc": "Whether to stream audio or not. Disabling this can be useful for streaming headless displays as second monitors.",
++    "stream_protocol": "Streaming Protocols",
++    "stream_protocol_both": "Both",
++    "stream_protocol_desc": "Which clients Sunshine serves: Moonlight apps, Moonlight WebRTC on Samsung Tizen TVs, or both. The ports of a protocol that is off stay closed.",
++    "stream_protocol_moonlight": "Moonlight",
++    "stream_protocol_webrtc": "WebRTC",
+     "sunshine_name": "Sunshine Name",
+     "sunshine_name_desc": "The name displayed by Moonlight. If not specified, the PC's hostname is used",
+     "sw_preset": "SW Presets",
+@@ -433,6 +442,12 @@
      "touchpad_as_ds4_desc": "If disabled, touchpad presence will not be taken into account during gamepad type selection.",
      "upnp": "UPnP",
      "upnp_desc": "Automatically configure port forwarding for streaming over the Internet",
-+    "webrtc_enabled": "Moonlight WebRTC TV Server",
-+    "webrtc_enabled_desc": "Stream directly to the Moonlight WebRTC app on Samsung Tizen TVs, without a separate Gateway. Pair TVs from the PIN page.",
++    "webrtc_media_port_max": "Moonlight WebRTC Last Media Port",
++    "webrtc_media_port_max_desc": "Last UDP port WebRTC video and audio may use. 0 leaves the range open upwards, to 65535.",
++    "webrtc_media_port_min": "Moonlight WebRTC First Media Port",
++    "webrtc_media_port_min_desc": "First UDP port WebRTC video and audio may use, so a firewall only needs that range open. 0 for both ports lets WebRTC pick any port.",
 +    "webrtc_port": "Moonlight WebRTC TV Port",
 +    "webrtc_port_desc": "TCP port of the WebSocket the TV connects to. The TV app uses 8000 unless another port is entered with the PC's address. Range: 1024-65535.",
      "vaapi_blbrc": "Block level based bitrate control (BLBRC)",

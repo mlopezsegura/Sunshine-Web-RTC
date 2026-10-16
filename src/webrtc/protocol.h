@@ -39,7 +39,7 @@ namespace webrtc_stream::protocol {
   struct video_mode_t {
     int width;  ///< Width in pixels.
     int height;  ///< Height in pixels.
-    int fps;  ///< Frame rate.
+    int max_fps;  ///< Highest frame rate offered; see @ref SUPPORTED_FRAME_RATES.
     bool supports_h264;  ///< Whether H.264 is offered at this resolution.
     bool supports_hevc;  ///< Whether HEVC is offered at this resolution.
     bool supports_av1;  ///< Whether AV1 is offered at this resolution, when the encoder supports it.
@@ -69,13 +69,25 @@ namespace webrtc_stream::protocol {
   };
 
   /**
+   * @brief Frame rates a TV may request, up to a mode's @ref video_mode_t::max_fps.
+   *
+   * The TV offers only the rates its own decoder reports it can sustain.
+   */
+  constexpr std::array SUPPORTED_FRAME_RATES {30, 60, 90, 120};
+
+  /**
+   * @brief Frame rate a TV uses when it does not choose one; older TV apps always send it.
+   */
+  constexpr int DEFAULT_FRAME_RATE = 60;
+
+  /**
    * @brief Resolutions offered to the TV. 1440p is not in Samsung's Cloud Gaming table.
    */
   constexpr std::array SUPPORTED_VIDEO_MODES {
-    video_mode_t {1280, 720, 60, true, true, true, video_codec_e::h264, 12000, false, false},
-    video_mode_t {1920, 1080, 60, true, true, true, video_codec_e::h264, 20000, false, true},
-    video_mode_t {2560, 1440, 60, true, true, true, video_codec_e::hevc, 30000, true, true},
-    video_mode_t {3840, 2160, 60, false, true, true, video_codec_e::hevc, 50000, false, true},
+    video_mode_t {1280, 720, 120, true, true, true, video_codec_e::h264, 12000, false, false},
+    video_mode_t {1920, 1080, 120, true, true, true, video_codec_e::h264, 20000, false, true},
+    video_mode_t {2560, 1440, 120, true, true, true, video_codec_e::hevc, 30000, true, true},
+    video_mode_t {3840, 2160, 120, false, true, true, video_codec_e::hevc, 50000, false, true},
   };
 
   /**
@@ -223,9 +235,26 @@ namespace webrtc_stream::protocol {
   };
 
   /**
+   * @brief Lines of the TV application's own log, written into Sunshine's log.
+   */
+  struct client_log_t {
+    std::vector<std::string> lines;  ///< Log lines, single-line and bounded in length.
+  };
+
+  /**
+   * @brief Largest number of lines one `client-log` message may carry.
+   */
+  constexpr std::size_t MAX_CLIENT_LOG_LINES = 100;
+
+  /**
+   * @brief Longest client log line kept; longer lines are cut.
+   */
+  constexpr std::size_t MAX_CLIENT_LOG_LINE_LENGTH = 4000;
+
+  /**
    * @brief Any message the TV may send.
    */
-  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
+  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t, client_log_t>;
 
   /**
    * @brief A parsed TV message.
@@ -272,6 +301,16 @@ namespace webrtc_stream::protocol {
   client_message_t parse_client_message(std::string_view text);
 
   /**
+   * @brief Check whether a control-channel message is the TV app asking for a keyframe.
+   *
+   * The TV sends `{"type": "request-keyframe"}` when its picture stops advancing while video
+   * still arrives, a stall its WebRTC stack does not always answer with a PLI of its own.
+   * @param text Control-channel message.
+   * @return True for a `request-keyframe` message, false for anything else or malformed JSON.
+   */
+  bool is_keyframe_request(std::string_view text);
+
+  /**
    * @brief Build the greeting carrying the authentication nonce.
    *
    * It also announces `"pairing": "client-pin"`: an unpaired TV shows its own PIN and sends
@@ -283,6 +322,27 @@ namespace webrtc_stream::protocol {
    * @return The message.
    */
   nlohmann::json make_auth_required(std::string_view nonce, const std::optional<std::string> &mac_address, std::optional<bool> sunshine_available);
+
+  /**
+   * @brief UDP port on which Sunshine answers TVs looking for it, whatever `webrtc_port` is.
+   */
+  constexpr std::uint16_t DISCOVERY_PORT = 8000;
+
+  /**
+   * @brief Check whether a datagram is a TV looking for Sunshine on the local network.
+   * @param datagram Received datagram.
+   * @return True for `{"version":2,"type":"discover"}`.
+   */
+  bool is_discovery_request(std::string_view datagram);
+
+  /**
+   * @brief Build the reply that tells a TV where to connect.
+   * @param name Sunshine's name.
+   * @param port TCP port of the signaling WebSocket.
+   * @param mac_address Wake-on-LAN address facing the TV, if known.
+   * @return The message.
+   */
+  nlohmann::json make_discovery_response(std::string_view name, int port, const std::optional<std::string> &mac_address);
 
   /**
    * @brief Build the push sent when streaming becomes possible or impossible.

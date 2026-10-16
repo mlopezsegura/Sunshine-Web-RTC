@@ -478,14 +478,20 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  // Moonlight discovery and port forwarding are only for Moonlight clients; stream_protocol = webrtc
+  // leaves every GameStream port closed.
   std::unique_ptr<platf::deinit_t> mDNS;
   auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-    mDNS = platf::publish::start();
+    if (config::moonlight_enabled()) {
+      mDNS = platf::publish::start();
+    }
   });
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
-    upnp_unmap = upnp::start();
+    if (config::moonlight_enabled()) {
+      upnp_unmap = upnp::start();
+    }
   });
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
@@ -495,7 +501,10 @@ int main(int argc, char *argv[]) {
 
   std::jthread httpThread {nvhttp::start};
   std::jthread configThread {confighttp::start};
-  std::jthread rtspThread {rtsp_stream::start};
+  std::jthread rtspThread;
+  if (config::moonlight_enabled()) {
+    rtspThread = std::jthread {rtsp_stream::start};
+  }
   std::jthread webrtcThread {webrtc_stream::start};
 
 #ifdef _WIN32

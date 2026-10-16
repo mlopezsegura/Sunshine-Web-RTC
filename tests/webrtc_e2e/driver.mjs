@@ -2,7 +2,7 @@
 // Chromium browser, approves the PIN it shows through the Web UI API, and prints what it measured.
 //
 //   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
-//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --bitrate=20000 --hdr=1]
+//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --fps=60 --bitrate=20000 --hdr=1]
 //                   [--summary=1] [--unpair=0] [--takeover=1] [--browser=path/to/msedge.exe]
 //
 // Sunshine's Web UI uses a self-signed certificate: run with NODE_TLS_REJECT_UNAUTHORIZED=0.
@@ -72,7 +72,7 @@ const clientsBefore = await tvClients();
 console.log("API clients before:", JSON.stringify(clientsBefore));
 
 const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin, codec: args.codec || "h264",
-  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", takeover: args.takeover || "0" });
+  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", fps: args.fps || "60", takeover: args.takeover || "0" });
 let edge;
 const server = http.createServer((request, response) => {
   if (request.method === "POST" && request.url === "/result") {
@@ -82,7 +82,7 @@ const server = http.createServer((request, response) => {
       response.end("ok");
       const result = JSON.parse(body);
       if (args.summary === "1") {
-        console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, hdr: result.hdr, errors: result.errors,
+        console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, fps: result.fps, hdr: result.hdr, errors: result.errors,
           states: result.steps.filter((s) => s.step.startsWith("session-") || s.step.startsWith("host-") || s.step.startsWith("takeover") || s.step.startsWith("replaced") || s.step === "offer").map((s) => s.step + (s.message ? "(" + s.message + ")" : "") + (s.rtpmap ? "[" + s.rtpmap + "]" : "")),
           video: result.stats?.video, audio: result.stats?.audio, codecs: result.stats?.codecs, measuredFps: result.measuredFps, measuredKbps: result.measuredKbps }, null, 1));
       } else {

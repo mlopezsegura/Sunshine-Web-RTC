@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -288,6 +289,76 @@ namespace webrtc_stream {
     }
 
     /**
+     * @brief Bytes sent per millisecond at most: 80% of 1 Gbps, the GameStream sender's rate.
+     */
+    constexpr std::size_t PACED_BYTES_PER_MS = 1'000'000'000ULL * 80 / 100 / 8 / 1000;
+
+    /**
+     * @brief Paces a frame's RTP packets the way the GameStream sender does.
+     *
+     * The packetizer hands over a whole frame at once. A 4K keyframe is hundreds of packets,
+     * and written back to back they overflow the UDP socket's send buffer, which drops them
+     * without telling anyone. The TV is left without the keyframe it asked for, asks again and
+     * receives another burst, and the picture stays black while audio, a few small packets
+     * at a time, carries on. Sending a millisecond's worth at most, then waiting for the next
+     * millisecond, keeps every frame inside the buffer at the cost of a few milliseconds on the
+     * largest ones. It is the last handler of the chain and runs on the video sender thread,
+     * which has nothing else to do meanwhile; NACK retransmissions do not pass through it.
+     */
+    class frame_pacer_t final: public rtc::MediaHandler {
+    public:
+      void outgoing(rtc::message_vector &messages, const rtc::message_callback &send) override {
+        if (!_timer) {
+          _timer = platf::create_high_precision_timer();
+        }
+        // A frame that follows a large one closely starts where that one's pacing ended.
+        const auto frame_start = std::max(_next_frame_start, std::chrono::steady_clock::now());
+        std::size_t frame_bytes = 0;
+        std::size_t group_bytes = 0;
+        for (auto &message : messages) {
+          if (group_bytes >= PACED_BYTES_PER_MS) {
+            wait_until(frame_start + paced_duration(frame_bytes));
+            group_bytes = 0;
+          }
+          frame_bytes += message->size();
+          group_bytes += message->size();
+          send(std::move(message));
+        }
+        messages.clear();
+        _next_frame_start = frame_start + paced_duration(frame_bytes);
+      }
+
+    private:
+      /**
+       * @brief Time the given number of bytes takes at the paced rate.
+       * @param bytes Bytes sent.
+       * @return Duration.
+       */
+      static std::chrono::nanoseconds paced_duration(std::size_t bytes) {
+        return std::chrono::nanoseconds {std::chrono::nanoseconds {1ms}.count() * static_cast<std::int64_t>(bytes) / static_cast<std::int64_t>(PACED_BYTES_PER_MS)};
+      }
+
+      /**
+       * @brief Sleep until a point in time, precisely when the platform allows it.
+       * @param due When to wake.
+       */
+      void wait_until(std::chrono::steady_clock::time_point due) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= due) {
+          return;
+        }
+        if (_timer && *_timer) {
+          _timer->sleep_for(due - now);
+        } else {
+          std::this_thread::sleep_until(due);
+        }
+      }
+
+      std::unique_ptr<platf::high_precision_timer> _timer;  ///< Created on the sending thread.
+      std::chrono::steady_clock::time_point _next_frame_start {};  ///< When the previous frame's pacing ends.
+    };
+
+    /**
      * @brief One WebRTC stream: its PeerConnection and, once connected, its capture pipeline.
      */
     struct stream_t {
@@ -317,6 +388,9 @@ namespace webrtc_stream {
       bool stop_requested = false;  ///< The stream must end.
       std::optional<std::string> failure;  ///< Why the host ended the stream.
       safe::mail_raw_t::event_t<bool> idr_event;  ///< Keyframe requests, once capture runs.
+      std::uint32_t pli_requests = 0;  ///< Keyframes the TV's WebRTC stack asked for since the last log line.
+      std::uint32_t watchdog_requests = 0;  ///< Keyframes the TV app's stall watchdog asked for since the last log line.
+      std::chrono::steady_clock::time_point last_request_log {};  ///< When keyframe requests were last logged.
 
       std::mutex candidate_mutex;  ///< Protects candidate buffering.
       bool has_remote_description = false;  ///< Whether the answer was applied.
@@ -340,6 +414,28 @@ namespace webrtc_stream {
       }
 
       /**
+       * @brief Encode the next frame as IDR, logging the requests at most once a second.
+       *
+       * A PLI storm would otherwise flood the log, while a single line per second still shows
+       * whether the TV asked at all while its picture was black.
+       * @param from_watchdog Whether the TV app asked because its picture stopped, rather than its WebRTC stack through PLI.
+       */
+      void request_keyframe(bool from_watchdog) {
+        std::lock_guard lock(mutex);
+        ++(from_watchdog ? watchdog_requests : pli_requests);
+        if (idr_event) {
+          idr_event->raise(true);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_request_log >= 1s) {
+          BOOST_LOG(info) << "WebRTC: session "sv << id << " keyframe requested: "sv << pli_requests << " PLI, "sv << watchdog_requests << " from the TV stall watchdog"sv;
+          pli_requests = 0;
+          watchdog_requests = 0;
+          last_request_log = now;
+        }
+      }
+
+      /**
        * @brief Check whether the stream must end.
        * @return True once a stop was requested.
        */
@@ -347,6 +443,101 @@ namespace webrtc_stream {
         std::lock_guard lock(mutex);
         return stop_requested;
       }
+    };
+
+    /**
+     * @brief Check that a peer is on the local network.
+     * @param address Peer address.
+     * @return True for loopback, private, link-local and unique local addresses.
+     */
+    bool is_local_peer(const boost::asio::ip::address &address) {
+      if (address.is_v6()) {
+        const auto v6 = address.to_v6();
+        if (v6.is_v4_mapped()) {
+          return is_local_peer(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6));
+        }
+        return v6.is_loopback() || v6.is_link_local() || (v6.to_bytes()[0] & 0xFE) == 0xFC;
+      }
+      const auto bytes = address.to_v4().to_bytes();
+      return bytes[0] == 127 || bytes[0] == 10 || (bytes[0] == 172 && (bytes[1] & 0xF0) == 16) ||
+             (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 169 && bytes[1] == 254);
+    }
+
+    /**
+     * @brief Answers TVs looking for Sunshine on the local network.
+     *
+     * A TV broadcasts `{"version":2,"type":"discover"}` to UDP @ref protocol::DISCOVERY_PORT and
+     * learns this PC's address from the reply's source, plus its name, signaling port and
+     * Wake-on-LAN address. Only local peers are answered, with a reply about as small as the request.
+     */
+    class discovery_responder_t {
+    public:
+      explicit discovery_responder_t(std::uint16_t port):
+          _socket(_io) {
+        boost::system::error_code error;
+        _socket.open(boost::asio::ip::udp::v4(), error);
+        if (!error) {
+          // Several Sunshine instances on one PC (one per user session) each answer the broadcast.
+          _socket.set_option(boost::asio::socket_base::reuse_address(true), error);
+        }
+        if (!error) {
+          _socket.bind({boost::asio::ip::address_v4::any(), port}, error);
+        }
+        if (error) {
+          BOOST_LOG(warning) << "WebRTC: TV discovery unavailable on UDP port "sv << port << ": "sv << error.message();
+          return;
+        }
+        receive();
+        _thread = std::jthread([this] {
+          _io.run();
+        });
+        BOOST_LOG(info) << "WebRTC: answering TV discovery on UDP port "sv << port;
+      }
+
+      ~discovery_responder_t() {
+        _io.stop();
+      }
+
+      discovery_responder_t(const discovery_responder_t &) = delete;
+      discovery_responder_t &operator=(const discovery_responder_t &) = delete;
+
+    private:
+      void receive() {
+        _socket.async_receive_from(boost::asio::buffer(_buffer), _sender, [this](const boost::system::error_code &error, std::size_t size) {
+          if (error == boost::asio::error::operation_aborted) {
+            return;
+          }
+          // Windows reports an ICMP port-unreachable for an earlier reply as connection_reset.
+          if (error && error != boost::asio::error::connection_reset) {
+            BOOST_LOG(warning) << "WebRTC: TV discovery stopped: "sv << error.message();
+            return;
+          }
+          if (!error) {
+            answer(std::string_view(_buffer.data(), size));
+          }
+          receive();
+        });
+      }
+
+      void answer(std::string_view datagram) {
+        const auto address = _sender.address();
+        if (!is_local_peer(address) || !protocol::is_discovery_request(datagram)) {
+          return;
+        }
+        const auto mac = wake_on_lan_address(address.to_string() + ":0");
+        const auto reply = protocol::make_discovery_response(config::nvhttp.sunshine_name, config::webrtc.port, mac).dump();
+        boost::system::error_code error;
+        _socket.send_to(boost::asio::buffer(reply), _sender, 0, error);
+        if (error) {
+          BOOST_LOG(debug) << "WebRTC: discovery reply not sent: "sv << error.message();
+        }
+      }
+
+      boost::asio::io_context _io;  ///< Runs the socket.
+      boost::asio::ip::udp::socket _socket;  ///< Discovery socket.
+      boost::asio::ip::udp::endpoint _sender;  ///< Sender of the datagram being received.
+      std::array<char, 512> _buffer {};  ///< Received datagram.
+      std::jthread _thread;  ///< Runs @ref _io; joined after it stops.
     };
 
     /**
@@ -384,6 +575,7 @@ namespace webrtc_stream {
           accept(std::move(socket));
         });
         _codecs = current_codec_support();
+        _discovery = std::make_unique<discovery_responder_t>(protocol::DISCOVERY_PORT);
         BOOST_LOG(info) << "WebRTC: TV server listening on port "sv << config::webrtc.port << ", "sv << _tv_clients.count() << " paired TV(s)"sv;
       }
 
@@ -721,6 +913,8 @@ namespace webrtc_stream {
             handle_answer(connection, *answer);
           } else if (const auto *candidate = std::get_if<protocol::candidate_t>(&message.payload)) {
             handle_candidate(connection, *candidate);
+          } else if (const auto *client_log = std::get_if<protocol::client_log_t>(&message.payload)) {
+            write_client_log(connection, *client_log);
           }
         } catch (const protocol::protocol_error_t &e) {
           BOOST_LOG(warning) << "WebRTC: protocol error: "sv << e.what();
@@ -728,6 +922,25 @@ namespace webrtc_stream {
         } catch (const std::exception &e) {
           BOOST_LOG(error) << "WebRTC: control error: "sv << e.what();
           send(connection, protocol::make_error("unknown", "internal-error", e.what()));
+        }
+      }
+
+      /**
+       * @brief Write the TV application's log lines into Sunshine's log.
+       *
+       * What the TV saw - a stall, a recovery, its decoder counters - then sits in one file
+       * next to what Sunshine did at the same moment, with no tooling needed on the TV.
+       * @param connection Connection.
+       * @param client_log Lines sent by the TV.
+       */
+      void write_client_log(const std::shared_ptr<connection_t> &connection, const protocol::client_log_t &client_log) {
+        std::string name;
+        {
+          std::lock_guard lock(connection->mutex);
+          name = connection->client_name;
+        }
+        for (const auto &line : client_log.lines) {
+          BOOST_LOG(info) << "WebRTC TV "sv << name << ": "sv << line;
         }
       }
 
@@ -1047,6 +1260,10 @@ namespace webrtc_stream {
 
         rtc::Configuration configuration;
         configuration.disableAutoNegotiation = true;
+        if (const auto range = media_port_range(config::webrtc.media_port_min, config::webrtc.media_port_max)) {
+          configuration.portRangeBegin = range->first;
+          configuration.portRangeEnd = range->second;
+        }
         stream->peer = std::make_shared<rtc::PeerConnection>(configuration);
 
         stream->peer->onStateChange([weak_stream](rtc::PeerConnection::State state) {
@@ -1132,7 +1349,13 @@ namespace webrtc_stream {
         stream->control_channel = stream->peer->createDataChannel("control", control_options);
         stream->control_channel->onMessage([weak_stream](rtc::message_variant data) {
           const auto stream = weak_stream.lock();
-          if (stream && std::holds_alternative<std::string>(data) && !stream->input_bridge->handle_control_message(std::get<std::string>(data))) {
+          if (!stream || !std::holds_alternative<std::string>(data)) {
+            return;
+          }
+          const auto &text = std::get<std::string>(data);
+          if (protocol::is_keyframe_request(text)) {
+            stream->request_keyframe(true);
+          } else if (!stream->input_bridge->handle_control_message(text)) {
             BOOST_LOG(warning) << "WebRTC: rejected malformed gamepad control message"sv;
           }
         });
@@ -1201,11 +1424,9 @@ namespace webrtc_stream {
             return;
           }
           // Sunshine encodes the next frame as IDR; no intermediate client has to ask for it.
-          std::lock_guard lock(stream->mutex);
-          if (stream->idr_event) {
-            stream->idr_event->raise(true);
-          }
+          stream->request_keyframe(false);
         }));
+        packetizer->addToChain(std::make_shared<frame_pacer_t>());
         stream->video_track->setMediaHandler(packetizer);
         stream->video_track->onOpen([weak_stream] {
           if (const auto stream = weak_stream.lock()) {
@@ -1451,12 +1672,28 @@ namespace webrtc_stream {
           platf::adjust_thread_priority(platf::thread_priority_e::high);
           std::optional<std::uint32_t> last_timestamp;
           const std::uint32_t frame_ticks = VIDEO_CLOCK_RATE / std::max(1, stream->settings.fps);
+          // IDR frames are logged at most once a second, with the largest one, so a black
+          // picture on the TV can be matched against whether keyframes were actually sent.
+          std::uint32_t idr_frames = 0;
+          std::size_t largest_idr = 0;
+          std::chrono::steady_clock::time_point last_idr_log {};
           while (auto packet = video_packets->pop()) {
             std::string_view payload {reinterpret_cast<const char *>(packet->data()), packet->data_size()};
             std::vector<std::uint8_t> replaced;
             if (packet->is_idr() && packet->replacements) {
               replaced = apply_replacements(payload, *packet->replacements);
               payload = {reinterpret_cast<const char *>(replaced.data()), replaced.size()};
+            }
+            if (packet->is_idr()) {
+              ++idr_frames;
+              largest_idr = std::max(largest_idr, payload.size());
+              const auto now = std::chrono::steady_clock::now();
+              if (now - last_idr_log >= 1s) {
+                BOOST_LOG(info) << "WebRTC: session "sv << stream->id << " sent "sv << idr_frames << " IDR frame(s), largest "sv << largest_idr / 1024 << " KiB"sv;
+                idr_frames = 0;
+                largest_idr = 0;
+                last_idr_log = now;
+              }
             }
             // The capture time drives the RTP clock so the TV paces frames as they were captured.
             auto timestamp = last_timestamp ? *last_timestamp + frame_ticks : 0U;
@@ -1779,22 +2016,50 @@ namespace webrtc_stream {
       std::unordered_map<std::string, std::optional<std::pair<std::string, std::string>>> _artwork;  ///< MIME type and Base64 by app ID.
       std::atomic<std::uint64_t> _next_session_id {1};  ///< Next session ID.
       std::unique_ptr<rtc::WebSocketServer> _server;  ///< Signaling server.
+      std::unique_ptr<discovery_responder_t> _discovery;  ///< Answers TVs looking for Sunshine.
     };
 
     std::mutex server_mutex;  ///< Protects @ref running_server.
     server_t *running_server = nullptr;  ///< The server while it runs.
   }  // namespace
 
+  std::optional<std::pair<std::uint16_t, std::uint16_t>> media_port_range(int min, int max) {
+    if (min == 0 && max == 0) {
+      return std::nullopt;
+    }
+    const int first = min == 0 ? 1024 : min;
+    const int last = max == 0 ? 65535 : max;
+    if (first < 1 || last > 65535 || first > last) {
+      BOOST_LOG(warning) << "WebRTC: media port range "sv << min << '-' << max << " is empty, any port is used"sv;
+      return std::nullopt;
+    }
+    return std::pair {static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)};
+  }
+
   void start() {
-    if (!config::webrtc.enabled) {
-      BOOST_LOG(info) << "WebRTC: TV server disabled"sv;
+    if (!config::webrtc_enabled()) {
+      BOOST_LOG(info) << "WebRTC: TV server disabled by stream_protocol"sv;
       return;
     }
-    rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string &message) {
+    // libjuice reports a full send buffer, which silently drops a packet, only at Info level.
+    // It is the one Info message worth seeing, so it is let through and summarized each second.
+    rtc::InitLogger(rtc::LogLevel::Info, [](rtc::LogLevel level, const std::string &message) {
       if (level <= rtc::LogLevel::Error) {
         BOOST_LOG(error) << "libdatachannel: "sv << message;
-      } else {
+      } else if (level == rtc::LogLevel::Warning) {
         BOOST_LOG(warning) << "libdatachannel: "sv << message;
+      } else if (message.find("buffer is full"sv) != std::string::npos) {
+        static std::mutex dropped_mutex;
+        static std::uint64_t dropped = 0;
+        static std::chrono::steady_clock::time_point last_log {};
+        std::lock_guard lock(dropped_mutex);
+        ++dropped;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log >= 1s) {
+          BOOST_LOG(warning) << "WebRTC: UDP send buffer full, "sv << dropped << " packet(s) dropped since the last report"sv;
+          dropped = 0;
+          last_log = now;
+        }
       }
     });
     rtc::Preload();
