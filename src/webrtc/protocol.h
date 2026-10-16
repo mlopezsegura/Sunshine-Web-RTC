@@ -235,9 +235,26 @@ namespace webrtc_stream::protocol {
   };
 
   /**
+   * @brief Lines of the TV application's own log, written into Sunshine's log.
+   */
+  struct client_log_t {
+    std::vector<std::string> lines;  ///< Log lines, single-line and bounded in length.
+  };
+
+  /**
+   * @brief Largest number of lines one `client-log` message may carry.
+   */
+  constexpr std::size_t MAX_CLIENT_LOG_LINES = 100;
+
+  /**
+   * @brief Longest client log line kept; longer lines are cut.
+   */
+  constexpr std::size_t MAX_CLIENT_LOG_LINE_LENGTH = 4000;
+
+  /**
    * @brief Any message the TV may send.
    */
-  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
+  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t, client_log_t>;
 
   /**
    * @brief A parsed TV message.
@@ -282,6 +299,16 @@ namespace webrtc_stream::protocol {
    * @throws protocol_error_t for malformed or unsupported messages.
    */
   client_message_t parse_client_message(std::string_view text);
+
+  /**
+   * @brief Check whether a control-channel message is the TV app asking for a keyframe.
+   *
+   * The TV sends `{"type": "request-keyframe"}` when its picture stops advancing while video
+   * still arrives, a stall its WebRTC stack does not always answer with a PLI of its own.
+   * @param text Control-channel message.
+   * @return True for a `request-keyframe` message, false for anything else or malformed JSON.
+   */
+  bool is_keyframe_request(std::string_view text);
 
   /**
    * @brief Build the greeting carrying the authentication nonce.

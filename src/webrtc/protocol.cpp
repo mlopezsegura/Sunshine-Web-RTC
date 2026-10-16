@@ -38,6 +38,37 @@ namespace webrtc_stream::protocol {
     }
 
     /**
+     * @brief Read the lines of a `client-log` message.
+     *
+     * Each line becomes one line of Sunshine's log, so control characters, which would let a
+     * line pass itself off as several, are replaced and long lines are cut.
+     * @param message Parsed message.
+     * @return The lines.
+     */
+    std::vector<std::string> client_log_lines(const json &message) {
+      const auto &lines = message.at("lines");
+      if (!lines.is_array() || lines.size() > MAX_CLIENT_LOG_LINES) {
+        throw protocol_error_t("invalid-message", "lines must be an array of at most 100 strings");
+      }
+      std::vector<std::string> result;
+      result.reserve(lines.size());
+      for (const auto &line : lines) {
+        if (!line.is_string()) {
+          throw protocol_error_t("invalid-message", "lines must be an array of at most 100 strings");
+        }
+        auto text = line.get<std::string>();
+        if (text.size() > MAX_CLIENT_LOG_LINE_LENGTH) {
+          text.resize(MAX_CLIENT_LOG_LINE_LENGTH);
+        }
+        std::ranges::replace_if(text, [](unsigned char character) {
+          return character < 0x20 || character == 0x7F;
+        }, ' ');
+        result.push_back(std::move(text));
+      }
+      return result;
+    }
+
+    /**
      * @brief Read a positive session ID.
      * @param message Parsed message.
      * @return The session ID.
@@ -308,6 +339,9 @@ namespace webrtc_stream::protocol {
       if (type == "candidate") {
         return {type, candidate_t {session_id(message), message.at("candidate").get<std::string>(), message.at("mid").get<std::string>()}};
       }
+      if (type == "client-log") {
+        return {type, client_log_t {client_log_lines(message)}};
+      }
       throw protocol_error_t("unsupported-message", "Unsupported message type: " + type);
     } catch (const protocol_error_t &) {
       throw;
@@ -460,5 +494,17 @@ namespace webrtc_stream::protocol {
     auto message = envelope("candidate");
     message.update({{"sessionId", session_id_value}, {"candidate", candidate}, {"mid", mid}});
     return message;
+  }
+
+  bool is_keyframe_request(std::string_view text) {
+    if (text.find("request-keyframe") == std::string_view::npos) {
+      return false;
+    }
+    try {
+      const auto message = json::parse(text);
+      return message.is_object() && message.contains("type") && message["type"].is_string() && message["type"].get<std::string_view>() == "request-keyframe";
+    } catch (const json::exception &) {
+      return false;
+    }
   }
 }  // namespace webrtc_stream::protocol

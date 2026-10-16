@@ -160,3 +160,43 @@ TEST(WebrtcProtocolTest, IncludesSettingsInSessionStatus) {
   EXPECT_TRUE(message.at("video").at("hdr"));
   EXPECT_EQ(message.at("audio").at("sampleRate"), 48000);
 }
+
+TEST(WebrtcProtocolTest, RecognizesKeyframeRequests) {
+  EXPECT_TRUE(is_keyframe_request(R"({"v":1,"type":"request-keyframe","reason":"stall"})"));
+  EXPECT_TRUE(is_keyframe_request(R"({"type":"request-keyframe"})"));
+}
+
+TEST(WebrtcProtocolTest, RejectsOtherControlMessagesAsKeyframeRequests) {
+  EXPECT_FALSE(is_keyframe_request(R"({"v":1,"type":"gamepad-connected","index":0})"));
+  EXPECT_FALSE(is_keyframe_request(R"({"type":"gamepad-connected","id":"request-keyframe"})"));
+  EXPECT_FALSE(is_keyframe_request(R"({"type":7,"note":"request-keyframe"})"));
+  EXPECT_FALSE(is_keyframe_request(R"(["request-keyframe"])"));
+  EXPECT_FALSE(is_keyframe_request(R"({"type":"request-keyframe")"));
+  EXPECT_FALSE(is_keyframe_request(""));
+}
+
+TEST(WebrtcProtocolTest, ParsesClientLogLines) {
+  const auto message = parse_client_message(R"({"version":2,"type":"client-log","lines":["Video stalled","second\nline\twith controls"]})");
+  const auto *log = std::get_if<client_log_t>(&message.payload);
+  ASSERT_NE(log, nullptr);
+  ASSERT_EQ(log->lines.size(), 2U);
+  EXPECT_EQ(log->lines[0], "Video stalled");
+  EXPECT_EQ(log->lines[1], "second line with controls");
+}
+
+TEST(WebrtcProtocolTest, CutsLongClientLogLines) {
+  const nlohmann::json request = {{"version", 2}, {"type", "client-log"}, {"lines", {std::string(MAX_CLIENT_LOG_LINE_LENGTH + 10, 'x')}}};
+  const auto message = parse_client_message(request.dump());
+  EXPECT_EQ(std::get<client_log_t>(message.payload).lines.at(0).size(), MAX_CLIENT_LOG_LINE_LENGTH);
+}
+
+TEST(WebrtcProtocolTest, RejectsMalformedClientLogs) {
+  EXPECT_THROW(parse_client_message(R"({"version":2,"type":"client-log","lines":"one line"})"), protocol_error_t);
+  EXPECT_THROW(parse_client_message(R"({"version":2,"type":"client-log","lines":[1]})"), protocol_error_t);
+  EXPECT_THROW(parse_client_message(R"({"version":2,"type":"client-log"})"), protocol_error_t);
+  nlohmann::json too_many = {{"version", 2}, {"type", "client-log"}, {"lines", nlohmann::json::array()}};
+  for (std::size_t index = 0; index <= MAX_CLIENT_LOG_LINES; ++index) {
+    too_many["lines"].push_back("line");
+  }
+  EXPECT_THROW(parse_client_message(too_many.dump()), protocol_error_t);
+}
