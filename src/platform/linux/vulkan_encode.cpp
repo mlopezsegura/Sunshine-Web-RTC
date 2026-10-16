@@ -450,7 +450,8 @@ namespace vk {
       height = in_height;
       offset_x = in_offset_x;
       offset_y = in_offset_y;
-      this->data = (void *) &init_hw_device;
+      hardware = true;
+      avcodec_encode_device_t::init_hw_device = &init_hw_device;
       return 0;
     }
 
@@ -591,11 +592,11 @@ namespace vk {
     void apply_colorspace() override {
       auto *colors = video::color_vectors_from_colorspace(colorspace, true);
       if (colors) {
-        memcpy(push.color_vec_y.data(), colors->color_vec_y, sizeof(push.color_vec_y));
-        memcpy(push.color_vec_u.data(), colors->color_vec_u, sizeof(push.color_vec_u));
-        memcpy(push.color_vec_v.data(), colors->color_vec_v, sizeof(push.color_vec_v));
-        memcpy(push.range_y.data(), colors->range_y, sizeof(push.range_y));
-        memcpy(push.range_uv.data(), colors->range_uv, sizeof(push.range_uv));
+        push.color_vec_y = colors->color_vec_y;
+        push.color_vec_u = colors->color_vec_u;
+        push.color_vec_v = colors->color_vec_v;
+        push.range_y = colors->range_y;
+        push.range_uv = colors->range_uv;
       }
     }
 

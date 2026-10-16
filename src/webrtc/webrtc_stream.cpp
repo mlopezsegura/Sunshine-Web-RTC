@@ -1660,12 +1660,13 @@ namespace webrtc_stream {
         const auto epoch = std::chrono::steady_clock::now();
         std::jthread video_capture([mail, video_config, stream] {
           platf::set_thread_name("webrtc::video");
-          video::capture(mail, video_config, stream.get());
+          // The packets come back through this stream's own queues, so no GameStream session rides with them.
+          video::capture(mail, video_config, nullptr);
           stream->request_stop("Video capture stopped");
         });
         std::jthread audio_capture([mail, audio_config, stream] {
           platf::set_thread_name("webrtc::audio");
-          audio::capture(mail, audio_config, stream.get());
+          audio::capture(mail, audio_config, nullptr);
         });
         std::jthread video_sender([video_packets, stream, epoch] {
           platf::set_thread_name("webrtc::video_send");
