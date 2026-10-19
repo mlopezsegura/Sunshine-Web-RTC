@@ -80,7 +80,7 @@ only when no Moonlight session and no other TV stream is running, and calls
 
 | File | Change |
 |---|---|
-| `cmake/dependencies/libdatachannel.cmake` (new) | Uses a system `LibDataChannel` ≥ 0.24 when available, otherwise `FetchContent` of v0.24.6 with its `plog`, `usrsctp`, `libjuice` and `libsrtp` submodules, built static, with OpenSSL (Sunshine's), media and WebSocket support, and no examples or tests. libSRTP's `ENABLE_WARNINGS_AS_ERRORS` is turned off because MinGW printf-format warnings break it, and Sunshine's own nlohmann_json is reused. |
+| `cmake/dependencies/libdatachannel.cmake` (new) | Uses a system `LibDataChannel` ≥ 0.24 when available, otherwise `FetchContent` of v0.24.6 with its `plog`, `usrsctp`, `libjuice` and `libsrtp` submodules, built static, with OpenSSL (Sunshine's), media and WebSocket support, and no examples or tests. libSRTP's `ENABLE_WARNINGS_AS_ERRORS` is turned off because MinGW printf-format warnings break it, and Sunshine's own nlohmann_json is reused. Its `src/configuration.cpp` is compiled with `-include algorithm`: v0.24.6 uses `std::transform` without including `<algorithm>`, which libc++ (Windows ARM64) does not include transitively; drop this once a newer release is used. |
 | `cmake/dependencies/common.cmake` | Includes it after nlohmann_json. |
 | `cmake/compile_definitions/common.cmake` | Adds `src/webrtc/*` to `SUNSHINE_TARGET_FILES` and `${SUNSHINE_LIBDATACHANNEL_TARGET}` to `SUNSHINE_EXTERNAL_LIBRARIES`. |
 
