@@ -28,8 +28,9 @@ for name in "${!topics[@]}"; do
   git diff "$base" HEAD -- ${topics[$name]} > "patches/$name.patch"
 done
 
-# Every change outside PATCHES.md, patches/ and this script must belong to a topic.
-uncovered="$(git diff --name-only "$base" HEAD -- . ':!PATCHES.md' ':!patches/' ':!scripts/webrtc/' \
+# Every change outside PATCHES.md, patches/, this script and the fork's release workflow must belong
+# to a topic.
+uncovered="$(git diff --name-only "$base" HEAD -- . ':!PATCHES.md' ':!patches/' ':!scripts/webrtc/' ':!.github/workflows/ci-webrtc.yml' \
   ':!src/thread_safe.h' ':!src/globals.h' ':!src/video.cpp' ':!src/audio.cpp' \
   ':!src/config.h' ':!src/config.cpp' ':!src/main.cpp' ':!src/nvhttp.cpp' ':!src/confighttp.cpp' \
   ':!cmake/' ':!src/webrtc/' ':!src_assets/' ':!tests/' ':!README.md' ':!docs/')"
@@ -45,9 +46,9 @@ git worktree add -q --detach "$check" "$base"
 git -C "$check" apply --whitespace=nowarn "$root"/patches/*.patch
 git -C "$check" add -A
 fork="$(git rev-parse HEAD)"
-if ! git -C "$check" diff --cached --quiet "$fork" -- . ':!PATCHES.md' ':!patches/' ':!scripts/webrtc/'; then
+if ! git -C "$check" diff --cached --quiet "$fork" -- . ':!PATCHES.md' ':!patches/' ':!scripts/webrtc/' ':!.github/workflows/ci-webrtc.yml'; then
   echo "Applying patches/ to $base does not reproduce this fork:" >&2
-  git -C "$check" diff --cached --stat "$fork" -- . ':!PATCHES.md' ':!patches/' ':!scripts/webrtc/' >&2
+  git -C "$check" diff --cached --stat "$fork" -- . ':!PATCHES.md' ':!patches/' ':!scripts/webrtc/' ':!.github/workflows/ci-webrtc.yml' >&2
   exit 1
 fi
 echo "patches/ reproduces this fork on $base"

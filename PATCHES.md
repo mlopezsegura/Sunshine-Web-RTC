@@ -28,7 +28,8 @@ one are not started, so their ports stay closed.
 ## The patch set
 
 `patches/` holds the whole fork as seven topic patches. Applied in order to the upstream base they
-reproduce this repository exactly (apart from this file, `patches/` and `scripts/webrtc/`):
+reproduce this repository exactly (apart from this file, `patches/`, `scripts/webrtc/` and
+`.github/workflows/ci-webrtc.yml`):
 
 ```sh
 git apply patches/*.patch
@@ -132,6 +133,14 @@ The upstream config-consistency test requires every new option in `config_tabs.j
 
 `README.md` gets a note pointing at the guide; `docs/configuration.md` documents the four options;
 `docs/api.md` is untouched, since TVs use the existing endpoints; `docs/moonlight_webrtc_tizen.md` is the guide.
+
+## Releases
+
+`.github/workflows/ci-webrtc.yml` is upstream's `ci.yml` reduced to the Windows build: every push to
+`master` is built by the unchanged `ci-windows.yml` and published as a pre-release tagged with the
+commit's date (`vYYYY.MDD.HHMMSS`), using this repository's token instead of LizardByte's bot. Pull
+requests are built and tested only. Upstream's `ci.yml` and its other automatic workflows are disabled
+in the repository's Actions settings, so upstream merges keep their workflow files unchanged.
 
 ## Verification of this revision
 
