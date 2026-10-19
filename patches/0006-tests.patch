@@ -1,3 +1,27 @@
+diff --git a/tests/unit/test_audio.cpp b/tests/unit/test_audio.cpp
+index 8561cb3d..88031dc9 100644
+--- a/tests/unit/test_audio.cpp
++++ b/tests/unit/test_audio.cpp
+@@ -12,7 +12,7 @@
+ #include <src/stream.h>
+ 
+ namespace audio {
+-  void encodeThread(std::shared_ptr<safe::queue_t<std::vector<float>>> samples, config_t config, stream::session_t *channel_data);
++  void encodeThread(std::shared_ptr<safe::queue_t<std::vector<float>>> samples, safe::mail_raw_t::queue_t<packet_t> packets, config_t config, stream::session_t *channel_data);
+ }
+ 
+ using namespace audio;
+@@ -42,8 +42,8 @@ TEST(AudioPacketSessionTest, EncoderPreservesTheReceivingSession) {
+   config_t config {.packetDuration = 5, .channels = 2, .mask = 0x3};
+   auto samples = std::make_shared<safe::queue_t<std::vector<float>>>();
+   auto packets = mail::man->queue<packet_t>(mail::audio_packets);
+-  std::jthread worker([&samples, &config, &session] {
+-    audio::encodeThread(samples, config, session.get());
++  std::jthread worker([&samples, &packets, &config, &session] {
++    audio::encodeThread(samples, packets, config, session.get());
+   });
+   auto stop_worker = util::fail_guard([&samples] {
+     samples->stop();
 diff --git a/tests/unit/webrtc/test_webrtc_input_bridge.cpp b/tests/unit/webrtc/test_webrtc_input_bridge.cpp
 new file mode 100644
 index 00000000..d4d98269
@@ -264,10 +288,10 @@ index 00000000..d4d98269
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_protocol.cpp b/tests/unit/webrtc/test_webrtc_protocol.cpp
 new file mode 100644
-index 00000000..2c8e1eee
+index 00000000..fceccbf2
 --- /dev/null
 +++ b/tests/unit/webrtc/test_webrtc_protocol.cpp
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,202 @@
 +/**
 + * @file tests/unit/webrtc/test_webrtc_protocol.cpp
 + * @brief Tests for the Moonlight WebRTC TV protocol.
@@ -429,6 +453,46 @@ index 00000000..2c8e1eee
 +  EXPECT_EQ(message.at("video").at("codec"), "av1");
 +  EXPECT_TRUE(message.at("video").at("hdr"));
 +  EXPECT_EQ(message.at("audio").at("sampleRate"), 48000);
++}
++
++TEST(WebrtcProtocolTest, RecognizesKeyframeRequests) {
++  EXPECT_TRUE(is_keyframe_request(R"({"v":1,"type":"request-keyframe","reason":"stall"})"));
++  EXPECT_TRUE(is_keyframe_request(R"({"type":"request-keyframe"})"));
++}
++
++TEST(WebrtcProtocolTest, RejectsOtherControlMessagesAsKeyframeRequests) {
++  EXPECT_FALSE(is_keyframe_request(R"({"v":1,"type":"gamepad-connected","index":0})"));
++  EXPECT_FALSE(is_keyframe_request(R"({"type":"gamepad-connected","id":"request-keyframe"})"));
++  EXPECT_FALSE(is_keyframe_request(R"({"type":7,"note":"request-keyframe"})"));
++  EXPECT_FALSE(is_keyframe_request(R"(["request-keyframe"])"));
++  EXPECT_FALSE(is_keyframe_request(R"({"type":"request-keyframe")"));
++  EXPECT_FALSE(is_keyframe_request(""));
++}
++
++TEST(WebrtcProtocolTest, ParsesClientLogLines) {
++  const auto message = parse_client_message(R"({"version":2,"type":"client-log","lines":["Video stalled","second\nline\twith controls"]})");
++  const auto *log = std::get_if<client_log_t>(&message.payload);
++  ASSERT_NE(log, nullptr);
++  ASSERT_EQ(log->lines.size(), 2U);
++  EXPECT_EQ(log->lines[0], "Video stalled");
++  EXPECT_EQ(log->lines[1], "second line with controls");
++}
++
++TEST(WebrtcProtocolTest, CutsLongClientLogLines) {
++  const nlohmann::json request = {{"version", 2}, {"type", "client-log"}, {"lines", {std::string(MAX_CLIENT_LOG_LINE_LENGTH + 10, 'x')}}};
++  const auto message = parse_client_message(request.dump());
++  EXPECT_EQ(std::get<client_log_t>(message.payload).lines.at(0).size(), MAX_CLIENT_LOG_LINE_LENGTH);
++}
++
++TEST(WebrtcProtocolTest, RejectsMalformedClientLogs) {
++  EXPECT_THROW(parse_client_message(R"({"version":2,"type":"client-log","lines":"one line"})"), protocol_error_t);
++  EXPECT_THROW(parse_client_message(R"({"version":2,"type":"client-log","lines":[1]})"), protocol_error_t);
++  EXPECT_THROW(parse_client_message(R"({"version":2,"type":"client-log"})"), protocol_error_t);
++  nlohmann::json too_many = {{"version", 2}, {"type", "client-log"}, {"lines", nlohmann::json::array()}};
++  for (std::size_t index = 0; index <= MAX_CLIENT_LOG_LINES; ++index) {
++    too_many["lines"].push_back("line");
++  }
++  EXPECT_THROW(parse_client_message(too_many.dump()), protocol_error_t);
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_sdp.cpp b/tests/unit/webrtc/test_webrtc_sdp.cpp
 new file mode 100644

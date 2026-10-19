@@ -41,10 +41,10 @@ index 9cc17c85..56049ea5 100644
  pkg_check_modules(CURL REQUIRED libcurl)
 diff --git a/cmake/dependencies/libdatachannel.cmake b/cmake/dependencies/libdatachannel.cmake
 new file mode 100644
-index 00000000..ac991667
+index 00000000..2f9b13fd
 --- /dev/null
 +++ b/cmake/dependencies/libdatachannel.cmake
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,62 @@
 +#
 +# Loads libdatachannel for the Moonlight WebRTC TV stream, giving the priority to the system package first,
 +# with a fallback to FetchContent. MSYS2 does not package libdatachannel, so Windows builds use the fallback.
@@ -96,6 +96,12 @@ index 00000000..ac991667
 +FetchContent_MakeAvailable(libdatachannel)
 +set(BUILD_SHARED_LIBS "${_sunshine_build_shared_libs}")
 +unset(_sunshine_build_shared_libs)
++
++# v0.24.6 uses std::transform in configuration.cpp without including <algorithm>. libstdc++ includes it
++# transitively, libc++ (Windows ARM64 with clang) does not. Fixed upstream after v0.24.6.
++set_source_files_properties("${libdatachannel_SOURCE_DIR}/src/configuration.cpp"
++        TARGET_DIRECTORY datachannel-static
++        PROPERTIES COMPILE_OPTIONS "-include;algorithm")
 +
 +set(SUNSHINE_LIBDATACHANNEL_TARGET LibDataChannel::LibDataChannelStatic)
 +if(NOT TARGET ${SUNSHINE_LIBDATACHANNEL_TARGET})

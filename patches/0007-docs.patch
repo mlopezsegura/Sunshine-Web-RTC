@@ -14,10 +14,10 @@ index 2f65f3f9..8bad65ba 100644
    <!-- Keep whitespace outside the badge links to avoid an underlined gap. -->
    <!-- Use raw HTML aliases to keep Doxygen's emitted comment delimiters balanced. -->
 diff --git a/docs/configuration.md b/docs/configuration.md
-index fb6ce69c..bf845efb 100644
+index e19ddd15..55920e78 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
-@@ -1880,6 +1880,134 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
+@@ -1914,6 +1914,134 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
      </tr>
  </table>
  

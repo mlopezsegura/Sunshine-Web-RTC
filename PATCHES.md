@@ -8,7 +8,7 @@ how to carry it to a newer Sunshine. The user-facing guide is
 
 | | |
 |---|---|
-| Upstream base | `0594f62d` — *chore: update global workflows (#5868)*, tag `v2026.1006.152353` |
+| Upstream base | `5b2a4cfd` — *chore(deps): update dependency @lucide/vue to v1.58.0 (#5945)*, after tag `v2026.1015.174736` |
 | Fork branch | `master` (development on `webrtc-tizen`) |
 | WebRTC library | libdatachannel v0.24.6, built from source when no system package exists |
 | Footprint in upstream files | 17 files, +441 / −14 lines; the rest is new files |

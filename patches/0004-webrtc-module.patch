@@ -1093,10 +1093,10 @@ index 00000000..6acae118
 +}  // namespace webrtc_stream
 diff --git a/src/webrtc/protocol.cpp b/src/webrtc/protocol.cpp
 new file mode 100644
-index 00000000..043d8953
+index 00000000..1ed31157
 --- /dev/null
 +++ b/src/webrtc/protocol.cpp
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,510 @@
 +/**
 + * @file src/webrtc/protocol.cpp
 + * @brief Definitions for the Moonlight WebRTC TV protocol (version 2).
@@ -1134,6 +1134,37 @@ index 00000000..043d8953
 +      if (!message.contains("version") || !message.at("version").is_number_integer() || message.at("version").get<int>() != VERSION) {
 +        throw protocol_error_t("unsupported-version", "Protocol version 2 is required");
 +      }
++    }
++
++    /**
++     * @brief Read the lines of a `client-log` message.
++     *
++     * Each line becomes one line of Sunshine's log, so control characters, which would let a
++     * line pass itself off as several, are replaced and long lines are cut.
++     * @param message Parsed message.
++     * @return The lines.
++     */
++    std::vector<std::string> client_log_lines(const json &message) {
++      const auto &lines = message.at("lines");
++      if (!lines.is_array() || lines.size() > MAX_CLIENT_LOG_LINES) {
++        throw protocol_error_t("invalid-message", "lines must be an array of at most 100 strings");
++      }
++      std::vector<std::string> result;
++      result.reserve(lines.size());
++      for (const auto &line : lines) {
++        if (!line.is_string()) {
++          throw protocol_error_t("invalid-message", "lines must be an array of at most 100 strings");
++        }
++        auto text = line.get<std::string>();
++        if (text.size() > MAX_CLIENT_LOG_LINE_LENGTH) {
++          text.resize(MAX_CLIENT_LOG_LINE_LENGTH);
++        }
++        std::ranges::replace_if(text, [](unsigned char character) {
++          return character < 0x20 || character == 0x7F;
++        }, ' ');
++        result.push_back(std::move(text));
++      }
++      return result;
 +    }
 +
 +    /**
@@ -1407,6 +1438,9 @@ index 00000000..043d8953
 +      if (type == "candidate") {
 +        return {type, candidate_t {session_id(message), message.at("candidate").get<std::string>(), message.at("mid").get<std::string>()}};
 +      }
++      if (type == "client-log") {
++        return {type, client_log_t {client_log_lines(message)}};
++      }
 +      throw protocol_error_t("unsupported-message", "Unsupported message type: " + type);
 +    } catch (const protocol_error_t &) {
 +      throw;
@@ -1560,13 +1594,25 @@ index 00000000..043d8953
 +    message.update({{"sessionId", session_id_value}, {"candidate", candidate}, {"mid", mid}});
 +    return message;
 +  }
++
++  bool is_keyframe_request(std::string_view text) {
++    if (text.find("request-keyframe") == std::string_view::npos) {
++      return false;
++    }
++    try {
++      const auto message = json::parse(text);
++      return message.is_object() && message.contains("type") && message["type"].is_string() && message["type"].get<std::string_view>() == "request-keyframe";
++    } catch (const json::exception &) {
++      return false;
++    }
++  }
 +}  // namespace webrtc_stream::protocol
 diff --git a/src/webrtc/protocol.h b/src/webrtc/protocol.h
 new file mode 100644
-index 00000000..657ff023
+index 00000000..36cf41bb
 --- /dev/null
 +++ b/src/webrtc/protocol.h
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,444 @@
 +/**
 + * @file src/webrtc/protocol.h
 + * @brief Declarations for the Moonlight WebRTC TV protocol (version 2).
@@ -1804,9 +1850,26 @@ index 00000000..657ff023
 +  };
 +
 +  /**
++   * @brief Lines of the TV application's own log, written into Sunshine's log.
++   */
++  struct client_log_t {
++    std::vector<std::string> lines;  ///< Log lines, single-line and bounded in length.
++  };
++
++  /**
++   * @brief Largest number of lines one `client-log` message may carry.
++   */
++  constexpr std::size_t MAX_CLIENT_LOG_LINES = 100;
++
++  /**
++   * @brief Longest client log line kept; longer lines are cut.
++   */
++  constexpr std::size_t MAX_CLIENT_LOG_LINE_LENGTH = 4000;
++
++  /**
 +   * @brief Any message the TV may send.
 +   */
-+  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t>;
++  using client_payload_t = std::variant<authenticate_t, request_pairing_t, get_apps_t, get_app_artwork_t, start_session_t, stop_session_t, stop_host_session_t, switch_session_t, answer_t, candidate_t, client_log_t>;
 +
 +  /**
 +   * @brief A parsed TV message.
@@ -1851,6 +1914,16 @@ index 00000000..657ff023
 +   * @throws protocol_error_t for malformed or unsupported messages.
 +   */
 +  client_message_t parse_client_message(std::string_view text);
++
++  /**
++   * @brief Check whether a control-channel message is the TV app asking for a keyframe.
++   *
++   * The TV sends `{"type": "request-keyframe"}` when its picture stops advancing while video
++   * still arrives, a stall its WebRTC stack does not always answer with a PLI of its own.
++   * @param text Control-channel message.
++   * @return True for a `request-keyframe` message, false for anything else or malformed JSON.
++   */
++  bool is_keyframe_request(std::string_view text);
 +
 +  /**
 +   * @brief Build the greeting carrying the authentication nonce.
@@ -2795,10 +2868,10 @@ index 00000000..406ed408
 +}  // namespace webrtc_stream::tv_auth
 diff --git a/src/webrtc/webrtc_stream.cpp b/src/webrtc/webrtc_stream.cpp
 new file mode 100644
-index 00000000..2770fca1
+index 00000000..d7f4fae5
 --- /dev/null
 +++ b/src/webrtc/webrtc_stream.cpp
-@@ -0,0 +1,1994 @@
+@@ -0,0 +1,2145 @@
 +/**
 + * @file src/webrtc/webrtc_stream.cpp
 + * @brief Definitions for streaming to Moonlight WebRTC TVs directly from Sunshine.
@@ -3090,6 +3163,76 @@ index 00000000..2770fca1
 +    }
 +
 +    /**
++     * @brief Bytes sent per millisecond at most: 80% of 1 Gbps, the GameStream sender's rate.
++     */
++    constexpr std::size_t PACED_BYTES_PER_MS = 1'000'000'000ULL * 80 / 100 / 8 / 1000;
++
++    /**
++     * @brief Paces a frame's RTP packets the way the GameStream sender does.
++     *
++     * The packetizer hands over a whole frame at once. A 4K keyframe is hundreds of packets,
++     * and written back to back they overflow the UDP socket's send buffer, which drops them
++     * without telling anyone. The TV is left without the keyframe it asked for, asks again and
++     * receives another burst, and the picture stays black while audio, a few small packets
++     * at a time, carries on. Sending a millisecond's worth at most, then waiting for the next
++     * millisecond, keeps every frame inside the buffer at the cost of a few milliseconds on the
++     * largest ones. It is the last handler of the chain and runs on the video sender thread,
++     * which has nothing else to do meanwhile; NACK retransmissions do not pass through it.
++     */
++    class frame_pacer_t final: public rtc::MediaHandler {
++    public:
++      void outgoing(rtc::message_vector &messages, const rtc::message_callback &send) override {
++        if (!_timer) {
++          _timer = platf::create_high_precision_timer();
++        }
++        // A frame that follows a large one closely starts where that one's pacing ended.
++        const auto frame_start = std::max(_next_frame_start, std::chrono::steady_clock::now());
++        std::size_t frame_bytes = 0;
++        std::size_t group_bytes = 0;
++        for (auto &message : messages) {
++          if (group_bytes >= PACED_BYTES_PER_MS) {
++            wait_until(frame_start + paced_duration(frame_bytes));
++            group_bytes = 0;
++          }
++          frame_bytes += message->size();
++          group_bytes += message->size();
++          send(std::move(message));
++        }
++        messages.clear();
++        _next_frame_start = frame_start + paced_duration(frame_bytes);
++      }
++
++    private:
++      /**
++       * @brief Time the given number of bytes takes at the paced rate.
++       * @param bytes Bytes sent.
++       * @return Duration.
++       */
++      static std::chrono::nanoseconds paced_duration(std::size_t bytes) {
++        return std::chrono::nanoseconds {std::chrono::nanoseconds {1ms}.count() * static_cast<std::int64_t>(bytes) / static_cast<std::int64_t>(PACED_BYTES_PER_MS)};
++      }
++
++      /**
++       * @brief Sleep until a point in time, precisely when the platform allows it.
++       * @param due When to wake.
++       */
++      void wait_until(std::chrono::steady_clock::time_point due) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now >= due) {
++          return;
++        }
++        if (_timer && *_timer) {
++          _timer->sleep_for(due - now);
++        } else {
++          std::this_thread::sleep_until(due);
++        }
++      }
++
++      std::unique_ptr<platf::high_precision_timer> _timer;  ///< Created on the sending thread.
++      std::chrono::steady_clock::time_point _next_frame_start {};  ///< When the previous frame's pacing ends.
++    };
++
++    /**
 +     * @brief One WebRTC stream: its PeerConnection and, once connected, its capture pipeline.
 +     */
 +    struct stream_t {
@@ -3119,6 +3262,9 @@ index 00000000..2770fca1
 +      bool stop_requested = false;  ///< The stream must end.
 +      std::optional<std::string> failure;  ///< Why the host ended the stream.
 +      safe::mail_raw_t::event_t<bool> idr_event;  ///< Keyframe requests, once capture runs.
++      std::uint32_t pli_requests = 0;  ///< Keyframes the TV's WebRTC stack asked for since the last log line.
++      std::uint32_t watchdog_requests = 0;  ///< Keyframes the TV app's stall watchdog asked for since the last log line.
++      std::chrono::steady_clock::time_point last_request_log {};  ///< When keyframe requests were last logged.
 +
 +      std::mutex candidate_mutex;  ///< Protects candidate buffering.
 +      bool has_remote_description = false;  ///< Whether the answer was applied.
@@ -3139,6 +3285,28 @@ index 00000000..2770fca1
 +          stop_requested = true;
 +        }
 +        condition.notify_all();
++      }
++
++      /**
++       * @brief Encode the next frame as IDR, logging the requests at most once a second.
++       *
++       * A PLI storm would otherwise flood the log, while a single line per second still shows
++       * whether the TV asked at all while its picture was black.
++       * @param from_watchdog Whether the TV app asked because its picture stopped, rather than its WebRTC stack through PLI.
++       */
++      void request_keyframe(bool from_watchdog) {
++        std::lock_guard lock(mutex);
++        ++(from_watchdog ? watchdog_requests : pli_requests);
++        if (idr_event) {
++          idr_event->raise(true);
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last_request_log >= 1s) {
++          BOOST_LOG(info) << "WebRTC: session "sv << id << " keyframe requested: "sv << pli_requests << " PLI, "sv << watchdog_requests << " from the TV stall watchdog"sv;
++          pli_requests = 0;
++          watchdog_requests = 0;
++          last_request_log = now;
++        }
 +      }
 +
 +      /**
@@ -3619,6 +3787,8 @@ index 00000000..2770fca1
 +            handle_answer(connection, *answer);
 +          } else if (const auto *candidate = std::get_if<protocol::candidate_t>(&message.payload)) {
 +            handle_candidate(connection, *candidate);
++          } else if (const auto *client_log = std::get_if<protocol::client_log_t>(&message.payload)) {
++            write_client_log(connection, *client_log);
 +          }
 +        } catch (const protocol::protocol_error_t &e) {
 +          BOOST_LOG(warning) << "WebRTC: protocol error: "sv << e.what();
@@ -3626,6 +3796,25 @@ index 00000000..2770fca1
 +        } catch (const std::exception &e) {
 +          BOOST_LOG(error) << "WebRTC: control error: "sv << e.what();
 +          send(connection, protocol::make_error("unknown", "internal-error", e.what()));
++        }
++      }
++
++      /**
++       * @brief Write the TV application's log lines into Sunshine's log.
++       *
++       * What the TV saw - a stall, a recovery, its decoder counters - then sits in one file
++       * next to what Sunshine did at the same moment, with no tooling needed on the TV.
++       * @param connection Connection.
++       * @param client_log Lines sent by the TV.
++       */
++      void write_client_log(const std::shared_ptr<connection_t> &connection, const protocol::client_log_t &client_log) {
++        std::string name;
++        {
++          std::lock_guard lock(connection->mutex);
++          name = connection->client_name;
++        }
++        for (const auto &line : client_log.lines) {
++          BOOST_LOG(info) << "WebRTC TV "sv << name << ": "sv << line;
 +        }
 +      }
 +
@@ -4034,7 +4223,13 @@ index 00000000..2770fca1
 +        stream->control_channel = stream->peer->createDataChannel("control", control_options);
 +        stream->control_channel->onMessage([weak_stream](rtc::message_variant data) {
 +          const auto stream = weak_stream.lock();
-+          if (stream && std::holds_alternative<std::string>(data) && !stream->input_bridge->handle_control_message(std::get<std::string>(data))) {
++          if (!stream || !std::holds_alternative<std::string>(data)) {
++            return;
++          }
++          const auto &text = std::get<std::string>(data);
++          if (protocol::is_keyframe_request(text)) {
++            stream->request_keyframe(true);
++          } else if (!stream->input_bridge->handle_control_message(text)) {
 +            BOOST_LOG(warning) << "WebRTC: rejected malformed gamepad control message"sv;
 +          }
 +        });
@@ -4103,11 +4298,9 @@ index 00000000..2770fca1
 +            return;
 +          }
 +          // Sunshine encodes the next frame as IDR; no intermediate client has to ask for it.
-+          std::lock_guard lock(stream->mutex);
-+          if (stream->idr_event) {
-+            stream->idr_event->raise(true);
-+          }
++          stream->request_keyframe(false);
 +        }));
++        packetizer->addToChain(std::make_shared<frame_pacer_t>());
 +        stream->video_track->setMediaHandler(packetizer);
 +        stream->video_track->onOpen([weak_stream] {
 +          if (const auto stream = weak_stream.lock()) {
@@ -4341,24 +4534,41 @@ index 00000000..2770fca1
 +        const auto epoch = std::chrono::steady_clock::now();
 +        std::jthread video_capture([mail, video_config, stream] {
 +          platf::set_thread_name("webrtc::video");
-+          video::capture(mail, video_config, stream.get());
++          // The packets come back through this stream's own queues, so no GameStream session rides with them.
++          video::capture(mail, video_config, nullptr);
 +          stream->request_stop("Video capture stopped");
 +        });
 +        std::jthread audio_capture([mail, audio_config, stream] {
 +          platf::set_thread_name("webrtc::audio");
-+          audio::capture(mail, audio_config, stream.get());
++          audio::capture(mail, audio_config, nullptr);
 +        });
 +        std::jthread video_sender([video_packets, stream, epoch] {
 +          platf::set_thread_name("webrtc::video_send");
 +          platf::adjust_thread_priority(platf::thread_priority_e::high);
 +          std::optional<std::uint32_t> last_timestamp;
 +          const std::uint32_t frame_ticks = VIDEO_CLOCK_RATE / std::max(1, stream->settings.fps);
++          // IDR frames are logged at most once a second, with the largest one, so a black
++          // picture on the TV can be matched against whether keyframes were actually sent.
++          std::uint32_t idr_frames = 0;
++          std::size_t largest_idr = 0;
++          std::chrono::steady_clock::time_point last_idr_log {};
 +          while (auto packet = video_packets->pop()) {
 +            std::string_view payload {reinterpret_cast<const char *>(packet->data()), packet->data_size()};
 +            std::vector<std::uint8_t> replaced;
 +            if (packet->is_idr() && packet->replacements) {
 +              replaced = apply_replacements(payload, *packet->replacements);
 +              payload = {reinterpret_cast<const char *>(replaced.data()), replaced.size()};
++            }
++            if (packet->is_idr()) {
++              ++idr_frames;
++              largest_idr = std::max(largest_idr, payload.size());
++              const auto now = std::chrono::steady_clock::now();
++              if (now - last_idr_log >= 1s) {
++                BOOST_LOG(info) << "WebRTC: session "sv << stream->id << " sent "sv << idr_frames << " IDR frame(s), largest "sv << largest_idr / 1024 << " KiB"sv;
++                idr_frames = 0;
++                largest_idr = 0;
++                last_idr_log = now;
++              }
 +            }
 +            // The capture time drives the RTP clock so the TV paces frames as they were captured.
 +            auto timestamp = last_timestamp ? *last_timestamp + frame_ticks : 0U;
@@ -4706,11 +4916,25 @@ index 00000000..2770fca1
 +      BOOST_LOG(info) << "WebRTC: TV server disabled by stream_protocol"sv;
 +      return;
 +    }
-+    rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string &message) {
++    // libjuice reports a full send buffer, which silently drops a packet, only at Info level.
++    // It is the one Info message worth seeing, so it is let through and summarized each second.
++    rtc::InitLogger(rtc::LogLevel::Info, [](rtc::LogLevel level, const std::string &message) {
 +      if (level <= rtc::LogLevel::Error) {
 +        BOOST_LOG(error) << "libdatachannel: "sv << message;
-+      } else {
++      } else if (level == rtc::LogLevel::Warning) {
 +        BOOST_LOG(warning) << "libdatachannel: "sv << message;
++      } else if (message.find("buffer is full"sv) != std::string::npos) {
++        static std::mutex dropped_mutex;
++        static std::uint64_t dropped = 0;
++        static std::chrono::steady_clock::time_point last_log {};
++        std::lock_guard lock(dropped_mutex);
++        ++dropped;
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last_log >= 1s) {
++          BOOST_LOG(warning) << "WebRTC: UDP send buffer full, "sv << dropped << " packet(s) dropped since the last report"sv;
++          dropped = 0;
++          last_log = now;
++        }
 +      }
 +    });
 +    rtc::Preload();
