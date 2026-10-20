@@ -9,9 +9,11 @@
 #include <bitset>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef SUNSHINE_BUILD_WAYLAND
@@ -31,15 +33,144 @@
 
 struct gbm_bo;
 struct gbm_device;
+struct _drmDevice;
 
 namespace wl {
+  /**
+   * @brief PCI bus address identifying one GPU.
+   */
+  struct pci_bus_id {
+    std::uint32_t domain {};  ///< PCI domain number.
+    std::uint8_t bus {};  ///< PCI bus number.
+    std::uint8_t device {};  ///< PCI device number.
+    std::uint8_t function {};  ///< PCI function number.
+
+    /**
+     * @brief Compare two PCI bus addresses for equality.
+     * @return True when domain, bus, device, and function all match.
+     */
+    bool operator==(const pci_bus_id &) const = default;
+  };
+
+  /**
+   * @brief Read the PCI bus id of a DRM render node, without parsing it.
+   *
+   * @param render_path Render node path to query.
+   * @return Raw bus id (e.g. "0000:0f:00.0"), or no value when it cannot be read.
+   */
+  using render_node_pci_reader_t = std::function<std::optional<std::string>(const std::string &render_path)>;
+
+  /**
+   * @brief Read the PCI bus id of a CUDA device, without parsing it.
+   *
+   * @param cuda_index CUDA device index to query.
+   * @return Raw bus id reported by the driver (e.g. "00000000:0F:00.0"),
+   *         or no value when CUDA is unavailable or the query fails.
+   */
+  using cuda_device_pci_reader_t = std::function<std::optional<std::string>(int cuda_index)>;
+
+  /**
+   * @brief Resolve a DRM render node path to its canonical device node.
+   *
+   * @param path Render node path to resolve.
+   * @return Canonical device path supplied by the resolver.
+   */
+  using render_path_resolver_t = std::function<std::string(const std::string &path)>;
+
+  /**
+   * @brief Resolve a DRM render node path, following udev by-path aliases.
+   *
+   * @param path Render node path to resolve, possibly a by-path alias.
+   * @return Canonical device node path, or the input path verbatim when it cannot be resolved.
+   */
+  std::string resolve_drm_node_path(const std::string &path);
+
+  /**
+   * @brief Parse a PCI bus id in sysfs or CUDA form.
+   *
+   * Accepts both the sysfs rendering ("dddd:bb:dd.f") and the CUDA rendering
+   * ("dddddddd:BB:DD.F"); comparison is numeric so width and case differences
+   * do not matter.
+   *
+   * @param bus_id Bus id text to parse.
+   * @return Parsed address, or no value when the text is malformed.
+   */
+  std::optional<pci_bus_id> parse_pci_bus_id(std::string_view bus_id);
+
+  /**
+   * @brief Functions used to query the PCI identity of a DRM render node.
+   */
+  struct drm_device_accessors_t {
+    int (*open_render_node)(const char *path);  ///< Open the render node and return its descriptor, or -1.
+    int (*get_device)(int fd, std::uint32_t flags, _drmDevice **device);  ///< Query the DRM device, returning 0 on success.
+    void (*free_device)(_drmDevice **device);  ///< Release a DRM device returned by the query.
+  };
+
+  /**
+   * @brief Query the PCI bus id of a DRM render node from its device.
+   *
+   * @param render_path Render node path to query.
+   * @return Bus id text, or no value when the node cannot be opened or is not a PCI device.
+   */
+  std::optional<std::string> render_node_pci_bus_id(const std::string &render_path);
+
+  /**
+   * @brief Query the PCI bus id of a DRM render node with injected device operations.
+   *
+   * @param render_path Render node path to query.
+   * @param accessors Device operations used to open and query the node.
+   * @return Bus id text, or no value when the node cannot be opened or is not a PCI device.
+   */
+  std::optional<std::string> render_node_pci_bus_id(const std::string &render_path, const drm_device_accessors_t &accessors);
+
+  /**
+   * @brief Check whether the capture render node is the CUDA encode device.
+   *
+   * Zero-copy VRAM capture hands the compositor's DMA-BUF directly to the
+   * encoder's GL context, which is only valid when capture and encode run on
+   * the same GPU, so identity is compared by PCI bus address. Anything
+   * unprovable (unreadable node, unavailable CUDA, unparsable ids, distinct
+   * addresses) selects the GPU -> RAM -> GPU bridge.
+   *
+   * @param read_render_pci Render node PCI reader; queries the node directly when empty.
+   * @param read_cuda_pci CUDA device PCI reader; queries the driver directly when empty.
+   * @param resolve_path Render node path resolver; resolves aliases directly when empty.
+   * @param cuda_index CUDA device index NVENC encodes on (always 0: video.cpp creates the CUDA hwdevice with a null device string).
+   * @return True when the capture node and the CUDA device share a PCI address.
+   */
+  bool capture_node_is_cuda_device(const render_node_pci_reader_t &read_render_pci = {}, const cuda_device_pci_reader_t &read_cuda_pci = {}, const render_path_resolver_t &resolve_path = {}, int cuda_index = 0);
+
+  /**
+   * @brief Check whether a linear copy buffer should be attempted for the format.
+   *
+   * The linear attempt is only valid when the compositor advertised the linear
+   * modifier for the format; otherwise allocation falls through to the
+   * advertised modifier list.
+   *
+   * @param prefer_linear_copy Whether linear copy buffers are preferred for cross-GPU encode.
+   * @param modifiers Effective modifier list advertised for the format.
+   * @return True only when linear copy is preferred and the linear modifier is advertised.
+   */
+  bool should_attempt_linear_copy(bool prefer_linear_copy, const std::vector<std::uint64_t> &modifiers);
+
+  /**
+   * @brief Look up the advertised modifier list for a DMA-BUF format.
+   *
+   * @param modifiers Modifier map to search, or nullptr when no list is available.
+   * @param format DMA-BUF format to look up.
+   * @return Pointer to the advertised list, or nullptr when the map is missing, the format is absent, or the list is empty.
+   */
+  const std::vector<std::uint64_t> *find_advertised_modifiers(const std::map<std::uint32_t, std::vector<std::uint64_t>> *modifiers, std::uint32_t format);
+
   /**
    * @brief Determine whether wlroots capture should keep frames in VRAM for the requested memory type.
    *
    * @param hwdevice_type Hardware device type requested for capture or encode.
+   * @param read_render_pci Render node PCI reader forwarded to the CUDA-device identity check.
+   * @param read_cuda_pci CUDA device PCI reader forwarded to the CUDA-device identity check.
    * @return `true` when the requested memory type should use the wlroots VRAM path.
    */
-  bool use_vram_capture(platf::mem_type_e hwdevice_type);
+  bool use_vram_capture(platf::mem_type_e hwdevice_type, const render_node_pci_reader_t &read_render_pci = {}, const cuda_device_pci_reader_t &read_cuda_pci = {});
 
   /**
    * @brief Determine whether wlroots capture should ask for frames with `copy_with_damage`.
@@ -214,10 +345,10 @@ namespace wl {
      * @brief Open the render node and create the GBM device on it.
      *
      * @param render_path Path of the DRM render node.
-     * @param accessors Functions used to open the node and create the device.
+     * @param device_accessors Functions used to open the node and create the device.
      * @return `true` when the device is ready, `false` when nothing is held.
      */
-    bool init(const std::string &render_path, const gbm_device_accessors_t &accessors);
+    bool init(const std::string &render_path, const gbm_device_accessors_t &device_accessors);
 
     /**
      * @brief Destroy the GBM device and close the render-node descriptor.
@@ -302,13 +433,14 @@ namespace wl {
      * @brief Start a screencopy request and attach the DMA-BUF listener callbacks.
      *
      * @param screencopy_manager Compositor screencopy manager used to request frames.
-     * @param dmabuf_interface Compositor DMA-BUF interface used to allocate buffers.
-     * @param supported_modifiers DMA-BUF format modifiers supported by the compositor.
+     * @param dmabuf_interface_in Compositor DMA-BUF interface used to allocate buffers.
+     * @param compositor_formats_in DMA-BUF format modifiers supported by the compositor.
      * @param output Wayland output to capture.
      * @param blend_cursor Whether the compositor should include the cursor in the frame.
-     * @param encoder_modifiers Optional modifiers supported by the encoder for format intersection.
+     * @param encoder_formats_in Optional modifiers supported by the encoder for format intersection.
+     * @param prefer_linear_copy_in Allocate linear copy buffers for cross-GPU encode import.
      */
-    void listen(zwlr_screencopy_manager_v1 *screencopy_manager, zwp_linux_dmabuf_v1 *dmabuf_interface, const std::map<std::uint32_t, std::vector<std::uint64_t>> *supported_modifiers, wl_output *output, bool blend_cursor = false, const std::map<std::uint32_t, std::vector<std::uint64_t>> *encoder_modifiers = nullptr);
+    void listen(zwlr_screencopy_manager_v1 *screencopy_manager, zwp_linux_dmabuf_v1 *dmabuf_interface_in, const std::map<std::uint32_t, std::vector<std::uint64_t>> *compositor_formats_in, wl_output *output, bool blend_cursor = false, const std::map<std::uint32_t, std::vector<std::uint64_t>> *encoder_formats_in = nullptr, bool prefer_linear_copy_in = false);
     /**
      * @brief Store the Wayland buffer created for a DMA-BUF parameter request.
      *
@@ -401,9 +533,9 @@ namespace wl {
       return current_frame == &frames[0] ? &frames[1] : &frames[0];
     }
 
-    status_e status;  ///< Current state of the active screencopy request.
+    status_e status {READY};  ///< Current state of the active screencopy request, initially ready.
     bool with_damage {false};  ///< Ask the compositor for the next frame that differs, rather than for a frame now.
-    std::array<frame_t, 2> frames;  ///< Double-buffered frame descriptors.
+    std::array<frame_t, 2> frames {};  ///< Double-buffered frame descriptors.
     frame_t *current_frame;  ///< Frame descriptor currently being filled by the compositor.
     zwlr_screencopy_frame_v1_listener listener;  ///< Callback table registered on screencopy frames.
 
@@ -415,6 +547,7 @@ namespace wl {
     zwp_linux_dmabuf_v1 *dmabuf_interface {nullptr};
     const std::map<std::uint32_t, std::vector<std::uint64_t>> *supported_modifiers {nullptr};
     const std::map<std::uint32_t, std::vector<std::uint64_t>> *encoder_modifiers {nullptr};  ///< Optional encoder modifiers for intersection.
+    bool prefer_linear_copy {false};  ///< Allocate linear copy buffers for cross-GPU encode import.
 
     struct {
       bool supported {false};
@@ -489,24 +622,19 @@ namespace wl {
     void xdg_size(zxdg_output_v1 *, std::int32_t width, std::int32_t height);
 
     /**
-     * @brief Acknowledge completion of an xdg-output metadata update.
+     * @brief Receive completion of an xdg-output metadata update.
      */
-    void xdg_done(zxdg_output_v1 *) {}
+    void xdg_done(zxdg_output_v1 *) {
+      // Size and position callbacks already store the metadata; completion needs no action.
+    }
 
     /**
-     * @brief Receive physical wl-output geometry metadata.
-     *
-     * @param wl_output Wayland output.
-     * @param x Horizontal coordinate reported by Wayland.
-     * @param y Vertical coordinate reported by Wayland.
-     * @param physical_width Physical width in millimeters.
-     * @param physical_height Physical height in millimeters.
-     * @param subpixel Wayland subpixel layout enum.
-     * @param make Monitor manufacturer string reported by Wayland.
-     * @param model Monitor model string reported by Wayland.
-     * @param transform Wayland output transform value.
+     * @brief Ignore physical wl-output geometry; monitor placement comes from xdg-output metadata.
+     * @details Retain the wl-output listener signature while ignoring all event arguments.
      */
-    void wl_geometry(wl_output *wl_output, std::int32_t x, std::int32_t y, std::int32_t physical_width, std::int32_t physical_height, std::int32_t subpixel, const char *make, const char *model, std::int32_t transform) {}
+    void wl_geometry(wl_output *, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, const char *, const char *, std::int32_t) {
+      // Logical placement comes from xdg-output, so physical geometry has nothing to update.
+    }
 
     /**
      * @brief Store the active pixel mode reported by wl-output.
@@ -521,18 +649,19 @@ namespace wl {
 
     /**
      * @brief Acknowledge completion of a wl-output metadata update.
-     *
-     * @param wl_output Wayland output.
+     * @details Retain the wl-output listener signature while ignoring the output argument.
      */
-    void wl_done(wl_output *wl_output) {}
+    void wl_done(wl_output *) {
+      // Metadata is stored as each event arrives; completion requires no additional work.
+    }
 
     /**
-     * @brief Receive the wl-output scale factor.
-     *
-     * @param wl_output Wayland output.
-     * @param factor Wayland output scale factor.
+     * @brief Ignore wl-output scale; capture uses the active pixel mode and xdg-output logical size.
+     * @details Retain the wl-output listener signature while ignoring both event arguments.
      */
-    void wl_scale(wl_output *wl_output, std::int32_t factor) {}
+    void wl_scale(wl_output *, std::int32_t) {
+      // Pixel mode and xdg-output logical size already describe the capture and input coordinate spaces.
+    }
 
     wl_output *output;  ///< Wayland output associated with this monitor.
     std::string name;  ///< xdg-output name used for display selection.
@@ -613,7 +742,15 @@ namespace wl {
     zxdg_output_manager_v1 *output_manager {nullptr};  ///< xdg-output global used to query monitor names and sizes.
 
   private:
-    void add_interface(wl_registry *registry, std::uint32_t id, const char *interface, std::uint32_t version);
+    /**
+     * @brief Bind supported globals advertised by the Wayland registry.
+     *
+     * @param registry Registry advertising the global.
+     * @param id Numeric name used to bind the global.
+     * @param interface_name Protocol interface name advertised by the compositor.
+     * @param version Protocol version advertised for the global.
+     */
+    void add_interface(wl_registry *registry, std::uint32_t id, const char *interface_name, std::uint32_t version);
     void del_interface(wl_registry *registry, uint32_t id);
 
     std::bitset<MAX_INTERFACES> interface;

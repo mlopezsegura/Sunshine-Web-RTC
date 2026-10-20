@@ -50,6 +50,12 @@ FetchContent_MakeAvailable(libdatachannel)
 set(BUILD_SHARED_LIBS "${_sunshine_build_shared_libs}")
 unset(_sunshine_build_shared_libs)
 
+# v0.24.6 uses std::transform in configuration.cpp without including <algorithm>. libstdc++ includes it
+# transitively, libc++ (Windows ARM64 with clang) does not. Fixed upstream after v0.24.6.
+set_source_files_properties("${libdatachannel_SOURCE_DIR}/src/configuration.cpp"
+        TARGET_DIRECTORY datachannel-static
+        PROPERTIES COMPILE_OPTIONS "-include;algorithm")
+
 set(SUNSHINE_LIBDATACHANNEL_TARGET LibDataChannel::LibDataChannelStatic)
 if(NOT TARGET ${SUNSHINE_LIBDATACHANNEL_TARGET})
     set(SUNSHINE_LIBDATACHANNEL_TARGET datachannel-static)

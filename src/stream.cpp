@@ -289,7 +289,7 @@ namespace stream {
   /**
    * @brief Packed encrypted control-channel envelope.
    */
-  typedef struct control_encrypted_t {
+  struct control_encrypted_t {
     std::uint16_t encryptedHeaderType;  ///< Always LE 0x0001.
     std::uint16_t length;  ///< Size of seq, tag, secondary header, and data.
 
@@ -306,7 +306,12 @@ namespace stream {
     }
 
     // encrypted control_header_v2 and payload data follow
-  } *control_encrypted_p;  ///< Alias for control encrypted p.
+  };
+
+  /**
+   * @brief Pointer to a packed encrypted control-channel envelope.
+   */
+  using control_encrypted_p = control_encrypted_t *;
 
   /**
    * @brief Packed RTP and FEC headers for an audio recovery packet.
@@ -362,7 +367,7 @@ namespace stream {
   static inline int encode_audio(bool encrypted, const audio::buffer_t &plaintext, uint8_t *destination, crypto::aes_t &iv, crypto::cipher::cbc_t &cbc) {
     // If encryption isn't enabled
     if (!encrypted) {
-      std::copy(std::begin(plaintext), std::end(plaintext), destination);
+      std::ranges::copy(plaintext, destination);
       return (int) plaintext.size();
     }
 
@@ -433,7 +438,7 @@ namespace stream {
      * @param cb Callback invoked for each matching message or session.
      */
     void map(uint16_t type, std::function<void(session_t *, const std::string_view &)> cb) {
-      _map_type_cb.emplace(type, std::move(cb));
+      _map_type_cb.try_emplace(type, std::move(cb));
     }
 
     /**
@@ -444,8 +449,7 @@ namespace stream {
      * @return Network operation status.
      */
     int send(const std::string_view &payload, net::peer_t peer) {
-      auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE);
-      if (enet_peer_send(peer, 0, packet)) {
+      if (auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE); enet_peer_send(peer, 0, packet)) {
         enet_packet_destroy(packet);
 
         return -1;
@@ -532,8 +536,7 @@ namespace stream {
       std::string ping_payload;  ///< Payload expected from audio-channel ping packets.
 
       std::uint16_t sequenceNumber;  ///< Next RTP sequence number for an audio packet.
-      // avRiKeyId == util::endian::big(First (sizeof(avRiKeyId)) bytes of launch_session->iv)
-      std::uint32_t avRiKeyId;  ///< Base audio encryption key identifier derived from the launch-session IV.
+      std::uint32_t avRiKeyId;  ///< Base audio encryption key identifier decoded from the first four IV bytes in big-endian order.
       std::uint32_t timestamp;  ///< RTP timestamp for the next audio packet.
       udp::endpoint peer;  ///< Client UDP endpoint for the audio channel.
 
@@ -996,7 +999,7 @@ namespace stream {
 
     std::copy(begin, next, std::back_inserter(replaced));
     if (next != end) {
-      std::copy(std::begin(_new), std::end(_new), std::back_inserter(replaced));
+      std::ranges::copy(_new, std::back_inserter(replaced));
       std::copy(next + old.size(), end, std::back_inserter(replaced));
     }
 
@@ -1185,7 +1188,7 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
-      int32_t *stats = (int32_t *) payload.data();
+      auto stats = (int32_t *) payload.data();
       auto count = stats[0];
       std::chrono::milliseconds t {stats[1]};
 
@@ -1457,14 +1460,14 @@ namespace stream {
         switch (socket_type) {
           case socket_e::video:
             if (message_queue) {
-              peer_to_video_session.emplace(session_id, message_queue);
+              peer_to_video_session.try_emplace(session_id, message_queue);
             } else {
               peer_to_video_session.erase(session_id);
             }
             break;
           case socket_e::audio:
             if (message_queue) {
-              peer_to_audio_session.emplace(session_id, message_queue);
+              peer_to_audio_session.try_emplace(session_id, message_queue);
             } else {
               peer_to_audio_session.erase(session_id);
             }
@@ -1475,7 +1478,7 @@ namespace stream {
 
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
       recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
-        auto fg = util::fail_guard([&]() {
+        auto fg = util::fail_guard([&sock, &buf, &peer, &recv_func, &buf_elem]() {
           sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
 
@@ -1562,7 +1565,7 @@ namespace stream {
 
       frame_network_latency_logger.first_point_now();
 
-      auto session = (session_t *) packet->channel_data;
+      auto *session = packet->channel_data;
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1687,9 +1690,9 @@ namespace stream {
 
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
-          auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
+          auto payload_packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
-          for (int x = 0; x < packets; ++x) {
+          for (int x = 0; x < payload_packets; ++x) {
             auto *inspect = (video_packet_raw_t *) &current_payload[x * blocksize];
 
             inspect->packet.frameIndex = (uint32_t) packet->frame_index();
@@ -1703,7 +1706,7 @@ namespace stream {
             if (x == 0) {
               inspect->packet.flags |= FLAG_SOF;
             }
-            if (x == packets - 1) {
+            if (x == payload_packets - 1) {
               inspect->packet.flags |= FLAG_EOF;
             }
           }
@@ -1887,7 +1890,7 @@ namespace stream {
       }
 
       TUPLE_2D_REF(channel_data, packet_data, *packet);
-      auto session = (session_t *) channel_data;
+      auto *session = channel_data;
 
       auto sequenceNumber = session->audio.sequenceNumber;
       auto timestamp = session->audio.timestamp;
@@ -1939,7 +1942,7 @@ namespace stream {
             fec_packet.rtp.sequenceNumber = util::endian::big<std::uint16_t>(sequenceNumber + x + 1);
             fec_packet.fecHeader.fecShardIndex = x;
 
-            auto send_info = platf::send_info_t {
+            auto fec_send_info = platf::send_info_t {
               (const char *) &fec_packet,
               sizeof(fec_packet),
               (const char *) shards_p[RTPA_DATA_SHARDS + x],
@@ -1949,7 +1952,7 @@ namespace stream {
               session->audio.peer.port(),
               session->localAddress,
             };
-            platf::send(send_info);
+            platf::send(fec_send_info);
             BOOST_LOG(verbose) << "Audio FEC ["sv << (sequenceNumber & ~(RTPA_DATA_SHARDS - 1)) << ' ' << x << "] ::  send..."sv;
           }
         }
@@ -2112,7 +2115,7 @@ namespace stream {
       }
 
       TUPLE_2D_REF(recv_peer, msg, *msg_opt);
-      if (msg.find(expected_payload) != std::string::npos) {
+      if (msg.contains(expected_payload)) {
         // Match the new PING payload format
         BOOST_LOG(debug) << "Received ping [v2] from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
       } else if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1) && msg == "PING"sv) {

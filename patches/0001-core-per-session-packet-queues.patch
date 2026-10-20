@@ -1,29 +1,29 @@
 diff --git a/src/audio.cpp b/src/audio.cpp
-index 28a3d810..add54a75 100644
+index 00ddb12d..b7d1df15 100644
 --- a/src/audio.cpp
 +++ b/src/audio.cpp
-@@ -103,11 +103,11 @@ namespace audio {
+@@ -104,11 +104,11 @@ namespace audio {
     * @brief Encode captured PCM samples into Opus packets on the audio worker thread.
     *
     * @param samples Queue of captured PCM sample buffers to encode.
 +   * @param packets Queue that receives the encoded packets.
     * @param config Audio stream settings negotiated with the client.
-    * @param channel_data Platform-specific audio capture context passed to packet metadata.
+    * @param channel_data Stream session carried with each encoded packet.
     */
--  void encodeThread(sample_queue_t samples, config_t config, void *channel_data) {
+-  void encodeThread(sample_queue_t samples, config_t config, stream::session_t *channel_data) {
 -    auto packets = mail::man->queue<packet_t>(mail::audio_packets);
-+  void encodeThread(sample_queue_t samples, safe::mail_raw_t::queue_t<packet_t> packets, config_t config, void *channel_data) {
++  void encodeThread(sample_queue_t samples, safe::mail_raw_t::queue_t<packet_t> packets, config_t config, stream::session_t *channel_data) {
      auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
      if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
        apply_surround_params(stream, config.customStreamParams);
-@@ -234,7 +234,7 @@ namespace audio {
+@@ -235,7 +235,7 @@ namespace audio {
      platf::adjust_thread_priority(platf::thread_priority_e::critical);
  
      auto samples = std::make_shared<sample_queue_t::element_type>(30);
 -    std::jthread thread {encodeThread, samples, config, channel_data};
 +    std::jthread thread {encodeThread, samples, mail::packet_queue<packet_t>(mail, mail::audio_packets), config, channel_data};
  
-     auto fg = util::fail_guard([&]() {
+     auto fg = util::fail_guard([&samples, &thread, &shutdown_event]() {
        samples->stop();
 diff --git a/src/globals.h b/src/globals.h
 index 2c7ee9b1..f3983c9d 100644
@@ -54,10 +54,10 @@ index 2c7ee9b1..f3983c9d 100644
 +
  }  // namespace mail
 diff --git a/src/thread_safe.h b/src/thread_safe.h
-index f3061e2b..de5fe110 100644
+index a2fc99e7..80093ee8 100644
 --- a/src/thread_safe.h
 +++ b/src/thread_safe.h
-@@ -854,6 +854,19 @@ namespace safe {
+@@ -852,6 +852,19 @@ namespace safe {
        return post;
      }
  
@@ -78,7 +78,7 @@ index f3061e2b..de5fe110 100644
       * @brief Run cleanup for completed asynchronous work.
       */
 diff --git a/src/video.cpp b/src/video.cpp
-index 58535864..c0298e88 100644
+index 82a1a4ad..df34db69 100644
 --- a/src/video.cpp
 +++ b/src/video.cpp
 @@ -2438,7 +2438,7 @@ namespace video {
@@ -90,7 +90,7 @@ index 58535864..c0298e88 100644
      auto idr_events = mail->event<bool>(mail::idr);
      auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
  
-@@ -2983,7 +2983,7 @@ namespace video {
+@@ -2979,7 +2979,7 @@ namespace video {
        ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
          &join_event,
          mail->event<bool>(mail::shutdown),

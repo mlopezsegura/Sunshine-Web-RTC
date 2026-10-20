@@ -63,7 +63,7 @@ void free_frame(AVFrame *frame);
 /**
  * @brief Owning pointer for an EGL frame object.
  */
-using frame_t = util::safe_ptr<AVFrame, free_frame>;
+using frame_t = util::safe_ptr<AVFrame, &free_frame>;
 
 namespace gl {
   extern GladGLContext ctx;
@@ -358,11 +358,11 @@ namespace gbm {
   /**
    * @brief Function pointer used to destroy a GBM device.
    */
-  typedef void (*device_destroy_fn)(device *gbm);
+  using device_destroy_fn = void (*)(device *gbm);
   /**
    * @brief Function pointer used to create a GBM device from a file descriptor.
    */
-  typedef device *(*create_device_fn)(int fd);
+  using create_device_fn = device *(*)(int fd);
 
   extern device_destroy_fn device_destroy;
   extern create_device_fn create_device;
@@ -408,7 +408,6 @@ namespace egl {
     gl::tex_t tex;  ///< Textures containing the imported Y and UV planes.
     gl::frame_buf_t buf;  ///< OpenGL framebuffer object used for rendering.
 
-    // sizeof(va::DRMPRIMESurfaceDescriptor::objects) / sizeof(va::DRMPRIMESurfaceDescriptor::objects[0]);
     static constexpr std::size_t num_fds = 4;  ///< Maximum number of DMA-BUF plane file descriptors exported by VAAPI.
 
     std::array<file_t, num_fds> fds;  ///< DMA-BUF file descriptors for each exported plane.
@@ -616,11 +615,11 @@ namespace egl {
      * @brief Reset the object to its initial empty state.
      */
     void reset() {
-      for (auto x = 0; x < 4; ++x) {
-        if (sd.fds[x] >= 0) {
-          close(sd.fds[x]);
+      for (auto fd_index = 0; fd_index < 4; ++fd_index) {
+        if (sd.fds[fd_index] >= 0) {
+          close(sd.fds[fd_index]);
 
-          sd.fds[x] = -1;
+          sd.fds[fd_index] = -1;
         }
       }
     }
