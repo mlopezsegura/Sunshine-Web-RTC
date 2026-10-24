@@ -496,10 +496,10 @@ index 00000000..fceccbf2
 +}
 diff --git a/tests/unit/webrtc/test_webrtc_sdp.cpp b/tests/unit/webrtc/test_webrtc_sdp.cpp
 new file mode 100644
-index 00000000..7680603b
+index 00000000..4b6ddfee
 --- /dev/null
 +++ b/tests/unit/webrtc/test_webrtc_sdp.cpp
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,90 @@
 +/**
 + * @file tests/unit/webrtc/test_webrtc_sdp.cpp
 + * @brief Tests for the Samsung Tizen SDP helpers.
@@ -538,6 +538,18 @@ index 00000000..7680603b
 +  EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer(attribute + attribute), value));
 +  EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer("a=rtpmap:96 H264/90000\r\n"), value));
 +  EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer(attribute) + "a=bare\n", value));
++}
++
++TEST(WebrtcSdpTest, ReadsTheVideoExtensionIdTheTvAccepted) {
++  const std::string uri = sdp::PLAYOUT_DELAY_EXTENSION_URI;
++  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:6 " + uri + "\r\n"), uri), 6);
++  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:9 http://example.com/other\r\na=extmap:12/recvonly " + uri + " attribute\r\n"), uri), 12);
++  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:6 " + uri + "-v2\r\n"), uri), std::nullopt);
++  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:x " + uri + "\r\n"), uri), std::nullopt);
++  EXPECT_EQ(sdp::video_extension_id(offer("a=rtpmap:96 H264/90000\r\n"), uri), std::nullopt);
++  // Only the video section counts: an audio section's extension does not mark video packets.
++  EXPECT_EQ(sdp::video_extension_id("v=0\r\nm=audio 9 RTP 111\r\na=extmap:6 " + uri + "\r\n" + offer(""), uri), std::nullopt);
++  EXPECT_EQ(sdp::video_extension_id("v=0\r\n", uri), std::nullopt);
 +}
 +
 +TEST(WebrtcSdpTest, RequiresTheRequestedCodecAlone) {
@@ -846,10 +858,10 @@ index 00000000..3a1ddf37
 +}
 diff --git a/tests/webrtc_e2e/README.md b/tests/webrtc_e2e/README.md
 new file mode 100644
-index 00000000..6fc3c9ae
+index 00000000..d49fdbed
 --- /dev/null
 +++ b/tests/webrtc_e2e/README.md
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,43 @@
 +# Moonlight WebRTC end-to-end test
 +
 +`driver.mjs` checks the Moonlight WebRTC TV server of a running Sunshine from end to end. It loads
@@ -866,12 +878,39 @@ index 00000000..6fc3c9ae
 +
 +Headless Edge decodes H.264 and AV1 8-bit. It has no HEVC or AV1 10-bit WebRTC decoder, so those
 +streams are established but their frames are only received, not decoded; a Samsung TV decodes them.
++
++## Glass-to-glass latency
++
++`--latency=SECONDS` measures the whole path from this PC's screen to the stand-in TV's: capture,
++encode, RTP, jitter buffer, decode and presentation. The driver shows `clock.html` full screen on the
++captured display; it paints the wall clock as a row of cells along the top edge, over moving noise
++(`--load=none` for a still picture) so the encoder runs at the requested bitrate. The page reads the
++row back from every frame it presents and subtracts. Both pages run on the same PC, so they share
++the clock. `--tvTweaks=0` measures without what the TV app does to its receiver (no lip sync,
++shortest jitter buffer).
++
++```sh
++node driver.mjs --creds=user:password --webui=https://127.0.0.1:50001 --ws=ws://127.0.0.1:8010 \
++  --codec=av1 --width=3840 --height=2160 --bitrate=80000 --latency=20 --results=latency.jsonl
++```
++
++`latency.ps1` compares Sunshine builds: it starts each one with a test configuration, runs every
++mode and appends one JSON line per run. Nothing else should be on screen while it runs.
++
++```powershell
++./latency.ps1 -Sunshine ([ordered]@{ before = 'C:\old\sunshine.exe'; after = 'C:\new\sunshine.exe' }) `
++  -Config C:\e2e\sunshine.conf -Modes 'h264:1920:1080:60:20000', 'av1:3840:2160:60:80000' -Repeat 2
++```
++
++On a Ryzen 9 5950X with a Radeon RX 9060 XT (AMF), zero playout delay took H.264 1080p60 at 20 Mbps
++from 54 ms to 38 ms, and AV1 2160p60 at 80 Mbps from 73 ms to about 50 ms. The figures include
++headless Edge's software decoder and its 60 Hz compositor; a TV decodes in hardware.
 diff --git a/tests/webrtc_e2e/client.html b/tests/webrtc_e2e/client.html
 new file mode 100644
-index 00000000..91a6cbe5
+index 00000000..c1482af8
 --- /dev/null
 +++ b/tests/webrtc_e2e/client.html
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,315 @@
 +<!doctype html>
 +<html>
 +<head><meta charset="utf-8"><title>WebRTC TV E2E</title></head>
@@ -888,6 +927,10 @@ index 00000000..91a6cbe5
 +const fps = Number(params.get("fps") || 60);
 +const hdr = params.get("hdr") === "1";
 +const takeover = params.get("takeover") === "1";
++// Seconds of glass-to-glass measurement against clock.html; 0 skips it.
++const latencySeconds = Number(params.get("latency") || 0);
++// What the TV app does to its receiver: no lip sync, shortest jitter buffer.
++const tvTweaks = params.get("tvTweaks") !== "0";
 +const log = [];
 +const result = { codec, width, height, fps, hdr, steps: [], errors: [] };
 +const t0 = performance.now();
@@ -899,7 +942,7 @@ index 00000000..91a6cbe5
 +  result.log = log.slice(-80);
 +  await fetch("/result", { method: "POST", body: JSON.stringify(result) });
 +}
-+setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000);
++setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000 + latencySeconds * 1000);
 +
 +let ws, pc, sessionId, control, gamepad, phase = "auth", credentials = null, appId = null;
 +const send = (m) => { log.push(">> " + m.type); ws.send(JSON.stringify(Object.assign({ version: 2 }, m))); };
@@ -939,6 +982,10 @@ index 00000000..91a6cbe5
 +    if (m.requestType === "request-pairing" && !credentials) {
 +      send({ type: "request-pairing", pin, clientName: "E2E Edge" });
 +    }
++    if (m.requestType === "start-session") {
++      result.errors.push("start-session refused: " + (m.message || m.code));
++      finish();
++    }
 +  } else if (m.type === "paired") {
 +    note("paired");
 +    credentials = { clientId: m.clientId, clientSecret: m.clientSecret };
@@ -971,7 +1018,7 @@ index 00000000..91a6cbe5
 +  } else if (m.type === "session-status") {
 +    note("session-" + m.state, m.message ? { message: m.message } : undefined);
 +    if (m.sessionId) sessionId = m.sessionId;
-+    if (m.state === "streaming") setTimeout(measure, 8000);
++    if (m.state === "streaming") setTimeout(latencySeconds > 0 ? measureLatency : measure, latencySeconds > 0 ? 3000 : 8000);
 +    if (m.state === "error") { result.errors.push("session error: " + m.message); finish(); }
 +    if (m.state === "idle" && phase === "stopping") {
 +      phase = "host-stop";
@@ -981,10 +1028,15 @@ index 00000000..91a6cbe5
 +    note("host-" + m.state, { running: m.runningAppId || null });
 +    if (m.state === "stopped" || m.state === "failed") finish();
 +  } else if (m.type === "offer") {
-+    note("offer", { imageattr: /a=imageattr:96 send/.test(m.sdp), rtpmap: (m.sdp.match(/a=rtpmap:96 [^\r]+/) || [""])[0] });
++    note("offer", { imageattr: /a=imageattr:96 send/.test(m.sdp), rtpmap: (m.sdp.match(/a=rtpmap:96 [^\r]+/) || [""])[0],
++      playoutDelay: /a=extmap:\d+ http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay/.test(m.sdp) });
 +    pc = new RTCPeerConnection();
 +    pc.onicecandidate = (e) => { if (e.candidate) send({ type: "candidate", sessionId, candidate: e.candidate.candidate, mid: e.candidate.sdpMid }); };
-+    pc.ontrack = (e) => { if (e.track.kind === "video") document.getElementById("video").srcObject = e.streams[0] || new MediaStream([e.track]); };
++    pc.ontrack = (e) => {
++      if (e.track.kind !== "video") return;
++      if (tvTweaks && "jitterBufferTarget" in e.receiver) e.receiver.jitterBufferTarget = 0;
++      document.getElementById("video").srcObject = new MediaStream([e.track]);
++    };
 +    pc.ondatachannel = (e) => {
 +      const channel = e.channel;
 +      if (channel.label === "control") {
@@ -1000,13 +1052,108 @@ index 00000000..91a6cbe5
 +      }
 +    };
 +    pc.onconnectionstatechange = () => note("pc-" + pc.connectionState);
-+    await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
++    await pc.setRemoteDescription({ type: "offer", sdp: tvTweaks ? separateAudioSync(m.sdp) : m.sdp });
 +    const answer = await pc.createAnswer();
 +    await pc.setLocalDescription(answer);
 +    send({ type: "answer", sessionId, sdp: pc.localDescription.sdp });
 +  } else if (m.type === "candidate") {
 +    if (pc) await pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid });
 +  }
++}
++
++// Same as tizen/low-latency.js: audio in a stream of its own, so the video is not held for it.
++function separateAudioSync(sdp) {
++  let inAudio = false;
++  const rename = (stream) => (stream === "-" || stream.endsWith("-audio") ? stream : stream + "-audio");
++  return sdp.split("\r\n").map((line) => {
++    if (line.startsWith("m=")) { inAudio = line.startsWith("m=audio"); return line; }
++    if (!inAudio) return line;
++    return line.replace(/^(a=msid:)(\S+)/, (m, p, s) => p + rename(s)).replace(/^(a=ssrc:\d+ msid:)(\S+)/, (m, p, s) => p + rename(s));
++  }).join("\r\n");
++}
++
++async function videoStats() {
++  const out = {};
++  (await pc.getStats()).forEach((s) => {
++    if (s.type === "inbound-rtp" && s.kind === "video") out.video = s;
++    if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") out.rtt = s.currentRoundTripTime;
++  });
++  return out;
++}
++
++function percentile(sorted, share) {
++  return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * share))] : null;
++}
++
++// Reads clock.html's row of cells back from every presented frame: white and black references,
++// then 24 bits of the wall clock in milliseconds. Same machine, same clock.
++async function measureLatency() {
++  const video = document.getElementById("video");
++  const canvas = document.createElement("canvas");
++  const context = canvas.getContext("2d", { willReadFrequently: true });
++  const samples = [];
++  const toScreen = [];
++  let unreadable = 0;
++  const startStats = await videoStats();
++  const ends = performance.now() + latencySeconds * 1000;
++  await new Promise((resolve) => {
++    const onFrame = (now, metadata) => {
++      const cell = video.videoHeight / 27;
++      canvas.width = Math.ceil(cell * 26);
++      canvas.height = Math.ceil(cell);
++      context.drawImage(video, 0, 0, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
++      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
++      const luma = (index) => {
++        const x = Math.floor(cell * (index + 0.5));
++        const y = Math.floor(cell * 0.5);
++        const offset = (y * canvas.width + x) * 4;
++        return pixels[offset] * 0.299 + pixels[offset + 1] * 0.587 + pixels[offset + 2] * 0.114;
++      };
++      const white = luma(0);
++      const black = luma(1);
++      if (!result.debugFrame) {
++        const full = document.createElement("canvas");
++        full.width = 480;
++        full.height = Math.round(480 * video.videoHeight / video.videoWidth);
++        full.getContext("2d").drawImage(video, 0, 0, full.width, full.height);
++        result.debugFrame = { white, black, videoWidth: video.videoWidth, videoHeight: video.videoHeight, png: full.toDataURL("image/png") };
++      }
++      const shownAt = Date.now() - (performance.now() - (metadata.expectedDisplayTime || now));
++      if (white - black > 100) {
++        const threshold = (white + black) / 2;
++        let value = 0;
++        for (let bit = 0; bit < 24; bit += 1) value = (value << 1) | (luma(bit + 2) > threshold ? 1 : 0);
++        const elapsed = ((Math.round(shownAt) & 0xffffff) - value + 0x1000000) % 0x1000000;
++        if (elapsed < 2000) samples.push(elapsed); else unreadable += 1;
++      } else {
++        unreadable += 1;
++      }
++      if (metadata.receiveTime) toScreen.push((metadata.expectedDisplayTime || now) - metadata.receiveTime);
++      if (performance.now() < ends) video.requestVideoFrameCallback(onFrame); else resolve();
++    };
++    video.requestVideoFrameCallback(onFrame);
++  });
++  const endStats = await videoStats();
++  const a = startStats.video || {};
++  const b = endStats.video || {};
++  const per = (total, count) => (b[count] - a[count]) > 0 ? Math.round(1000 * (b[total] - a[total]) / (b[count] - a[count]) * 100) / 100 : null;
++  const sorted = samples.slice().sort((x, y) => x - y);
++  const mean = (list) => list.length ? Math.round(list.reduce((sum, x) => sum + x, 0) / list.length * 10) / 10 : null;
++  result.latency = {
++    frames: samples.length, unreadable,
++    meanMs: mean(samples), p50Ms: percentile(sorted, 0.5), p95Ms: percentile(sorted, 0.95), p99Ms: percentile(sorted, 0.99),
++    minMs: sorted.length ? sorted[0] : null, maxMs: sorted.length ? sorted[sorted.length - 1] : null,
++    arrivalToScreenMs: mean(toScreen),
++    jitterBufferMs: per("jitterBufferDelay", "jitterBufferEmittedCount"),
++    decodeMs: per("totalDecodeTime", "framesDecoded"),
++    rttMs: endStats.rtt != null ? Math.round(endStats.rtt * 10000) / 10 : null,
++    decodedFps: Math.round((b.framesDecoded - a.framesDecoded) / latencySeconds * 10) / 10,
++    packetsLost: (b.packetsLost || 0) - (a.packetsLost || 0),
++    decoder: b.decoderImplementation,
++  };
++  note("latency-measured");
++  phase = "stopping";
++  send({ type: "stop-session" });
 +}
 +
 +async function measure() {
@@ -1079,22 +1226,103 @@ index 00000000..91a6cbe5
 +</script>
 +</body>
 +</html>
+diff --git a/tests/webrtc_e2e/clock.html b/tests/webrtc_e2e/clock.html
+new file mode 100644
+index 00000000..bbffccf8
+--- /dev/null
++++ b/tests/webrtc_e2e/clock.html
+@@ -0,0 +1,71 @@
++<!doctype html>
++<html>
++<head><meta charset="utf-8"><title>WebRTC latency clock</title>
++<style>html, body { margin: 0; height: 100%; overflow: hidden; background: #000; cursor: none; } canvas { display: block; }</style>
++</head>
++<body>
++<canvas id="clock"></canvas>
++<script>
++// Shown full screen on the display Sunshine captures. Every animation frame paints the wall clock
++// as a row of cells along the top edge: a white and a black reference cell, then the low 24 bits of
++// Date.now() in milliseconds, most significant first. The client reads the row back from each
++// frame it presents, so the difference is the whole path from this screen to that one.
++const CELLS = 26;
++const ROWS_PER_SCREEN = 27;
++const canvas = document.getElementById("clock");
++const context = canvas.getContext("2d");
++
++function resize() {
++  canvas.width = Math.round(innerWidth * devicePixelRatio);
++  canvas.height = Math.round(innerHeight * devicePixelRatio);
++}
++
++// ?load=noise fills the rest of the screen with moving noise, the worst case for the encoder, so
++// the stream runs at the bitrate it was given instead of idling on a still picture.
++const noisy = new URLSearchParams(location.search).get("load") === "noise";
++const noise = document.createElement("canvas");
++noise.width = noise.height = 512;
++if (noisy) {
++  const tile = noise.getContext("2d");
++  const pixels = tile.createImageData(512, 512);
++  for (let index = 0; index < pixels.data.length; index += 4) {
++    pixels.data[index] = Math.random() * 256;
++    pixels.data[index + 1] = Math.random() * 256;
++    pixels.data[index + 2] = Math.random() * 256;
++    pixels.data[index + 3] = 255;
++  }
++  tile.putImageData(pixels, 0, 0);
++}
++
++function paintLoad(top) {
++  const pattern = context.createPattern(noise, "repeat");
++  const shift = new DOMMatrix([1, 0, 0, 1, Math.random() * 512, Math.random() * 512]);
++  pattern.setTransform(shift);
++  context.fillStyle = pattern;
++  context.fillRect(0, top, canvas.width, canvas.height - top);
++}
++
++function paint() {
++  const cell = canvas.height / ROWS_PER_SCREEN;
++  if (noisy) {
++    paintLoad(cell * 2);
++  }
++  const value = Date.now() & 0xffffff;
++  context.fillStyle = "#000";
++  context.fillRect(0, 0, cell * CELLS, cell);
++  context.fillStyle = "#fff";
++  context.fillRect(0, 0, cell, cell);
++  for (let bit = 0; bit < 24; bit += 1) {
++    if (value & (1 << (23 - bit))) {
++      context.fillRect(cell * (bit + 2), 0, cell, cell);
++    }
++  }
++  requestAnimationFrame(paint);
++}
++
++addEventListener("resize", resize);
++resize();
++requestAnimationFrame(paint);
++</script>
++</body>
++</html>
 diff --git a/tests/webrtc_e2e/driver.mjs b/tests/webrtc_e2e/driver.mjs
 new file mode 100644
-index 00000000..7e1978d2
+index 00000000..bb43b69c
 --- /dev/null
 +++ b/tests/webrtc_e2e/driver.mjs
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,140 @@
 +// Drives one end-to-end run against a running Sunshine: serves the TV stand-in page to a headless
 +// Chromium browser, approves the PIN it shows through the Web UI API, and prints what it measured.
 +//
 +//   node driver.mjs --creds=user:password [--webui=https://127.0.0.1:47990] [--ws=ws://127.0.0.1:8000]
 +//                   [--codec=h264|hevc|av1] [--width=1920 --height=1080 --fps=60 --bitrate=20000 --hdr=1]
 +//                   [--summary=1] [--unpair=0] [--takeover=1] [--browser=path/to/msedge.exe]
++//                   [--latency=SECONDS [--load=noise|none] [--tvTweaks=0] [--label=NAME] [--results=latency.jsonl]]
++//
++// --latency shows clock.html full screen on this PC's display for the length of the stream and
++// prints the glass-to-glass latency the stand-in TV measured; --results appends it as one line.
 +//
 +// Sunshine's Web UI uses a self-signed certificate: run with NODE_TLS_REJECT_UNAUTHORIZED=0.
 +import { spawn, spawnSync } from "node:child_process";
-+import { readFileSync, mkdtempSync } from "node:fs";
++import { appendFileSync, readFileSync, mkdtempSync, writeFileSync } from "node:fs";
 +import http from "node:http";
 +import https from "node:https";
 +import { tmpdir } from "node:os";
@@ -1102,7 +1330,11 @@ index 00000000..7e1978d2
 +import { fileURLToPath } from "node:url";
 +
 +// Edge keeps its child processes alive when only the parent is killed.
-+const killEdge = () => edge && spawnSync("taskkill", ["/T", "/F", "/PID", String(edge.pid)], { stdio: "ignore" });
++const killEdge = () => {
++  for (const browser of [edge, clock]) {
++    if (browser) spawnSync("taskkill", ["/T", "/F", "/PID", String(browser.pid)], { stdio: "ignore" });
++  }
++};
 +const here = path.dirname(fileURLToPath(import.meta.url));
 +const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, "").split("=")));
 +const webUi = args.webui || "https://127.0.0.1:50001";
@@ -1159,8 +1391,10 @@ index 00000000..7e1978d2
 +console.log("API clients before:", JSON.stringify(clientsBefore));
 +
 +const query = new URLSearchParams({ ws: args.ws || "ws://127.0.0.1:8010", pin, codec: args.codec || "h264",
-+  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", fps: args.fps || "60", takeover: args.takeover || "0" });
++  width: args.width || "1280", height: args.height || "720", bitrate: args.bitrate || "12000", hdr: args.hdr || "0", fps: args.fps || "60", takeover: args.takeover || "0",
++  latency: args.latency || "0", tvTweaks: args.tvTweaks || "1" });
 +let edge;
++let clock;
 +const server = http.createServer((request, response) => {
 +  if (request.method === "POST" && request.url === "/result") {
 +    let body = "";
@@ -1168,6 +1402,17 @@ index 00000000..7e1978d2
 +    request.on("end", async () => {
 +      response.end("ok");
 +      const result = JSON.parse(body);
++      if (result.latency) {
++        const line = { label: args.label || "", codec: result.codec, size: result.width + "x" + result.height, fps: result.fps,
++          bitrateKbps: Number(args.bitrate || 12000), tvTweaks: args.tvTweaks !== "0",
++          playoutDelayOffered: Boolean((result.steps.find((s) => s.step === "offer") || {}).playoutDelay), ...result.latency, errors: result.errors };
++        console.log("LATENCY " + JSON.stringify(line));
++        if (args.results) appendFileSync(args.results, JSON.stringify(line) + "\n");
++        if (result.debugFrame && args.debugFrame) {
++          writeFileSync(args.debugFrame, Buffer.from(result.debugFrame.png.split(",")[1], "base64"));
++          console.log("DEBUG " + JSON.stringify({ ...result.debugFrame, png: undefined }));
++        }
++      }
 +      if (args.summary === "1") {
 +        console.log(JSON.stringify({ codec: result.codec, size: result.width + "x" + result.height, fps: result.fps, hdr: result.hdr, errors: result.errors,
 +          states: result.steps.filter((s) => s.step.startsWith("session-") || s.step.startsWith("host-") || s.step.startsWith("takeover") || s.step.startsWith("replaced") || s.step === "offer").map((s) => s.step + (s.message ? "(" + s.message + ")" : "") + (s.rtpmap ? "[" + s.rtpmap + "]" : "")),
@@ -1189,13 +1434,99 @@ index 00000000..7e1978d2
 +    return;
 +  }
 +  response.setHeader("Content-Type", "text/html");
-+  response.end(readFileSync(path.join(here, "client.html")));
++  response.end(readFileSync(path.join(here, request.url.startsWith("/clock") ? "clock.html" : "client.html")));
 +});
 +server.listen(8099, "127.0.0.1", () => {
++  if (Number(args.latency || 0) > 0) {
++    clock = spawn(args.browser || "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", [
++      "--kiosk", "--edge-kiosk-type=fullscreen", "--no-first-run", "--user-data-dir=" + mkdtempSync(path.join(tmpdir(), "edge-clock-")),
++      "http://127.0.0.1:8099/clock?load=" + (args.load || "noise")], { stdio: "ignore" });
++  }
 +  const profile = mkdtempSync(path.join(tmpdir(), "edge-e2e-"));
 +  edge = spawn(args.browser || "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", [
 +    "--headless=new", "--no-first-run", "--user-data-dir=" + profile, "--autoplay-policy=no-user-gesture-required",
 +    "--remote-debugging-port=0", "--enable-features=WebRtcAllowH265Receive,PlatformHEVCDecoderSupport", "http://127.0.0.1:8099/?" + query], { stdio: "ignore" });
 +  pairThroughWebUi().catch((error) => { console.log("pairing failed:", error.message); killEdge(); process.exit(3); });
 +});
-+setTimeout(() => { console.log("driver timeout"); killEdge(); process.exit(2); }, 90000);
++setTimeout(() => { console.log("driver timeout"); killEdge(); process.exit(2); }, 90000 + Number(args.latency || 0) * 1000);
+diff --git a/tests/webrtc_e2e/latency.ps1 b/tests/webrtc_e2e/latency.ps1
+new file mode 100644
+index 00000000..00f11a4f
+--- /dev/null
++++ b/tests/webrtc_e2e/latency.ps1
+@@ -0,0 +1,75 @@
++<#
++.SYNOPSIS
++    Measures the glass-to-glass latency of one or more Sunshine builds with driver.mjs.
++
++.DESCRIPTION
++    Starts each Sunshine with the given configuration file in this Windows session, waits for its
++    Web UI, runs driver.mjs --latency for every stream mode, stops it, and appends one JSON line per
++    run to -Results. clock.html is shown full screen on the captured display while a run lasts, so
++    nothing else should be on screen. The configuration must enable WebRTC, and its Web UI
++    credentials must match -Credentials.
++
++.EXAMPLE
++    ./latency.ps1 -Sunshine @{ before = 'C:\old\sunshine.exe'; after = 'C:\new\sunshine.exe' } `
++        -Config C:\e2e\sunshine.conf -Results latency.jsonl
++#>
++[CmdletBinding()]
++param(
++    [Parameter(Mandatory = $true)][hashtable]$Sunshine,
++    [Parameter(Mandatory = $true)][string]$Config,
++    [string]$Results = (Join-Path $PSScriptRoot 'latency.jsonl'),
++    [string]$Credentials = 'e2e:e2e-password',
++    [int]$WebUiPort = 50001,
++    [int]$WebRtcPort = 8010,
++    [int]$Seconds = 20,
++    [int]$Repeat = 1,
++    # codec:width:height:fps:bitrateKbps
++    [string[]]$Modes = @('h264:1920:1080:60:20000', 'h264:3840:2160:60:80000'),
++    [switch]$WithoutTvTweaks
++)
++
++$ErrorActionPreference = 'Stop'
++$driver = Join-Path $PSScriptRoot 'driver.mjs'
++
++function Wait-Port([int]$Port) {
++    for ($attempt = 0; $attempt -lt 120; $attempt += 1) {
++        $client = New-Object System.Net.Sockets.TcpClient
++        try {
++            $client.Connect('127.0.0.1', $Port)
++            return
++        } catch {
++            Start-Sleep -Milliseconds 500
++        } finally {
++            $client.Dispose()
++        }
++    }
++    throw "Nothing listens on port $Port"
++}
++
++foreach ($label in $Sunshine.Keys) {
++    $exe = $Sunshine[$label]
++    $process = Start-Process -FilePath $exe -ArgumentList "`"$Config`"" -WorkingDirectory (Split-Path $exe) -PassThru -WindowStyle Hidden
++    try {
++        Wait-Port $WebUiPort
++        Wait-Port $WebRtcPort
++        foreach ($mode in $Modes) {
++            $codec, $width, $height, $fps, $bitrate = $mode.Split(':')
++            foreach ($tweaks in @($true) + @(if ($WithoutTvTweaks) { $false })) {
++                for ($run = 1; $run -le $Repeat; $run += 1) {
++                    Write-Host "== $label $mode tvTweaks=$tweaks run $run"
++                    # Windows PowerShell turns a native command's stderr into terminating errors.
++                    $ErrorActionPreference = 'Continue'
++                    & node $driver "--creds=$Credentials" "--webui=https://127.0.0.1:$WebUiPort" "--ws=ws://127.0.0.1:$WebRtcPort" `
++                        "--codec=$codec" "--width=$width" "--height=$height" "--fps=$fps" "--bitrate=$bitrate" `
++                        "--latency=$Seconds" "--tvTweaks=$(if ($tweaks) { 1 } else { 0 })" "--label=$label" "--results=$Results" |
++                        Select-String '^LATENCY|timeout|failed'
++                    $ErrorActionPreference = 'Stop'
++                    Start-Sleep -Seconds 2
++                }
++            }
++        }
++    } finally {
++        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
++        Start-Sleep -Seconds 2
++    }
++}

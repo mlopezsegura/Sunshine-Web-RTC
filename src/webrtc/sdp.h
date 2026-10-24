@@ -15,6 +15,16 @@
 namespace webrtc_stream::sdp {
   constexpr int VIDEO_PAYLOAD_TYPE = 96;  ///< RTP payload type of the video track.
   constexpr int AUDIO_PAYLOAD_TYPE = 111;  ///< RTP payload type of the audio track.
+  constexpr int PLAYOUT_DELAY_EXTENSION_ID = 6;  ///< RTP header extension ID offered for the playout delay.
+  constexpr auto PLAYOUT_DELAY_EXTENSION_URI = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";  ///< Playout delay extension.
+
+  /**
+   * @brief Read the ID a video section gives an RTP header extension.
+   * @param sdp Offer or answer SDP.
+   * @param uri Extension URI.
+   * @return The negotiated ID, or nothing when the video section does not carry the extension.
+   */
+  std::optional<int> video_extension_id(std::string_view sdp, std::string_view uri);
 
   /**
    * @brief Build the imageattr that puts the Tizen decoder in Samsung Game Mode.

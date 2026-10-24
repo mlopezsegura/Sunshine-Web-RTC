@@ -3,6 +3,7 @@
  * @brief Definitions for the SDP details Samsung Tizen needs for low-latency streaming.
  */
 // standard includes
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstdint>
@@ -186,6 +187,30 @@ namespace webrtc_stream::sdp {
       return std::nullopt;
     }
     return level;
+  }
+
+  std::optional<int> video_extension_id(std::string_view sdp, std::string_view uri) {
+    constexpr std::string_view prefix = "a=extmap:";
+    const auto section = video_section(sdp);
+    for (std::size_t position = section.find(prefix); position != std::string_view::npos; position = section.find(prefix, position + 1)) {
+      if (position != 0 && section[position - 1] != '\n') {
+        continue;
+      }
+      const auto line_end = section.find_first_of("\r\n", position);
+      const auto line = section.substr(position + prefix.size(), line_end == std::string_view::npos ? line_end : line_end - position - prefix.size());
+      // a=extmap:<id>[/<direction>] <uri> [<attributes>]
+      const auto uri_begin = line.find(' ');
+      if (uri_begin == std::string_view::npos || line.substr(uri_begin + 1, line.find(' ', uri_begin + 1) - uri_begin - 1) != uri) {
+        continue;
+      }
+      int id = 0;
+      const auto id_end = std::min(uri_begin, line.find('/'));
+      const auto parsed = std::from_chars(line.data(), line.data() + id_end, id);
+      if (parsed.ec == std::errc {} && parsed.ptr == line.data() + id_end && id > 0 && id < 256) {
+        return id;
+      }
+    }
+    return std::nullopt;
   }
 
   bool has_data_channel_section(std::string_view sdp) {
