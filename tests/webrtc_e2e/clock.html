@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>WebRTC latency clock</title>
+<style>html, body { margin: 0; height: 100%; overflow: hidden; background: #000; cursor: none; } canvas { display: block; }</style>
+</head>
+<body>
+<canvas id="clock"></canvas>
+<script>
+// Shown full screen on the display Sunshine captures. Every animation frame paints the wall clock
+// as a row of cells along the top edge: a white and a black reference cell, then the low 24 bits of
+// Date.now() in milliseconds, most significant first. The client reads the row back from each
+// frame it presents, so the difference is the whole path from this screen to that one.
+const CELLS = 26;
+const ROWS_PER_SCREEN = 27;
+const canvas = document.getElementById("clock");
+const context = canvas.getContext("2d");
+
+function resize() {
+  canvas.width = Math.round(innerWidth * devicePixelRatio);
+  canvas.height = Math.round(innerHeight * devicePixelRatio);
+}
+
+// ?load=noise fills the rest of the screen with moving noise, the worst case for the encoder, so
+// the stream runs at the bitrate it was given instead of idling on a still picture.
+const noisy = new URLSearchParams(location.search).get("load") === "noise";
+const noise = document.createElement("canvas");
+noise.width = noise.height = 512;
+if (noisy) {
+  const tile = noise.getContext("2d");
+  const pixels = tile.createImageData(512, 512);
+  for (let index = 0; index < pixels.data.length; index += 4) {
+    pixels.data[index] = Math.random() * 256;
+    pixels.data[index + 1] = Math.random() * 256;
+    pixels.data[index + 2] = Math.random() * 256;
+    pixels.data[index + 3] = 255;
+  }
+  tile.putImageData(pixels, 0, 0);
+}
+
+function paintLoad(top) {
+  const pattern = context.createPattern(noise, "repeat");
+  const shift = new DOMMatrix([1, 0, 0, 1, Math.random() * 512, Math.random() * 512]);
+  pattern.setTransform(shift);
+  context.fillStyle = pattern;
+  context.fillRect(0, top, canvas.width, canvas.height - top);
+}
+
+function paint() {
+  const cell = canvas.height / ROWS_PER_SCREEN;
+  if (noisy) {
+    paintLoad(cell * 2);
+  }
+  const value = Date.now() & 0xffffff;
+  context.fillStyle = "#000";
+  context.fillRect(0, 0, cell * CELLS, cell);
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, cell, cell);
+  for (let bit = 0; bit < 24; bit += 1) {
+    if (value & (1 << (23 - bit))) {
+      context.fillRect(cell * (bit + 2), 0, cell, cell);
+    }
+  }
+  requestAnimationFrame(paint);
+}
+
+addEventListener("resize", resize);
+resize();
+requestAnimationFrame(paint);
+</script>
+</body>
+</html>

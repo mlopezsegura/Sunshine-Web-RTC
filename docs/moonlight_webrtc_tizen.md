@@ -91,6 +91,10 @@ works as is. Sunshine implements it as follows:
 - **Paired TVs** appear in the client list under **Troubleshooting**, like Moonlight clients: a TV can be
   disabled there, which keeps it paired but refuses it until it is enabled again, or unpaired. They are
   stored in `webrtc_tv_clients.json` in Sunshine's configuration directory.
+- **Latency.** Video packets carry the WebRTC playout-delay extension set to zero, which TVs that accept
+  it in their answer honour by showing each frame the moment it is decoded, with no jitter buffer
+  smoothing. Audio is sent in a media stream of its own, so the TV does not hold the picture back to
+  keep lip sync. `tests/webrtc_e2e` measures the result from screen to screen.
 
 ## Web UI API
 

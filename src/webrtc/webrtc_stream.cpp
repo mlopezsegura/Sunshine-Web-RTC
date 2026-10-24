@@ -73,9 +73,14 @@ namespace webrtc_stream {
      */
     constexpr auto RTP_CNAME = "sunshine";
     /**
-     * @brief Media stream both tracks belong to.
+     * @brief Media stream of the video track.
      */
     constexpr auto MEDIA_STREAM_ID = "stream1";
+    /**
+     * @brief Media stream of the audio track, apart from the video so the TV does not hold
+     * the picture back to stay in sync with the audio.
+     */
+    constexpr auto AUDIO_MEDIA_STREAM_ID = "stream1-audio";
     /**
      * @brief Opus frame duration, as Moonlight requests on a LAN.
      */
@@ -1399,6 +1404,9 @@ namespace webrtc_stream {
           // and the HEVC VUI/SEI or AV1 sequence header already carry the colour description.
           video.addExtMap(rtc::Description::Entry::ExtMap(9, "http://www.webrtc.org/experiments/rtp-hdrext/color-space"));
         }
+        // Asks the TV to show each frame as soon as it is decoded, with no jitter buffer
+        // smoothing; the answer says whether it agreed.
+        video.addExtMap(rtc::Description::Entry::ExtMap(sdp::PLAYOUT_DELAY_EXTENSION_ID, sdp::PLAYOUT_DELAY_EXTENSION_URI));
         video.addSSRC(VIDEO_SSRC, RTP_CNAME, MEDIA_STREAM_ID, "video");
         stream->video_track = stream->peer->addTrack(video);
 
@@ -1445,7 +1453,7 @@ namespace webrtc_stream {
 
         rtc::Description::Audio audio("audio", rtc::Description::Direction::SendOnly);
         audio.addOpusCodec(sdp::AUDIO_PAYLOAD_TYPE, "minptime=20;maxaveragebitrate=128000;stereo=1;sprop-stereo=1;useinbandfec=0");
-        audio.addSSRC(AUDIO_SSRC, RTP_CNAME, MEDIA_STREAM_ID, "audio");
+        audio.addSSRC(AUDIO_SSRC, RTP_CNAME, AUDIO_MEDIA_STREAM_ID, "audio");
         stream->audio_track = stream->peer->addTrack(audio);
 
         stream->audio_rtp = std::make_shared<rtc::RtpPacketizationConfig>(AUDIO_SSRC, RTP_CNAME, sdp::AUDIO_PAYLOAD_TYPE, AUDIO_CLOCK_RATE);
@@ -1862,6 +1870,18 @@ namespace webrtc_stream {
           if (const auto level = sdp::hevc_level_id(answer.sdp)) {
             BOOST_LOG(info) << "WebRTC: TV HEVC Main10 answer level-id "sv << *level;
           }
+        }
+        // Zero playout delay: the TV decodes and shows every frame the moment it is complete,
+        // instead of holding it for its own jitter estimate, as Stadia did. Set before the
+        // connection opens, so the video sender only ever reads it.
+        if (const auto id = sdp::video_extension_id(answer.sdp, sdp::PLAYOUT_DELAY_EXTENSION_URI)) {
+          stream->video_rtp->playoutDelayId = static_cast<std::uint8_t>(*id);
+          stream->video_rtp->playoutDelayMin = 0;
+          stream->video_rtp->playoutDelayMax = 0;
+          BOOST_LOG(info) << "WebRTC: TV accepted zero playout delay (extension "sv << *id << ')';
+        } else {
+          stream->video_rtp->playoutDelayId = 0;
+          BOOST_LOG(info) << "WebRTC: TV did not negotiate playout delay; it keeps its jitter buffer"sv;
         }
         stream->peer->setRemoteDescription(rtc::Description(answer.sdp, "answer"));
 

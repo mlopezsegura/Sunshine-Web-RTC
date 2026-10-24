@@ -14,6 +14,10 @@ const bitrate = Number(params.get("bitrate") || 12000);
 const fps = Number(params.get("fps") || 60);
 const hdr = params.get("hdr") === "1";
 const takeover = params.get("takeover") === "1";
+// Seconds of glass-to-glass measurement against clock.html; 0 skips it.
+const latencySeconds = Number(params.get("latency") || 0);
+// What the TV app does to its receiver: no lip sync, shortest jitter buffer.
+const tvTweaks = params.get("tvTweaks") !== "0";
 const log = [];
 const result = { codec, width, height, fps, hdr, steps: [], errors: [] };
 const t0 = performance.now();
@@ -25,7 +29,7 @@ async function finish() {
   result.log = log.slice(-80);
   await fetch("/result", { method: "POST", body: JSON.stringify(result) });
 }
-setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000);
+setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000 + latencySeconds * 1000);
 
 let ws, pc, sessionId, control, gamepad, phase = "auth", credentials = null, appId = null;
 const send = (m) => { log.push(">> " + m.type); ws.send(JSON.stringify(Object.assign({ version: 2 }, m))); };
@@ -65,6 +69,10 @@ async function handle(m) {
     if (m.requestType === "request-pairing" && !credentials) {
       send({ type: "request-pairing", pin, clientName: "E2E Edge" });
     }
+    if (m.requestType === "start-session") {
+      result.errors.push("start-session refused: " + (m.message || m.code));
+      finish();
+    }
   } else if (m.type === "paired") {
     note("paired");
     credentials = { clientId: m.clientId, clientSecret: m.clientSecret };
@@ -97,7 +105,7 @@ async function handle(m) {
   } else if (m.type === "session-status") {
     note("session-" + m.state, m.message ? { message: m.message } : undefined);
     if (m.sessionId) sessionId = m.sessionId;
-    if (m.state === "streaming") setTimeout(measure, 8000);
+    if (m.state === "streaming") setTimeout(latencySeconds > 0 ? measureLatency : measure, latencySeconds > 0 ? 3000 : 8000);
     if (m.state === "error") { result.errors.push("session error: " + m.message); finish(); }
     if (m.state === "idle" && phase === "stopping") {
       phase = "host-stop";
@@ -107,10 +115,15 @@ async function handle(m) {
     note("host-" + m.state, { running: m.runningAppId || null });
     if (m.state === "stopped" || m.state === "failed") finish();
   } else if (m.type === "offer") {
-    note("offer", { imageattr: /a=imageattr:96 send/.test(m.sdp), rtpmap: (m.sdp.match(/a=rtpmap:96 [^\r]+/) || [""])[0] });
+    note("offer", { imageattr: /a=imageattr:96 send/.test(m.sdp), rtpmap: (m.sdp.match(/a=rtpmap:96 [^\r]+/) || [""])[0],
+      playoutDelay: /a=extmap:\d+ http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay/.test(m.sdp) });
     pc = new RTCPeerConnection();
     pc.onicecandidate = (e) => { if (e.candidate) send({ type: "candidate", sessionId, candidate: e.candidate.candidate, mid: e.candidate.sdpMid }); };
-    pc.ontrack = (e) => { if (e.track.kind === "video") document.getElementById("video").srcObject = e.streams[0] || new MediaStream([e.track]); };
+    pc.ontrack = (e) => {
+      if (e.track.kind !== "video") return;
+      if (tvTweaks && "jitterBufferTarget" in e.receiver) e.receiver.jitterBufferTarget = 0;
+      document.getElementById("video").srcObject = new MediaStream([e.track]);
+    };
     pc.ondatachannel = (e) => {
       const channel = e.channel;
       if (channel.label === "control") {
@@ -126,13 +139,108 @@ async function handle(m) {
       }
     };
     pc.onconnectionstatechange = () => note("pc-" + pc.connectionState);
-    await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
+    await pc.setRemoteDescription({ type: "offer", sdp: tvTweaks ? separateAudioSync(m.sdp) : m.sdp });
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     send({ type: "answer", sessionId, sdp: pc.localDescription.sdp });
   } else if (m.type === "candidate") {
     if (pc) await pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid });
   }
+}
+
+// Same as tizen/low-latency.js: audio in a stream of its own, so the video is not held for it.
+function separateAudioSync(sdp) {
+  let inAudio = false;
+  const rename = (stream) => (stream === "-" || stream.endsWith("-audio") ? stream : stream + "-audio");
+  return sdp.split("\r\n").map((line) => {
+    if (line.startsWith("m=")) { inAudio = line.startsWith("m=audio"); return line; }
+    if (!inAudio) return line;
+    return line.replace(/^(a=msid:)(\S+)/, (m, p, s) => p + rename(s)).replace(/^(a=ssrc:\d+ msid:)(\S+)/, (m, p, s) => p + rename(s));
+  }).join("\r\n");
+}
+
+async function videoStats() {
+  const out = {};
+  (await pc.getStats()).forEach((s) => {
+    if (s.type === "inbound-rtp" && s.kind === "video") out.video = s;
+    if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") out.rtt = s.currentRoundTripTime;
+  });
+  return out;
+}
+
+function percentile(sorted, share) {
+  return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * share))] : null;
+}
+
+// Reads clock.html's row of cells back from every presented frame: white and black references,
+// then 24 bits of the wall clock in milliseconds. Same machine, same clock.
+async function measureLatency() {
+  const video = document.getElementById("video");
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const samples = [];
+  const toScreen = [];
+  let unreadable = 0;
+  const startStats = await videoStats();
+  const ends = performance.now() + latencySeconds * 1000;
+  await new Promise((resolve) => {
+    const onFrame = (now, metadata) => {
+      const cell = video.videoHeight / 27;
+      canvas.width = Math.ceil(cell * 26);
+      canvas.height = Math.ceil(cell);
+      context.drawImage(video, 0, 0, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      const luma = (index) => {
+        const x = Math.floor(cell * (index + 0.5));
+        const y = Math.floor(cell * 0.5);
+        const offset = (y * canvas.width + x) * 4;
+        return pixels[offset] * 0.299 + pixels[offset + 1] * 0.587 + pixels[offset + 2] * 0.114;
+      };
+      const white = luma(0);
+      const black = luma(1);
+      if (!result.debugFrame) {
+        const full = document.createElement("canvas");
+        full.width = 480;
+        full.height = Math.round(480 * video.videoHeight / video.videoWidth);
+        full.getContext("2d").drawImage(video, 0, 0, full.width, full.height);
+        result.debugFrame = { white, black, videoWidth: video.videoWidth, videoHeight: video.videoHeight, png: full.toDataURL("image/png") };
+      }
+      const shownAt = Date.now() - (performance.now() - (metadata.expectedDisplayTime || now));
+      if (white - black > 100) {
+        const threshold = (white + black) / 2;
+        let value = 0;
+        for (let bit = 0; bit < 24; bit += 1) value = (value << 1) | (luma(bit + 2) > threshold ? 1 : 0);
+        const elapsed = ((Math.round(shownAt) & 0xffffff) - value + 0x1000000) % 0x1000000;
+        if (elapsed < 2000) samples.push(elapsed); else unreadable += 1;
+      } else {
+        unreadable += 1;
+      }
+      if (metadata.receiveTime) toScreen.push((metadata.expectedDisplayTime || now) - metadata.receiveTime);
+      if (performance.now() < ends) video.requestVideoFrameCallback(onFrame); else resolve();
+    };
+    video.requestVideoFrameCallback(onFrame);
+  });
+  const endStats = await videoStats();
+  const a = startStats.video || {};
+  const b = endStats.video || {};
+  const per = (total, count) => (b[count] - a[count]) > 0 ? Math.round(1000 * (b[total] - a[total]) / (b[count] - a[count]) * 100) / 100 : null;
+  const sorted = samples.slice().sort((x, y) => x - y);
+  const mean = (list) => list.length ? Math.round(list.reduce((sum, x) => sum + x, 0) / list.length * 10) / 10 : null;
+  result.latency = {
+    frames: samples.length, unreadable,
+    meanMs: mean(samples), p50Ms: percentile(sorted, 0.5), p95Ms: percentile(sorted, 0.95), p99Ms: percentile(sorted, 0.99),
+    minMs: sorted.length ? sorted[0] : null, maxMs: sorted.length ? sorted[sorted.length - 1] : null,
+    arrivalToScreenMs: mean(toScreen),
+    jitterBufferMs: per("jitterBufferDelay", "jitterBufferEmittedCount"),
+    decodeMs: per("totalDecodeTime", "framesDecoded"),
+    rttMs: endStats.rtt != null ? Math.round(endStats.rtt * 10000) / 10 : null,
+    decodedFps: Math.round((b.framesDecoded - a.framesDecoded) / latencySeconds * 10) / 10,
+    packetsLost: (b.packetsLost || 0) - (a.packetsLost || 0),
+    decoder: b.decoderImplementation,
+  };
+  note("latency-measured");
+  phase = "stopping";
+  send({ type: "stop-session" });
 }
 
 async function measure() {

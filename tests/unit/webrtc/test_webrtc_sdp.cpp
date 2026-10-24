@@ -38,6 +38,18 @@ TEST(WebrtcSdpTest, AcceptsOneImageAttributeInTheVideoSection) {
   EXPECT_FALSE(sdp::has_valid_game_mode_image_attribute(offer(attribute) + "a=bare\n", value));
 }
 
+TEST(WebrtcSdpTest, ReadsTheVideoExtensionIdTheTvAccepted) {
+  const std::string uri = sdp::PLAYOUT_DELAY_EXTENSION_URI;
+  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:6 " + uri + "\r\n"), uri), 6);
+  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:9 http://example.com/other\r\na=extmap:12/recvonly " + uri + " attribute\r\n"), uri), 12);
+  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:6 " + uri + "-v2\r\n"), uri), std::nullopt);
+  EXPECT_EQ(sdp::video_extension_id(offer("a=extmap:x " + uri + "\r\n"), uri), std::nullopt);
+  EXPECT_EQ(sdp::video_extension_id(offer("a=rtpmap:96 H264/90000\r\n"), uri), std::nullopt);
+  // Only the video section counts: an audio section's extension does not mark video packets.
+  EXPECT_EQ(sdp::video_extension_id("v=0\r\nm=audio 9 RTP 111\r\na=extmap:6 " + uri + "\r\n" + offer(""), uri), std::nullopt);
+  EXPECT_EQ(sdp::video_extension_id("v=0\r\n", uri), std::nullopt);
+}
+
 TEST(WebrtcSdpTest, RequiresTheRequestedCodecAlone) {
   EXPECT_TRUE(sdp::has_expected_video_codec(offer("a=rtpmap:96 H265/90000\r\n"), protocol::video_codec_e::hevc));
   EXPECT_FALSE(sdp::has_expected_video_codec(offer("a=rtpmap:96 H265/90000\r\na=rtpmap:97 H264/90000\r\n"), protocol::video_codec_e::hevc));
