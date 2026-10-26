@@ -24,6 +24,7 @@ extern "C" {
 // local includes
 #include "display.h"
 #include "misc.h"
+#include "remoteidd/FrameConsumer.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
@@ -1912,6 +1913,74 @@ namespace platf::dxgi {
 
   capture_e display_wgc_vram_t::release_snapshot() {
     return dup.release_frame();
+  }
+
+  /**
+   * Copy the most recent frame published by the RemoteIdd driver into a new snapshot texture.
+   */
+  capture_e display_ridd_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool /*cursor_visible*/) {
+    switch (consumer->WaitFrame(static_cast<DWORD>(timeout.count()))) {
+      case osms::ridd::FrameConsumer::Wait::Frame:
+        break;
+      case osms::ridd::FrameConsumer::Wait::Timeout:
+        return capture_e::timeout;
+      default:
+        return capture_e::reinit;
+    }
+
+    ID3D11Texture2D *raw = nullptr;
+    RemoteIddFrameInfo frame;
+    if (!consumer->Acquire(static_cast<DWORD>(timeout.count()), &raw, &frame)) {
+      // Texture recreated or still held by the driver: the next frame will bring it.
+      return capture_e::timeout;
+    }
+    texture2d_t src {raw};
+
+    // From here on the driver cannot write the texture: copy it and let go quickly.
+    auto release = util::fail_guard([&]() {
+      consumer->Release();
+    });
+
+    if (frame.Width != width_before_rotation || frame.Height != height_before_rotation) {
+      BOOST_LOG(info) << "Capture size changed ["sv << width << 'x' << height << " -> "sv << frame.Width << 'x' << frame.Height << ']';
+      return capture_e::reinit;
+    }
+    if (static_cast<DXGI_FORMAT>(frame.DxgiFormat) != capture_format) {
+      BOOST_LOG(info) << "Capture format changed ["sv << dxgi_format_to_string(capture_format) << " -> "sv << dxgi_format_to_string(static_cast<DXGI_FORMAT>(frame.DxgiFormat)) << ']';
+      return capture_e::reinit;
+    }
+
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    d3d_img->blank = false;
+    if (complete_img(d3d_img.get(), false) != 0) {
+      return capture_e::capture_error;
+    }
+    {
+      texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+      if (!lock_helper.lock()) {
+        BOOST_LOG(error) << "Failed to lock capture texture";
+        return capture_e::capture_error;
+      }
+      device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+    }
+
+    auto frame_timestamp = std::chrono::steady_clock::now();
+    if (frame.QpcPresent) {
+      frame_timestamp -= qpc_time_difference(qpc_counter(), static_cast<int64_t>(frame.QpcPresent));
+    }
+    img_out = img;
+    img_out->frame_timestamp = frame_timestamp;
+    return capture_e::ok;
+  }
+
+  capture_e display_ridd_vram_t::release_snapshot() {
+    // The shared texture is released right after the copy in snapshot().
+    return capture_e::ok;
   }
 
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {

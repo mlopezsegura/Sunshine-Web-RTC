@@ -2422,6 +2422,12 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             @note{Applies to Windows only.}
             @attention{This capture method is not compatible with the Sunshine service.}</td>
     </tr>
+    <tr>
+        <td>remoteidd</td>
+        <td>Read the frames published by the OpenStreamMS RemoteIdd display driver of the current
+            session, without Desktop Duplication or WGC. Never chosen automatically.
+            @note{Applies to Windows only. Requires a hardware encoder and SDR.}</td>
+    </tr>
 </table>
 
 ### fp16_sdr_gamma_encoded
