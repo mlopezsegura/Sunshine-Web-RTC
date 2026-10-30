@@ -1822,7 +1822,8 @@ namespace confighttp {
    * @brief List client pairing requests that are waiting for PIN approval.
    *
    * Moonlight WebRTC TVs waiting to pair are listed beside Moonlight clients and are approved
-   * or cancelled through the same endpoints.
+   * or cancelled through the same endpoints. Each request's `kind` tells them apart:
+   * `moonlight` for a Moonlight client, `webrtc` for a Moonlight WebRTC TV.
    *
    * @api_examples{/api/pin|:| GET|:| null}
    */
@@ -1840,6 +1841,7 @@ namespace confighttp {
         {"id", pairing.id},
         {"name", pairing.name},
         {"address", pairing.address},
+        {"kind", "moonlight"},
       });
     }
     // Moonlight WebRTC TVs show their PIN like Moonlight does and are approved in the same form.
@@ -1848,6 +1850,7 @@ namespace confighttp {
         {"id", pairing.id},
         {"name", pairing.name},
         {"address", pairing.address},
+        {"kind", "webrtc"},
       });
     }
     send_response(response, output_tree);

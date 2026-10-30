@@ -3,7 +3,9 @@
  * @brief Definitions for the Windows display base code.
  */
 // standard includes
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <thread>
 #include <utility>
@@ -20,6 +22,7 @@
 #include <MinHook.h>
 
 // local includes
+#include "frame_rate_limiter.h"
 #include "utf_utils.h"
 
 // Including Boost.Process before Windows.h prevents the definition of NTSTATUS, so we must define it ourselves.
@@ -251,6 +254,23 @@ namespace platf::dxgi {
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
 
+    // When the display composes much faster than the client rate (e.g. an RDP session whose
+    // composition interval is set well above the client rate), a fixed client-rate grid loses
+    // frames: updates land on display ticks and a slot can come back empty. Send frames as they
+    // arrive instead, capped at the client rate.
+    std::optional<frame_rate_limiter_t> arrival_limiter;
+    std::shared_ptr<img_t> held_img;
+    if (display_refresh_rate.Numerator > 0 && display_refresh_rate.Denominator > 0) {
+      const double display_rate = (double) display_refresh_rate.Numerator / display_refresh_rate.Denominator;
+      const double client_rate = (double) client_frame_rate_adjusted.Numerator / client_frame_rate_adjusted.Denominator;
+      if (display_rate >= client_rate * 1.5) {
+        const std::chrono::nanoseconds period = std::chrono::nanoseconds(1s) * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
+        const std::chrono::nanoseconds tick = std::chrono::nanoseconds(1s) * display_refresh_rate.Denominator / display_refresh_rate.Numerator;
+        arrival_limiter.emplace(period, std::min(tick, period / 2));
+        BOOST_LOG(info) << "Capturing frames as they arrive, capped at " << client_rate << "fps (display " << display_rate << "Hz)";
+      }
+    }
+
     // Keep the display awake during capture. If the display goes to sleep during
     // capture, best case is that capture stops until it powers back on. However,
     // worst case it will trigger us to reinit DD, waking the display back up in
@@ -273,8 +293,45 @@ namespace platf::dxgi {
       platf::capture_e status = capture_e::ok;
       std::shared_ptr<img_t> img_out;
 
+      if (arrival_limiter) {
+        // Sleep until the earliest time the next frame can be accepted instead of spinning
+        if (const auto next_time = arrival_limiter->next_accept_time()) {
+          const auto now = std::chrono::steady_clock::now();
+          if (*next_time > now) {
+            timer->sleep_for(*next_time - now);
+          }
+        }
+
+        // If an early frame is already held, probe with 0ms to see if a newer one arrived;
+        // otherwise wait up to 200ms for the next frame.
+        const auto wait = held_img ? 0ms : 200ms;
+
+        status = snapshot(pull_free_image_cb, img_out, wait, *cursor);
+
+        if (status == capture_e::ok && img_out) {
+          const auto timestamp = img_out->frame_timestamp.value_or(std::chrono::steady_clock::now());
+          if (!arrival_limiter->accept(timestamp)) {
+            // Too early for the client rate: keep it, it is sent at its slot unless a newer frame replaces it.
+            held_img = std::move(img_out);
+            status = release_snapshot();
+            if (status != platf::capture_e::ok) {
+              return status;
+            }
+            continue;
+          }
+          held_img.reset();
+        } else if (status == capture_e::timeout && held_img) {
+          arrival_limiter->accept(std::chrono::steady_clock::now());
+          img_out = std::move(held_img);
+          status = capture_e::ok;
+        } else if (status == capture_e::timeout) {
+          // Nothing is updating the display: let the encoding thread take the device lock (see below).
+          std::this_thread::sleep_for(10ms);
+        }
+      }
+
       // Try to continue frame pacing group, snapshot() is called with zero timeout after waiting for client frame interval
-      if (frame_pacing_group_start) {
+      else if (frame_pacing_group_start) {
         const uint32_t seconds = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
         const uint32_t remainder = (uint64_t) frame_pacing_group_frames * client_frame_rate_adjusted.Denominator % client_frame_rate_adjusted.Numerator;
         const auto sleep_target = *frame_pacing_group_start +
@@ -304,7 +361,7 @@ namespace platf::dxgi {
       }
 
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
-      if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
+      if (!arrival_limiter && (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start))) {
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
 
         if (status == capture_e::ok && img_out) {
@@ -1027,6 +1084,20 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    // OpenStreamMS RemoteIdd: only on explicit request, never part of auto-detection.
+    if (config::video.capture == "remoteidd") {
+      if (hwdevice_type == mem_type_e::dxgi) {
+        auto disp = std::make_shared<dxgi::display_ridd_vram_t>();
+
+        if (!disp->init(config, display_name)) {
+          return disp;
+        }
+      } else {
+        BOOST_LOG(error) << "RemoteIdd capture requires a hardware encoder"sv;
+      }
+      return nullptr;
+    }
+
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();

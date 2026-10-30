@@ -19,6 +19,10 @@
 #include "src/utility.h"
 #include "src/video.h"
 
+namespace osms::ridd {
+  class FrameConsumer;
+}
+
 namespace platf::dxgi {
   /**
    * @brief Diagnostic names indexed by DXGI_FORMAT.
@@ -857,5 +861,47 @@ namespace platf::dxgi {
      * @return Capture status after releasing the current snapshot.
      */
     capture_e release_snapshot() override;
+  };
+
+  /**
+   * Display backend that reads the frames published by the OpenStreamMS RemoteIdd driver.
+   *
+   * The driver copies every swapchain buffer into a shared texture (NT handle + keyed
+   * mutex) and announces it through a named slot; this backend copies that texture into
+   * the capture image without going through Desktop Duplication or WGC. Only selected
+   * with capture = remoteidd.
+   */
+  class display_ridd_vram_t: public display_vram_t {
+  public:
+    display_ridd_vram_t();
+    ~display_ridd_vram_t() override;
+
+    /**
+     * @brief Initialize the display and open the RemoteIdd frame slot.
+     *
+     * @param config Configuration values to apply.
+     * @param display_name Display name.
+     * @return 0 on success; nonzero when the driver is not publishing frames.
+     */
+    int init(const ::video::config_t &config, const std::string &display_name);
+    /**
+     * @brief Copy the most recent RemoteIdd frame into the provided image object.
+     *
+     * @param pull_free_image_cb Callback that provides an available image buffer.
+     * @param img_out Captured image buffer returned to the streaming pipeline.
+     * @param timeout Maximum time to wait for the operation.
+     * @param cursor_visible Unused: the cursor is composed into the IddCx swapchain.
+     * @return Capture status reported to the streaming pipeline.
+     */
+    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
+    /**
+     * @brief Release resources associated with the last captured snapshot.
+     *
+     * @return Capture status after releasing the current snapshot.
+     */
+    capture_e release_snapshot() override;
+
+  private:
+    std::unique_ptr<osms::ridd::FrameConsumer> consumer;  ///< Reader of the RemoteIdd frame slot.
   };
 }  // namespace platf::dxgi

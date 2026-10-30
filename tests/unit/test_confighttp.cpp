@@ -629,6 +629,7 @@ TEST_F(ConfigHttpTest, PairingRestApiListsAuthenticatedPendingRequests) {
   EXPECT_EQ(body.at("pairings").front().at("id"), pairing_id);
   EXPECT_EQ(body.at("pairings").front().at("name"), "REST client");
   EXPECT_EQ(body.at("pairings").front().at("address"), "192.0.2.30");
+  EXPECT_EQ(body.at("pairings").front().at("kind"), "moonlight");
 }
 
 TEST_F(ConfigHttpTest, PairingRestApiRejectsMalformedFieldsWithoutConsumingRequest) {

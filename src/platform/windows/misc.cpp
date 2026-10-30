@@ -321,8 +321,12 @@ namespace platf {
     TOKEN_ELEVATION_TYPE elevationType;
     DWORD dwSize;
 
-    // Get the session ID of the active console session
-    consoleSessionId = WTSGetActiveConsoleSessionId();
+    // Session whose user runs the commands. As a service (session 0) that is the active console
+    // session; a SYSTEM Sunshine launched inside a user session (OpenStreamMS seats with
+    // capture = remoteidd) must use its own session, or apps would open on the console.
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &consoleSessionId) || consoleSessionId == 0) {
+      consoleSessionId = WTSGetActiveConsoleSessionId();
+    }
     if (0xFFFFFFFF == consoleSessionId) {
       // If there is no active console session, log a warning and return null
       BOOST_LOG(warning) << "There isn't an active user session, therefore it is not possible to execute commands under the users profile.";
