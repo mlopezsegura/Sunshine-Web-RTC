@@ -337,6 +337,7 @@ protected:
     server->resource["^/virtual-input-license-test$"]["GET"] = confighttp::getVirtualInputLicense;
     server->resource["^/virtual-input-license-test$"]["POST"] = confighttp::updateVirtualInputLicense;
     server->resource["^/permissions-test$"]["GET"] = confighttp::getPermissions;
+    server->resource["^/streams-test$"]["GET"] = confighttp::getActiveStreams;
     server->resource["^/permissions-test$"]["POST"] = confighttp::requestPermission;
     server->resource["^/pairing-test$"]["DELETE"] = confighttp::cancelPairing;
     server->resource["^/pairing-test$"]["GET"] = confighttp::getPendingPairings;
@@ -512,6 +513,7 @@ INSTANTIATE_TEST_SUITE_P(
     endpoint_request_t {"CsrfToken", "GET", "/csrf-token-test", ""},
     endpoint_request_t {"BrowseDirectory", "GET", "/browse-test", ""},
     endpoint_request_t {"PairingList", "GET", "/pairing-test", ""},
+    endpoint_request_t {"ActiveStreams", "GET", "/streams-test", ""},
     endpoint_request_t {"PortalTokenReset", "POST", "/portal-token-reset-test", ""},
     endpoint_request_t {"VirtualInputStatus", "GET", "/virtual-input-status-test", ""},
     endpoint_request_t {"VirtualInputLicense", "GET", "/virtual-input-license-test", ""},
@@ -1757,6 +1759,20 @@ TEST_F(ConfigHttpTest, PermissionsEndpointReturnsRequiredAndOptionalStatuses) {
   EXPECT_EQ(body.at("permissions").at(0).at("id"), "screen_recording");
   EXPECT_TRUE(body.at("permissions").at(0).at("required").get<bool>());
   EXPECT_FALSE(body.at("permissions").at(1).at("required").get<bool>());
+}
+
+TEST_F(ConfigHttpTest, ActiveStreamsEndpointReportsMoonlightAndWebRtcCounts) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+
+  const auto response = client->request("GET", "/streams-test", "", headers);
+  ASSERT_EQ(response->status_code, "200 OK");
+  assert_security_headers(response);
+  const auto body = nlohmann::json::parse(response->content.string());
+  EXPECT_TRUE(body.at("status").get<bool>());
+  EXPECT_EQ(body.at("moonlight").get<int>(), 0);
+  EXPECT_EQ(body.at("webrtc").get<int>(), 0);
+  EXPECT_EQ(body.at("total").get<int>(), 0);
 }
 
 TEST_F(ConfigHttpTest, PermissionsEndpointRejectsMalformedAndUnknownRequests) {

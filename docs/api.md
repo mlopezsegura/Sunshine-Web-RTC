@@ -58,6 +58,9 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 ## POST /api/clients/unpair
 @copydoc confighttp::unpair()
 
+## GET /api/streams
+@copydoc confighttp::getActiveStreams()
+
 ## POST /api/clients/unpair-all
 @copydoc confighttp::unpairAll()
 
