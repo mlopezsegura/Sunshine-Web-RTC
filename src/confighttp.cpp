@@ -1339,6 +1339,41 @@ namespace confighttp {
   }
 
   /**
+   * @brief Get how many clients are streaming right now.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * The response counts Moonlight sessions and Moonlight WebRTC TV sessions separately:
+   * @code{.json}
+   * {
+   *   "moonlight": 1,
+   *   "webrtc": 0,
+   *   "total": 1,
+   *   "status": true
+   * }
+   * @endcode
+   *
+   * @api_examples{/api/streams|:| GET|:| null}
+   */
+  void getActiveStreams(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    const int moonlight = rtsp_stream::session_count();
+    const int webrtc = webrtc_stream::session_count();
+
+    nlohmann::json output_tree;
+    output_tree["moonlight"] = moonlight;
+    output_tree["webrtc"] = webrtc;
+    output_tree["total"] = moonlight + webrtc;
+    output_tree["status"] = true;
+    send_response(response, output_tree);
+  }
+
+  /**
    * @brief Enable or disable a client.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -2525,6 +2560,7 @@ namespace confighttp {
     server.resource["^/api/apps/([0-9]+)$"]["DELETE"] = deleteApp;
     server.resource["^/api/apps/close$"]["POST"] = closeApp;
     server.resource["^/api/clients/list$"]["GET"] = getClients;
+    server.resource["^/api/streams$"]["GET"] = getActiveStreams;
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;
     server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
     server.resource["^/api/clients/update$"]["POST"] = updateClient;

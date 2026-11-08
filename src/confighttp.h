@@ -183,6 +183,14 @@ namespace confighttp {
   void getPermissions(const resp_https_t &response, const req_https_t &request);
 
   /**
+   * @brief Report how many clients are streaming right now.
+   *
+   * @param response HTTPS response receiving the stream counts JSON.
+   * @param request Authenticated HTTPS request.
+   */
+  void getActiveStreams(const resp_https_t &response, const req_https_t &request);
+
+  /**
    * @brief Initiate a native permission request from the Web UI.
    *
    * @param response HTTPS response receiving the request result.
