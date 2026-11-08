@@ -13,6 +13,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -72,7 +73,19 @@ namespace webrtc_stream {
     std::function<void(bool, std::uint8_t)> mouse_button;  ///< Press flag and Moonlight button.
     std::function<void(std::int8_t)> scroll;  ///< Vertical wheel clicks.
     std::function<void(std::int8_t)> horizontal_scroll;  ///< Horizontal wheel clicks.
+    std::function<void(std::vector<std::uint8_t> &&)> keyboard_mouse_packet;  ///< Validated keyboard or mouse packet from the client.
   };
+
+  /**
+   * @brief Check a keyboard or mouse packet sent by a browser on the input DataChannel.
+   *
+   * Only Moonlight keyboard, mouse motion, mouse button and scroll packets of their exact size are
+   * accepted, so a client cannot inject controller packets that bypass the gamepad bridge.
+   *
+   * @param packet Serialized Moonlight input packet, header included.
+   * @return True when the packet may be passed to Sunshine.
+   */
+  bool is_keyboard_mouse_packet(std::span<const std::byte> packet);
 
   /**
    * @brief Build an input API that feeds Moonlight input packets to a sink.
@@ -121,6 +134,13 @@ namespace webrtc_stream {
      * @return True when the snapshot was valid, current and applied.
      */
     bool handle_gamepad_message(std::string_view text, clock::time_point received_at = clock::now());
+
+    /**
+     * @brief Handle a keyboard or mouse packet from the input DataChannel.
+     * @param packet Serialized Moonlight input packet, header included.
+     * @return True when the packet was valid and forwarded to the host.
+     */
+    bool handle_keyboard_mouse_packet(std::span<const std::byte> packet);
 
     /**
      * @brief Start or stop forwarding input to the host.

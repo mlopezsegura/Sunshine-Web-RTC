@@ -31,7 +31,7 @@ async function finish() {
 }
 setTimeout(() => { result.errors.push("timeout"); finish(); }, 60000 + latencySeconds * 1000);
 
-let ws, pc, sessionId, control, gamepad, phase = "auth", credentials = null, appId = null;
+let ws, pc, sessionId, control, gamepad, input, phase = "auth", credentials = null, appId = null;
 const send = (m) => { log.push(">> " + m.type); ws.send(JSON.stringify(Object.assign({ version: 2 }, m))); };
 
 async function hmacHex(secretHex, text) {
@@ -136,6 +136,9 @@ async function handle(m) {
       } else if (channel.label === "gamepad") {
         gamepad = channel;
         channel.onopen = () => note("gamepad-open");
+      } else if (channel.label === "input") {
+        input = channel;
+        channel.onopen = () => note("input-open");
       }
     };
     pc.onconnectionstatechange = () => note("pc-" + pc.connectionState);
@@ -243,7 +246,27 @@ async function measureLatency() {
   send({ type: "stop-session" });
 }
 
+// A Moonlight input packet as a browser sends it on the input channel: big-endian size, then
+// little-endian type, then the payload the callback fills in.
+function inputPacket(magic, payloadSize, fill) {
+  const view = new DataView(new ArrayBuffer(8 + payloadSize));
+  view.setUint32(0, 4 + payloadSize, false);
+  view.setUint32(4, magic, true);
+  fill(view);
+  return view.buffer;
+}
+
 async function measure() {
+  // Keyboard and mouse that change nothing on the desktop: F15, which no application uses, and a
+  // pointer move that is undone at once. A controller packet on this channel must be dropped.
+  if (input && input.readyState === "open") {
+    const key = (magic) => inputPacket(magic, 6, (v) => v.setInt16(9, 0x7e, true));
+    const move = (dx, dy) => inputPacket(0x07, 4, (v) => { v.setInt16(8, dx, false); v.setInt16(10, dy, false); });
+    for (const packet of [key(0x03), key(0x04), move(40, 30), move(-40, -30), inputPacket(0x0c, 22, () => {})]) {
+      input.send(packet);
+    }
+    note("input-sent");
+  }
   // Neutral gamepad snapshots exercise the unreliable channel without pressing anything.
   for (let seq = 1; seq <= 20; seq++) {
     if (gamepad && gamepad.readyState === "open") {
