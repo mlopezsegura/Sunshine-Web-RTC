@@ -23,6 +23,10 @@
 #include "src/logging.h"
 #include "virtualhid_input.h"
 
+#ifdef _WIN32
+  #include "windows/session_input.h"
+#endif
+
 using namespace std::literals;
 
 namespace platf::virtualhid {
@@ -1152,34 +1156,82 @@ namespace platf {
 #endif
 
   void move_mouse(input_t &input, int deltaX, int deltaY) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::move_mouse(deltaX, deltaY);
+      return;
+    }
+#endif
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
   }
 
   void move_mouse(input_t &input, const touch_port_t &touch_port, int deltaX, int deltaY) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::move_mouse(deltaX, deltaY);
+      return;
+    }
+#endif
     virtualhid::move_mouse(virtualhid::get_input_context(input), touch_port, deltaX, deltaY);
   }
 
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::abs_mouse(touch_port, x, y);
+      return;
+    }
+#endif
     virtualhid::abs_mouse(virtualhid::get_input_context(input), touch_port, x, y);
   }
 
   void button_mouse(input_t &input, int button, bool release) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::button_mouse(button, release);
+      return;
+    }
+#endif
     virtualhid::button_mouse(virtualhid::get_input_context(input), button, release);
   }
 
   void scroll(input_t &input, int high_res_distance) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::scroll(high_res_distance);
+      return;
+    }
+#endif
     virtualhid::scroll(virtualhid::get_input_context(input), high_res_distance);
   }
 
   void hscroll(input_t &input, int high_res_distance) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::hscroll(high_res_distance);
+      return;
+    }
+#endif
     virtualhid::hscroll(virtualhid::get_input_context(input), high_res_distance);
   }
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags, bool extended) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::keyboard_update(modcode, release, flags, extended);
+      return;
+    }
+#endif
     virtualhid::keyboard_update(virtualhid::get_input_context(input), modcode, release, flags, extended);
   }
 
   void unicode(input_t &input, const char *utf8, int size) {
+#ifdef _WIN32
+    if (session_input::should_use()) {
+      session_input::unicode(utf8, size);
+      return;
+    }
+#endif
     virtualhid::unicode(virtualhid::get_input_context(input), utf8, size);
   }
 
