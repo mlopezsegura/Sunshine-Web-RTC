@@ -188,6 +188,40 @@ namespace webrtc_stream {
     }
   }  // namespace
 
+  bool is_keyboard_mouse_packet(std::span<const std::byte> packet) {
+    NV_INPUT_HEADER header {};
+    if (packet.size() < sizeof(header)) {
+      return false;
+    }
+    std::memcpy(&header, packet.data(), sizeof(header));
+    std::size_t expected_size = 0;
+    switch (util::endian::little(header.magic)) {
+      case KEY_DOWN_EVENT_MAGIC:
+      case KEY_UP_EVENT_MAGIC:
+        expected_size = sizeof(NV_KEYBOARD_PACKET);
+        break;
+      case MOUSE_MOVE_REL_MAGIC_GEN5:
+        expected_size = sizeof(NV_REL_MOUSE_MOVE_PACKET);
+        break;
+      case MOUSE_MOVE_ABS_MAGIC:
+        expected_size = sizeof(NV_ABS_MOUSE_MOVE_PACKET);
+        break;
+      case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
+      case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
+        expected_size = sizeof(NV_MOUSE_BUTTON_PACKET);
+        break;
+      case SCROLL_MAGIC_GEN5:
+        expected_size = sizeof(NV_SCROLL_PACKET);
+        break;
+      case SS_HSCROLL_MAGIC:
+        expected_size = sizeof(SS_HSCROLL_PACKET);
+        break;
+      default:
+        return false;
+    }
+    return packet.size() == expected_size && util::endian::big(header.size) == expected_size - sizeof(header.size);
+  }
+
   input_api_t make_packet_input_api(std::function<void(std::vector<std::uint8_t> &&)> sink) {
     input_api_t api;
     api.controller_arrival = [sink](std::uint8_t slot, std::uint16_t, std::uint8_t type, std::uint32_t supported_buttons, std::uint16_t capabilities) {
@@ -238,13 +272,14 @@ namespace webrtc_stream {
       packet.scrollAmount = util::endian::big(static_cast<std::int16_t>(clicks * WHEEL_DELTA_UNITS));
       sink(serialize(packet, SS_HSCROLL_MAGIC));
     };
+    api.keyboard_mouse_packet = sink;
     return api;
   }
 
   input_bridge_t::input_bridge_t(input_api_t api, control_sender_t control_sender):
       _api(std::move(api)),
       _control_sender(std::move(control_sender)) {
-    if (!_api.controller_arrival || !_api.controller_state || !_api.mouse_move || !_api.mouse_button || !_api.scroll || !_api.horizontal_scroll) {
+    if (!_api.controller_arrival || !_api.controller_state || !_api.mouse_move || !_api.mouse_button || !_api.scroll || !_api.horizontal_scroll || !_api.keyboard_mouse_packet) {
       throw std::invalid_argument("Every input callback is required");
     }
     _worker = std::jthread([this](std::stop_token stop_token) {
@@ -439,6 +474,21 @@ namespace webrtc_stream {
       }
     }
     controller.previous_buttons = buttons;
+    return true;
+  }
+
+  bool input_bridge_t::handle_keyboard_mouse_packet(std::span<const std::byte> packet) {
+    if (!is_keyboard_mouse_packet(packet)) {
+      return false;
+    }
+    std::vector<std::uint8_t> bytes(packet.size());
+    std::memcpy(bytes.data(), packet.data(), packet.size());
+    // Sent under the lock, like controller packets, so nothing reaches a stream that has stopped.
+    std::lock_guard lock(_mutex);
+    if (_shutdown || !_stream_active) {
+      return false;
+    }
+    _api.keyboard_mouse_packet(std::move(bytes));
     return true;
   }
 

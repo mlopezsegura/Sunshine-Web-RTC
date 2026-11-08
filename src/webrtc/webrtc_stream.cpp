@@ -378,6 +378,7 @@ namespace webrtc_stream {
       std::shared_ptr<rtc::Track> audio_track;  ///< Send-only audio track.
       std::shared_ptr<rtc::DataChannel> control_channel;  ///< Ordered, reliable control channel.
       std::shared_ptr<rtc::DataChannel> gamepad_channel;  ///< Unordered, unreliable gamepad snapshots.
+      std::shared_ptr<rtc::DataChannel> input_channel;  ///< Ordered, reliable keyboard and mouse packets.
       std::shared_ptr<rtc::RtpPacketizationConfig> video_rtp;  ///< Video RTP state.
       std::shared_ptr<rtc::RtpPacketizationConfig> audio_rtp;  ///< Audio RTP state.
       std::shared_ptr<input_bridge_t> input_bridge;  ///< Gamepad translation for the whole stream.
@@ -1383,6 +1384,18 @@ namespace webrtc_stream {
         stream->gamepad_channel->onClosed([weak_stream] {
           if (const auto stream = weak_stream.lock()) {
             stream->input_bridge->on_transport_closed();
+          }
+        });
+
+        // Keyboard and mouse travel as Moonlight input packets. Clients that do not know this
+        // channel close it, which leaves gamepad input untouched.
+        rtc::DataChannelInit input_options;
+        input_options.reliability.unordered = false;
+        stream->input_channel = stream->peer->createDataChannel("input", input_options);
+        stream->input_channel->onMessage([weak_stream](rtc::message_variant data) {
+          const auto stream = weak_stream.lock();
+          if (stream && std::holds_alternative<rtc::binary>(data) && !stream->input_bridge->handle_keyboard_mouse_packet(std::get<rtc::binary>(data))) {
+            BOOST_LOG(verbose) << "WebRTC: dropped keyboard or mouse packet"sv;
           }
         });
 

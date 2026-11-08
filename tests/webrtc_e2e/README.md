@@ -4,7 +4,8 @@
 `client.html` in headless Edge, which plays the TV: it asks to pair showing a PIN, which the driver
 approves through `/api/pin` like a user in the Web UI would (after a wrong PIN and a cancellation); the
 page then reconnects and authenticates, lists the applications, fetches
-artwork, starts a stream, announces a gamepad, measures the decoded video and audio through `getStats()`,
+artwork, starts a stream, announces a gamepad, sends keyboard and mouse input that changes nothing
+(F15 and a pointer move it undoes) on the `input` channel, measures the decoded video and audio through `getStats()`,
 and finally stops the stream and the application. The driver prints the steps and statistics.
 
 ```sh

@@ -50,6 +50,7 @@ namespace {
     std::vector<state_t> states;
     std::vector<std::pair<bool, std::uint8_t>> mouse_buttons;
     std::vector<std::string> control_messages;
+    std::vector<std::vector<std::uint8_t>> keyboard_mouse_packets;
 
     input_api_t api() {
       input_api_t api;
@@ -70,6 +71,10 @@ namespace {
       api.scroll = [](std::int8_t) {
       };
       api.horizontal_scroll = [](std::int8_t) {
+      };
+      api.keyboard_mouse_packet = [this](std::vector<std::uint8_t> &&packet) {
+        std::lock_guard lock(mutex);
+        keyboard_mouse_packets.push_back(std::move(packet));
       };
       return api;
     }
@@ -100,6 +105,21 @@ namespace {
       {"rightStickY", 0},
     }
       .dump();
+  }
+
+  /**
+   * @brief Build a Moonlight packet the way the browser client does.
+   * @param packet Packet whose header is completed.
+   * @param magic Packet type.
+   * @return The serialized packet.
+   */
+  template<class T>
+  std::vector<std::byte> client_packet(T packet, std::uint32_t magic) {
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(T) - sizeof(std::uint32_t));
+    packet.header.magic = util::endian::little(magic);
+    std::vector<std::byte> bytes(sizeof(T));
+    std::memcpy(bytes.data(), &packet, sizeof(T));
+    return bytes;
   }
 
   template<class T>
@@ -154,6 +174,53 @@ TEST(WebrtcInputBridgeTest, BuildsPacketsSunshineAccepts) {
 
   EXPECT_EQ(util::endian::big(packet_as<NV_SCROLL_PACKET>(packets[4]).scrollAmt1), -120);
   EXPECT_EQ(util::endian::big(packet_as<SS_HSCROLL_PACKET>(packets[5]).scrollAmount), 120);
+}
+
+TEST(WebrtcInputBridgeTest, AcceptsOnlyKeyboardAndMousePackets) {
+  NV_KEYBOARD_PACKET keyboard {};
+  keyboard.keyCode = util::endian::little<std::int16_t>(0x41);
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(keyboard, KEY_DOWN_EVENT_MAGIC)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(keyboard, KEY_UP_EVENT_MAGIC)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(NV_REL_MOUSE_MOVE_PACKET {}, MOUSE_MOVE_REL_MAGIC_GEN5)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(NV_ABS_MOUSE_MOVE_PACKET {}, MOUSE_MOVE_ABS_MAGIC)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(NV_MOUSE_BUTTON_PACKET {}, MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(NV_MOUSE_BUTTON_PACKET {}, MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(NV_SCROLL_PACKET {}, SCROLL_MAGIC_GEN5)));
+  EXPECT_TRUE(is_keyboard_mouse_packet(client_packet(SS_HSCROLL_PACKET {}, SS_HSCROLL_MAGIC)));
+
+  // Controller packets must go through the gamepad bridge, which owns the controller slots.
+  EXPECT_FALSE(is_keyboard_mouse_packet(client_packet(NV_MULTI_CONTROLLER_PACKET {}, MULTI_CONTROLLER_MAGIC_GEN5)));
+  EXPECT_FALSE(is_keyboard_mouse_packet(client_packet(SS_CONTROLLER_ARRIVAL_PACKET {}, SS_CONTROLLER_ARRIVAL_MAGIC)));
+
+  // A known type with the wrong size, a short packet, or a header that disagrees with the size.
+  EXPECT_FALSE(is_keyboard_mouse_packet(client_packet(NV_SCROLL_PACKET {}, MOUSE_MOVE_REL_MAGIC_GEN5)));
+  auto truncated = client_packet(NV_REL_MOUSE_MOVE_PACKET {}, MOUSE_MOVE_REL_MAGIC_GEN5);
+  EXPECT_FALSE(is_keyboard_mouse_packet(std::span(truncated).first(4)));
+  truncated.pop_back();
+  EXPECT_FALSE(is_keyboard_mouse_packet(truncated));
+  auto wrong_header = client_packet(NV_REL_MOUSE_MOVE_PACKET {}, MOUSE_MOVE_REL_MAGIC_GEN5);
+  wrong_header[3] = std::byte {0x7F};
+  EXPECT_FALSE(is_keyboard_mouse_packet(wrong_header));
+}
+
+TEST(WebrtcInputBridgeTest, ForwardsKeyboardAndMousePacketsWhileTheStreamIsActive) {
+  recorder_t recorder;
+  input_bridge_t bridge(recorder.api(), recorder.sender());
+  NV_REL_MOUSE_MOVE_PACKET move {};
+  move.deltaX = util::endian::big<std::int16_t>(-7);
+  const auto packet = client_packet(move, MOUSE_MOVE_REL_MAGIC_GEN5);
+  EXPECT_FALSE(bridge.handle_keyboard_mouse_packet(packet));
+
+  bridge.set_stream_active(true);
+  EXPECT_TRUE(bridge.handle_keyboard_mouse_packet(packet));
+  EXPECT_FALSE(bridge.handle_keyboard_mouse_packet(client_packet(NV_MULTI_CONTROLLER_PACKET {}, MULTI_CONTROLLER_MAGIC_GEN5)));
+  ASSERT_EQ(recorder.keyboard_mouse_packets.size(), 1);
+  EXPECT_TRUE(input::testing::is_valid_input_packet(recorder.keyboard_mouse_packets[0]));
+  EXPECT_EQ(util::endian::big(packet_as<NV_REL_MOUSE_MOVE_PACKET>(recorder.keyboard_mouse_packets[0]).deltaX), -7);
+
+  bridge.shutdown();
+  EXPECT_FALSE(bridge.handle_keyboard_mouse_packet(packet));
+  EXPECT_EQ(recorder.keyboard_mouse_packets.size(), 1);
 }
 
 TEST(WebrtcInputBridgeTest, AnnouncesControllersOnceTheStreamIsActive) {
