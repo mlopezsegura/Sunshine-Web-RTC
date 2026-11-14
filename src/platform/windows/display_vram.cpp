@@ -7,6 +7,8 @@
 #include <array>
 #include <cmath>
 #include <span>
+#include <thread>
+#include <vector>
 
 // platform includes
 #include <d3dcompiler.h>
@@ -1919,6 +1921,15 @@ namespace platf::dxgi {
    * Copy the most recent frame published by the RemoteIdd driver into a new snapshot texture.
    */
   capture_e display_ridd_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool /*cursor_visible*/) {
+    // OpenStreamMS added or removed a session of the mosaic: rebuild the display (and
+    // with it the canvas and the mouse mapping).
+    if (layout_changed()) {
+      return capture_e::reinit;
+    }
+    if (!tiles.empty()) {
+      return mosaic_snapshot(pull_free_image_cb, img_out, timeout);
+    }
+
     switch (consumer->WaitFrame(static_cast<DWORD>(timeout.count()))) {
       case osms::ridd::FrameConsumer::Wait::Frame:
         break;
@@ -1972,6 +1983,125 @@ namespace platf::dxgi {
     auto frame_timestamp = std::chrono::steady_clock::now();
     if (frame.QpcPresent) {
       frame_timestamp -= qpc_time_difference(qpc_counter(), static_cast<int64_t>(frame.QpcPresent));
+    }
+    img_out = img;
+    img_out->frame_timestamp = frame_timestamp;
+    return capture_e::ok;
+  }
+
+  /**
+   * Mosaic: wait for a frame from any of the sessions, copy the tiles that changed onto
+   * the canvas and the canvas into a new snapshot texture. A session that does not change
+   * keeps its last frame on the canvas.
+   */
+  capture_e display_ridd_vram_t::mosaic_snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout) {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<HANDLE> events;
+    events.reserve(tiles.size());
+    for (auto &tile : tiles) {
+      if (!tile.consumer && now >= tile.next_open) {
+        open_tile(tile);
+      }
+      if (tile.consumer) {
+        events.push_back(tile.consumer->ReadyEvent());
+      }
+    }
+
+    if (!compose_now) {
+      if (events.empty()) {
+        // No session publishes yet: do not spin.
+        std::this_thread::sleep_for(std::min(timeout, 100ms));
+        return capture_e::timeout;
+      }
+      auto n = static_cast<DWORD>(events.size());
+      auto woke = WaitForMultipleObjects(n, events.data(), FALSE, static_cast<DWORD>(timeout.count()));
+      if (woke == WAIT_TIMEOUT) {
+        return capture_e::timeout;
+      }
+      if (woke >= WAIT_OBJECT_0 + n) {
+        return capture_e::reinit;
+      }
+      // Several sessions may have presented at once: consume their events too (all the
+      // tiles that changed are copied below), so one change is not encoded twice.
+      for (DWORD i = 0; i < n; ++i) {
+        if (i != woke - WAIT_OBJECT_0) {
+          WaitForSingleObject(events[i], 0);
+        }
+      }
+    }
+    compose_now = false;
+
+    bool updated = false;
+    uint64_t newest_qpc = 0;
+    for (auto &tile : tiles) {
+      if (!tile.consumer) {
+        continue;
+      }
+      auto id = tile.consumer->LatestFrameId();
+      if (!id || id == tile.last_frame) {
+        continue;
+      }
+
+      ID3D11Texture2D *raw = nullptr;
+      RemoteIddFrameInfo frame;
+      if (!tile.consumer->Acquire(4, &raw, &frame)) {
+        // Texture recreated or still held by the driver: the next frame will bring it.
+        continue;
+      }
+      texture2d_t src {raw};
+      auto release = util::fail_guard([&]() {
+        tile.consumer->Release();
+      });
+
+      if (static_cast<DXGI_FORMAT>(frame.DxgiFormat) != capture_format) {
+        continue;
+      }
+      if ((frame.Width < tile.frame_width || frame.Height < tile.frame_height) && (frame.Width < static_cast<uint32_t>(tile.width) || frame.Height < static_cast<uint32_t>(tile.height))) {
+        // The session shrank (it is being reconnected to its part): drop what is left of
+        // the bigger frame. Clearing resets every tile, so all are copied again.
+        tile.frame_width = frame.Width;
+        tile.frame_height = frame.Height;
+        clear_canvas();
+        compose_now = true;
+        return capture_e::timeout;
+      }
+      tile.frame_width = frame.Width;
+      tile.frame_height = frame.Height;
+
+      // Sessions are reconnected to the size of their part; while one is not (yet), it
+      // is cropped to its part rather than scaled.
+      D3D11_BOX box {0, 0, 0, std::min<UINT>(frame.Width, tile.width), std::min<UINT>(frame.Height, tile.height), 1};
+      device_ctx->CopySubresourceRegion(canvas.get(), 0, tile.x, tile.y, 0, src.get(), 0, &box);
+      tile.last_frame = frame.FrameId;
+      newest_qpc = std::max<uint64_t>(newest_qpc, frame.QpcPresent);
+      updated = true;
+    }
+    if (!updated) {
+      return capture_e::timeout;
+    }
+
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    d3d_img->blank = false;
+    if (complete_img(d3d_img.get(), false) != 0) {
+      return capture_e::capture_error;
+    }
+    {
+      texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+      if (!lock_helper.lock()) {
+        BOOST_LOG(error) << "Failed to lock capture texture";
+        return capture_e::capture_error;
+      }
+      device_ctx->CopyResource(d3d_img->capture_texture.get(), canvas.get());
+    }
+
+    auto frame_timestamp = std::chrono::steady_clock::now();
+    if (newest_qpc) {
+      frame_timestamp -= qpc_time_difference(qpc_counter(), static_cast<int64_t>(newest_qpc));
     }
     img_out = img;
     img_out->frame_timestamp = frame_timestamp;

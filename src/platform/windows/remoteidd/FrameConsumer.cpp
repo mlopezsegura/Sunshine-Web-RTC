@@ -70,6 +70,12 @@ FrameConsumer::Wait FrameConsumer::WaitFrame(DWORD timeoutMs)
     }
 }
 
+uint64_t FrameConsumer::LatestFrameId() const
+{
+    RemoteIddFrameInfo f;
+    return m_slot && RemoteIddSlotRead(m_slot, &f) ? f.FrameId : 0;
+}
+
 bool FrameConsumer::OpenTexture(const RemoteIddFrameInfo& info)
 {
     if (m_texture && info.ProducerPid == m_producerPid && info.TextureGeneration == m_generation)

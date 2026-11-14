@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/platform/windows/test_remoteidd.cpp
- * @brief Test the OpenStreamMS RemoteIdd frame hand-off and capture backend.
+ * @brief Test the OpenStreamMS RemoteIdd frame hand-off, capture backend and mosaic.
  */
 
 // test includes
@@ -11,6 +11,9 @@
   #include <algorithm>
   #include <atomic>
   #include <chrono>
+  #include <filesystem>
+  #include <fstream>
+  #include <string>
   #include <thread>
   #include <vector>
 
@@ -19,6 +22,7 @@
 
   // local includes
   #include "remoteidd/FramePublisher.h"
+
   #include <src/config.h>
   #include <src/logging.h>
   #include <src/platform/windows/display.h>
@@ -320,10 +324,274 @@ TEST(RemoteIddCaptureTest, CapturesPublishedFramesAt240Hz) {
   const double p50 = age_ms[age_ms.size() / 2];
   const double p99 = age_ms[std::min(age_ms.size() - 1, age_ms.size() * 99 / 100)];
   BOOST_LOG(info) << "RemoteIdd capture: " << captured << '/' << frames << " frames at " << width << 'x' << height
-            << ", present->snapshot (CPU) p50 " << p50 << " ms, p99 " << p99 << " ms";
+                  << ", present->snapshot (CPU) p50 " << p50 << " ms, p99 " << p99 << " ms";
 
   EXPECT_EQ(reinit, 0);
   EXPECT_GE(captured, frames * 95 / 100);
   EXPECT_LE(p99, 4.0);
+}
+
+/**
+ * @brief Part names map to the cells of the 2x2 grid; unknown names to none.
+ */
+TEST(RemoteIddMosaicLayoutTest, MapsPartNamesToCells) {
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("Full"), 0b1111);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("Left"), 0b0101);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("Right"), 0b1010);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("Top"), 0b0011);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("Bottom"), 0b1100);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("TopLeft"), 0b0001);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("TopRight"), 0b0010);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("BottomLeft"), 0b0100);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("BottomRight"), 0b1000);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells("left"), 0);
+  EXPECT_EQ(platf::dxgi::mosaic_area_cells(""), 0);
+}
+
+/**
+ * @brief The parser reads the canvas and the sessions and skips comments, bad lines and overlaps.
+ */
+TEST(RemoteIddMosaicLayoutTest, ParsesCanvasSessionsAndSkipsBadLines) {
+  auto layout = platf::dxgi::parse_mosaic_layout(
+    "# OpenStreamMS mosaic\r\n"
+    "canvas 1920 1080\r\n"
+    "7 TopLeft\r\n"
+    "\r\n"
+    "9 TopRight\n"
+    "11 Left\n"  // overlaps 7
+    "x12 BottomLeft\n"  // not a session id
+    "13 Middle\n"  // unknown part
+    "14\n"  // no part
+    "15 BottomRight\n"
+  );
+  EXPECT_EQ(layout.canvas_width, 1920);
+  EXPECT_EQ(layout.canvas_height, 1080);
+  ASSERT_EQ(layout.entries.size(), 3u);
+  EXPECT_EQ(layout.entries[0].session, 7u);
+  EXPECT_EQ(layout.entries[0].cells, 0b0001);
+  EXPECT_EQ(layout.entries[1].session, 9u);
+  EXPECT_EQ(layout.entries[1].cells, 0b0010);
+  EXPECT_EQ(layout.entries[2].session, 15u);
+  EXPECT_EQ(layout.entries[2].cells, 0b1000);
+}
+
+/**
+ * @brief Without a valid canvas line the canvas is left to the stream size.
+ */
+TEST(RemoteIddMosaicLayoutTest, IgnoresInvalidCanvas) {
+  EXPECT_EQ(platf::dxgi::parse_mosaic_layout("canvas 0 1080\n7 Left\n").canvas_width, 0);
+  EXPECT_EQ(platf::dxgi::parse_mosaic_layout("canvas 1920\n7 Left\n").canvas_width, 0);
+  EXPECT_EQ(platf::dxgi::parse_mosaic_layout("canvas a b\n7 Left\n").canvas_width, 0);
+  EXPECT_TRUE(platf::dxgi::parse_mosaic_layout("").entries.empty());
+}
+
+/**
+ * @brief Parts split the canvas like SeatMonitor.Region: the left/top half gets the smaller side.
+ */
+TEST(RemoteIddMosaicLayoutTest, SplitsCanvasIntoParts) {
+  auto check = [](int cells, int x, int y, int w, int h) {
+    auto r = platf::dxgi::mosaic_rect(cells, 1921, 1081);
+    EXPECT_EQ(r.x, x) << cells;
+    EXPECT_EQ(r.y, y) << cells;
+    EXPECT_EQ(r.width, w) << cells;
+    EXPECT_EQ(r.height, h) << cells;
+  };
+  check(0b1111, 0, 0, 1921, 1081);
+  check(0b0101, 0, 0, 960, 1081);
+  check(0b1010, 960, 0, 961, 1081);
+  check(0b0011, 0, 0, 1921, 540);
+  check(0b1100, 0, 540, 1921, 541);
+  check(0b0001, 0, 0, 960, 540);
+  check(0b0010, 960, 0, 961, 540);
+  check(0b0100, 0, 540, 960, 541);
+  check(0b1000, 960, 540, 961, 541);
+}
+
+namespace {
+  /**
+   * @brief Read the frame id painted at a point of a texture (see frame_source_t::paint).
+   */
+  UINT64 read_id_at(ID3D11Texture2D *tex, UINT x, UINT y) {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    tex->GetDevice(&dev);
+    dev->GetImmediateContext(&ctx);
+    return read_center_id(dev.Get(), ctx.Get(), tex, x * 2, y * 2);
+  }
+
+  /**
+   * @brief A temporary sunshine.conf location holding osms-mosaic.txt, restored on destruction.
+   */
+  struct mosaic_dir_t {
+    std::filesystem::path dir;
+    std::string restore = config::sunshine.config_file;
+
+    mosaic_dir_t() {
+      dir = std::filesystem::temp_directory_path() / ("sunshine-mosaic-test-" + std::to_string(GetCurrentProcessId()));
+      std::filesystem::create_directories(dir);
+      config::sunshine.config_file = (dir / "sunshine.conf").string();
+    }
+
+    ~mosaic_dir_t() {
+      config::sunshine.config_file = restore;
+      std::error_code ec;
+      std::filesystem::remove_all(dir, ec);
+    }
+
+    void write(const std::string &text) const {
+      std::ofstream(dir / "osms-mosaic.txt", std::ios::binary | std::ios::trunc) << text;
+    }
+  };
+}  // namespace
+
+/**
+ * @brief In mosaic mode every session lands in its part of the canvas, a session that stops
+ * presenting keeps its last frame, and the mouse is offset to the own part.
+ */
+TEST(RemoteIddCaptureTest, ComposesSessionsIntoMosaic) {
+  ComPtr<ID3D11Device> pdev;
+  ComPtr<ID3D11DeviceContext> pctx;
+  if (!create_device(pdev, pctx)) {
+    GTEST_SKIP() << "No D3D11 hardware device";
+  }
+
+  const auto host = unique_session(4);
+  const auto guest = unique_session(5);
+  osms::ridd::FramePublisher host_pub(pdev, pctx, host, test_ns, nullptr);
+  osms::ridd::FramePublisher guest_pub(pdev, pctx, guest, test_ns, nullptr);
+  frame_source_t host_src;
+  frame_source_t guest_src;
+  ASSERT_TRUE(host_src.init(pdev.Get(), 64, 64));
+  ASSERT_TRUE(guest_src.init(pdev.Get(), 64, 64));
+  host_src.paint(pctx.Get(), 11);
+  guest_src.paint(pctx.Get(), 22);
+  ASSERT_EQ(host_pub.Publish(host_src.texture.Get(), 0), osms::ridd::FramePublisher::Result::Published);
+  ASSERT_EQ(guest_pub.Publish(guest_src.texture.Get(), 0), osms::ridd::FramePublisher::Result::Published);
+
+  mosaic_dir_t files;
+
+  SetEnvironmentVariableW(L"OSMS_RIDD_NS", test_ns);
+  SetEnvironmentVariableW(L"OSMS_RIDD_SESSION", std::to_wstring(host).c_str());
+  auto restore_capture = config::video.capture;
+  config::video.capture = "remoteidd";
+  auto cleanup = util::fail_guard([&]() {
+    config::video.capture = restore_capture;
+    SetEnvironmentVariableW(L"OSMS_RIDD_NS", nullptr);
+    SetEnvironmentVariableW(L"OSMS_RIDD_SESSION", nullptr);
+  });
+
+  video::config_t config {1920, 1080, 60, 0, 20000, 1, 1, 0, 1, 0, 0, 0};
+  auto plain = platf::display(platf::mem_type_e::dxgi, "", config);
+  if (!plain) {
+    GTEST_SKIP() << "No display output to initialize the capture backend";
+  }
+  const int plain_offset_x = plain->offset_x;
+  const int plain_offset_y = plain->offset_y;
+  plain.reset();
+
+  files.write("canvas 128 64\n" + std::to_string(host) + " Right\n" + std::to_string(guest) + " Left\n");
+  auto disp = std::dynamic_pointer_cast<platf::dxgi::display_ridd_vram_t>(platf::display(platf::mem_type_e::dxgi, "", config));
+  ASSERT_TRUE(disp);
+  ASSERT_NE(disp->canvas_texture(), nullptr);
+  EXPECT_EQ(disp->width_before_rotation, 128);
+  EXPECT_EQ(disp->height_before_rotation, 64);
+
+  std::vector<std::shared_ptr<platf::img_t>> pool;
+  auto pull = [&](std::shared_ptr<platf::img_t> &out) {
+    pool.push_back(disp->alloc_img());
+    out = pool.back();
+    return true;
+  };
+  auto capture = [&]() {
+    for (int i = 0; i < 20; ++i) {
+      std::shared_ptr<platf::img_t> img;
+      auto status = disp->snapshot(pull, img, 100ms, false);
+      if (status == platf::capture_e::ok) {
+        disp->release_snapshot();
+        return true;
+      }
+      if (status != platf::capture_e::timeout) {
+        ADD_FAILURE() << "snapshot failed: " << static_cast<int>(status);
+        return false;
+      }
+    }
+    return false;
+  };
+
+  // The first snapshot composes what is already published, without waiting for a present.
+  ASSERT_TRUE(capture());
+  EXPECT_EQ(read_id_at(disp->canvas_texture(), 32, 32), 22u);  // guest, left
+  EXPECT_EQ(read_id_at(disp->canvas_texture(), 96, 32), 11u);  // host, right
+
+  // Only the guest presents: the host keeps its last frame.
+  guest_src.paint(pctx.Get(), 33);
+  ASSERT_EQ(guest_pub.Publish(guest_src.texture.Get(), 0), osms::ridd::FramePublisher::Result::Published);
+  ASSERT_TRUE(capture());
+  EXPECT_EQ(read_id_at(disp->canvas_texture(), 32, 32), 33u);
+  EXPECT_EQ(read_id_at(disp->canvas_texture(), 96, 32), 11u);
+
+  // Absolute mouse: canvas x 64 is the host desktop's left edge.
+  EXPECT_EQ(disp->offset_x, plain_offset_x - 64);
+  EXPECT_EQ(disp->offset_y, plain_offset_y);
+}
+
+/**
+ * @brief Changing osms-mosaic.txt makes the backend ask for a reinit, in and out of mosaic mode.
+ */
+TEST(RemoteIddCaptureTest, ReinitializesWhenMosaicLayoutChanges) {
+  ComPtr<ID3D11Device> pdev;
+  ComPtr<ID3D11DeviceContext> pctx;
+  if (!create_device(pdev, pctx)) {
+    GTEST_SKIP() << "No D3D11 hardware device";
+  }
+
+  const auto host = unique_session(6);
+  osms::ridd::FramePublisher host_pub(pdev, pctx, host, test_ns, nullptr);
+  frame_source_t src;
+  ASSERT_TRUE(src.init(pdev.Get(), 64, 64));
+  ASSERT_EQ(host_pub.Publish(src.texture.Get(), 0), osms::ridd::FramePublisher::Result::Published);
+
+  mosaic_dir_t files;  // no osms-mosaic.txt: single-session mode
+
+  SetEnvironmentVariableW(L"OSMS_RIDD_NS", test_ns);
+  SetEnvironmentVariableW(L"OSMS_RIDD_SESSION", std::to_wstring(host).c_str());
+  auto restore_capture = config::video.capture;
+  config::video.capture = "remoteidd";
+  auto cleanup = util::fail_guard([&]() {
+    config::video.capture = restore_capture;
+    SetEnvironmentVariableW(L"OSMS_RIDD_NS", nullptr);
+    SetEnvironmentVariableW(L"OSMS_RIDD_SESSION", nullptr);
+  });
+
+  video::config_t config {1920, 1080, 60, 0, 20000, 1, 1, 0, 1, 0, 0, 0};
+  auto disp = std::dynamic_pointer_cast<platf::dxgi::display_ridd_vram_t>(platf::display(platf::mem_type_e::dxgi, "", config));
+  if (!disp) {
+    GTEST_SKIP() << "No display output to initialize the capture backend";
+  }
+  EXPECT_EQ(disp->canvas_texture(), nullptr);
+
+  // A guest that does not publish yet still turns the stream into a mosaic.
+  files.write("canvas 128 64\n" + std::to_string(host) + " Left\n" + std::to_string(unique_session(7)) + " Right\n");
+  std::this_thread::sleep_for(300ms);
+  auto pull = [&](std::shared_ptr<platf::img_t> &out) {
+    out = disp->alloc_img();
+    return true;
+  };
+  std::shared_ptr<platf::img_t> img;
+  EXPECT_EQ(disp->snapshot(pull, img, 10ms, false), platf::capture_e::reinit);
+
+  auto mosaic = std::dynamic_pointer_cast<platf::dxgi::display_ridd_vram_t>(platf::display(platf::mem_type_e::dxgi, "", config));
+  ASSERT_TRUE(mosaic);
+  ASSERT_NE(mosaic->canvas_texture(), nullptr);
+
+  // The guest slot does not exist: the host alone is composed, and nothing fails.
+  std::shared_ptr<platf::img_t> first;
+  EXPECT_EQ(mosaic->snapshot(pull, first, 100ms, false), platf::capture_e::ok);
+
+  // Removing the file goes back to single-session mode.
+  std::filesystem::remove(files.dir / "osms-mosaic.txt");
+  std::this_thread::sleep_for(300ms);
+  std::shared_ptr<platf::img_t> again;
+  EXPECT_EQ(mosaic->snapshot(pull, again, 10ms, false), platf::capture_e::reinit);
 }
 #endif

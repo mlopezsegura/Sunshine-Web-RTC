@@ -35,6 +35,12 @@ namespace osms::ridd
         bool Open();
         Wait WaitFrame(DWORD timeoutMs);
 
+        // Evento FrameReady (auto-reset) para esperar a varias sesiones a la vez con
+        // WaitForMultipleObjects (mosaico de Sunshine). nullptr hasta que Open() acierta.
+        HANDLE ReadyEvent() const { return m_evReady; }
+        // FrameId del descriptor más reciente sin tomar la textura; 0 si aún no hay frame.
+        uint64_t LatestFrameId() const;
+
         // Lee el descriptor más reciente, (re)abre la textura si cambió y toma el keyed
         // mutex. La textura sigue siendo del consumidor hasta Release().
         bool Acquire(DWORD timeoutMs, ID3D11Texture2D** texture, RemoteIddFrameInfo* info);
