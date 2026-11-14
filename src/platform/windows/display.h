@@ -4,6 +4,12 @@
  */
 #pragma once
 
+// standard includes
+#include <chrono>
+#include <memory>
+#include <string>
+#include <vector>
+
 // platform includes
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -870,6 +876,11 @@ namespace platf::dxgi {
    * mutex) and announces it through a named slot; this backend copies that texture into
    * the capture image without going through Desktop Duplication or WGC. Only selected
    * with capture = remoteidd.
+   *
+   * Mosaic: when OpenStreamMS writes osms-mosaic.txt next to sunshine.conf listing this
+   * session and at least one more, the stream becomes a canvas of the client's size split
+   * like a 2x2 grid, and every listed session is copied into its part. Mouse input is
+   * offset so that it lands in this session's part.
    */
   class display_ridd_vram_t: public display_vram_t {
   public:
@@ -902,6 +913,48 @@ namespace platf::dxgi {
     capture_e release_snapshot() override;
 
   private:
-    std::unique_ptr<osms::ridd::FrameConsumer> consumer;  ///< Reader of the RemoteIdd frame slot.
+    /**
+     * @brief One session of a mosaic stream and its rectangle on the canvas.
+     */
+    struct mosaic_tile_t {
+      uint32_t session = 0;  ///< Terminal Services session whose slot is read.
+      int x = 0;  ///< Left edge on the canvas.
+      int y = 0;  ///< Top edge on the canvas.
+      int width = 0;  ///< Width on the canvas.
+      int height = 0;  ///< Height on the canvas.
+      std::unique_ptr<osms::ridd::FrameConsumer> consumer;  ///< Null until the session publishes frames.
+      uint64_t last_frame = 0;  ///< Last FrameId copied onto the canvas.
+      uint32_t frame_width = 0;  ///< Size of the last frame copied, to notice a shrink.
+      uint32_t frame_height = 0;  ///< Size of the last frame copied, to notice a shrink.
+      std::chrono::steady_clock::time_point next_open;  ///< When to retry opening the slot.
+    };
+
+    /**
+     * @brief Re-read osms-mosaic.txt (at most every 250 ms).
+     * @return True when it no longer matches the layout this display was built with.
+     */
+    bool layout_changed();
+    /**
+     * @brief Open the frame slot of a mosaic tile; on failure retry later.
+     * @param tile Tile to open.
+     * @return True when the slot is open.
+     */
+    bool open_tile(mosaic_tile_t &tile);
+    /**
+     * @brief Clear the canvas to black and copy every tile again on the next snapshot.
+     */
+    void clear_canvas();
+    /**
+     * @brief Snapshot in mosaic mode: copy the tiles that changed and then the canvas.
+     */
+    capture_e mosaic_snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout);
+
+    std::unique_ptr<osms::ridd::FrameConsumer> consumer;  ///< Reader of the RemoteIdd frame slot (single-session mode).
+    std::vector<mosaic_tile_t> tiles;  ///< Sessions of the mosaic; empty in single-session mode.
+    texture2d_t canvas;  ///< Mosaic canvas, the size of the stream.
+    render_target_t canvas_rt;  ///< Render target view of the canvas, to clear it.
+    bool compose_now = false;  ///< Compose without waiting for a new frame (after init or a clear).
+    std::string layout;  ///< Content of osms-mosaic.txt when this display was built.
+    std::chrono::steady_clock::time_point next_layout_check;  ///< Throttle for layout_changed().
   };
 }  // namespace platf::dxgi
