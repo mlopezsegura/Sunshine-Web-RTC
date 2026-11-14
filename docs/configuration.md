@@ -2428,7 +2428,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             session, without Desktop Duplication or WGC. Never chosen automatically.
             If OpenStreamMS writes `osms-mosaic.txt` next to `sunshine.conf` (one
             `<session id> <part>` line per session, parts of a 2x2 grid such as `Left` or
-            `TopRight`), the stream becomes a mosaic: a canvas of the client's size with every
+            `TopRight`, and optionally `canvas <width> <height>`), the stream becomes a mosaic: a canvas with every
             listed session copied into its part, and mouse input mapped to this session's part.
             @note{Applies to Windows only. Requires a hardware encoder and SDR.}</td>
     </tr>
