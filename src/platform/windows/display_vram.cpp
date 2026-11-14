@@ -2056,8 +2056,7 @@ namespace platf::dxgi {
       if (static_cast<DXGI_FORMAT>(frame.DxgiFormat) != capture_format) {
         continue;
       }
-      if ((frame.Width < tile.frame_width || frame.Height < tile.frame_height) &&
-          (frame.Width < static_cast<uint32_t>(tile.width) || frame.Height < static_cast<uint32_t>(tile.height))) {
+      if ((frame.Width < tile.frame_width || frame.Height < tile.frame_height) && (frame.Width < static_cast<uint32_t>(tile.width) || frame.Height < static_cast<uint32_t>(tile.height))) {
         // The session shrank (it is being reconnected to its part): drop what is left of
         // the bigger frame. Clearing resets every tile, so all are copied again.
         tile.frame_width = frame.Width;

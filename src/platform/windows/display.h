@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // platform includes
@@ -870,6 +871,64 @@ namespace platf::dxgi {
   };
 
   /**
+   * @brief A session of a mosaic stream, as listed in osms-mosaic.txt.
+   */
+  struct mosaic_entry_t {
+    uint32_t session;  ///< Terminal Services session id.
+    int cells;  ///< Cells of the 2x2 grid it covers: 1 top-left, 2 top-right, 4 bottom-left, 8 bottom-right.
+  };
+
+  /**
+   * @brief Content of osms-mosaic.txt.
+   */
+  struct mosaic_layout_t {
+    int canvas_width = 0;  ///< Canvas width from the "canvas W H" line; 0 = the stream size.
+    int canvas_height = 0;  ///< Canvas height from the "canvas W H" line; 0 = the stream size.
+    std::vector<mosaic_entry_t> entries;  ///< Sessions in file order, without overlaps.
+  };
+
+  /**
+   * @brief Rectangle of a part of the mosaic canvas.
+   */
+  struct mosaic_rect_t {
+    int x;  ///< Left edge.
+    int y;  ///< Top edge.
+    int width;  ///< Width.
+    int height;  ///< Height.
+  };
+
+  /**
+   * @brief Grid cells covered by a part name (Full, Left, Right, Top, Bottom, TopLeft,
+   * TopRight, BottomLeft, BottomRight), the names OpenStreamMS uses for split seats.
+   *
+   * @param area Part name.
+   * @return Cell bits, or 0 for an unknown name.
+   */
+  int mosaic_area_cells(std::string_view area);
+
+  /**
+   * @brief Parse osms-mosaic.txt.
+   *
+   * Lines are "canvas <width> <height>" or "<session id> <part>"; lines starting with #
+   * are comments. Lines that do not parse, and parts that overlap an earlier one, are skipped.
+   *
+   * @param text File content.
+   * @return Parsed layout.
+   */
+  mosaic_layout_t parse_mosaic_layout(const std::string &text);
+
+  /**
+   * @brief Rectangle covered by some grid cells on a canvas. With an odd size the left or
+   * top half gets the smaller side, like SeatMonitor.Region in OpenStreamMS.
+   *
+   * @param cells Grid cells.
+   * @param canvas_width Canvas width.
+   * @param canvas_height Canvas height.
+   * @return Rectangle of the part.
+   */
+  mosaic_rect_t mosaic_rect(int cells, int canvas_width, int canvas_height);
+
+  /**
    * Display backend that reads the frames published by the OpenStreamMS RemoteIdd driver.
    *
    * The driver copies every swapchain buffer into a shared texture (NT handle + keyed
@@ -878,9 +937,9 @@ namespace platf::dxgi {
    * with capture = remoteidd.
    *
    * Mosaic: when OpenStreamMS writes osms-mosaic.txt next to sunshine.conf listing this
-   * session and at least one more, the stream becomes a canvas of the client's size split
-   * like a 2x2 grid, and every listed session is copied into its part. Mouse input is
-   * offset so that it lands in this session's part.
+   * session and at least one more, the stream becomes a canvas split like a 2x2 grid and
+   * every listed session is copied into its part. Mouse input is offset so that it lands
+   * in this session's part.
    */
   class display_ridd_vram_t: public display_vram_t {
   public:
@@ -911,6 +970,15 @@ namespace platf::dxgi {
      * @return Capture status after releasing the current snapshot.
      */
     capture_e release_snapshot() override;
+
+    /**
+     * @brief Mosaic canvas, for tests and diagnostics.
+     *
+     * @return The canvas texture, or nullptr outside mosaic mode.
+     */
+    ID3D11Texture2D *canvas_texture() {
+      return canvas.get();
+    }
 
   private:
     /**

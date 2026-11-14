@@ -6,6 +6,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -64,9 +65,7 @@ namespace platf::dxgi {
     /**
      * @brief osms-mosaic.txt, written by OpenStreamMS next to this instance's sunshine.conf.
      *
-     * One line per session: "<Terminal Services session id> <part>", where part is the
-     * same 2x2 grid name OpenStreamMS uses for split seats (Full, Left, Right, Top, Bottom,
-     * TopLeft, TopRight, BottomLeft, BottomRight). Lines starting with # are comments.
+     * See parse_mosaic_layout() for the format.
      */
     std::filesystem::path mosaic_path() {
       return std::filesystem::path(config::sunshine.config_file).parent_path() / "osms-mosaic.txt";
@@ -85,71 +84,85 @@ namespace platf::dxgi {
       return content.str();
     }
 
-    /**
-     * @brief Cells of the 2x2 grid covered by a part: 1 top-left, 2 top-right, 4 bottom-left, 8 bottom-right.
-     * @return 0 for an unknown name.
-     */
-    int area_cells(std::string_view area) {
-      constexpr std::pair<std::string_view, int> areas[] {
-        {"Full"sv, 0b1111},
-        {"Left"sv, 0b0101},
-        {"Right"sv, 0b1010},
-        {"Top"sv, 0b0011},
-        {"Bottom"sv, 0b1100},
-        {"TopLeft"sv, 0b0001},
-        {"TopRight"sv, 0b0010},
-        {"BottomLeft"sv, 0b0100},
-        {"BottomRight"sv, 0b1000},
-      };
-      for (const auto &[name, cells] : areas) {
-        if (name == area) {
-          return cells;
-        }
-      }
-      return 0;
-    }
-
-    /**
-     * @brief A session listed in osms-mosaic.txt.
-     */
-    struct mosaic_entry_t {
-      uint32_t session;  ///< Terminal Services session id.
-      int cells;  ///< Grid cells it covers.
-    };
-
-    /**
-     * @brief Parse osms-mosaic.txt. Lines that do not parse, and parts that overlap an
-     * earlier line, are skipped.
-     */
-    std::vector<mosaic_entry_t> parse_layout(const std::string &text) {
-      std::vector<mosaic_entry_t> entries;
-      int used = 0;
-      std::istringstream lines(text);
-      std::string line;
-      while (std::getline(lines, line)) {
-        if (!line.empty() && line.back() == '\r') {
-          line.pop_back();
-        }
-        if (line.empty() || line[0] == '#') {
-          continue;
-        }
-        std::istringstream fields(line);
-        uint32_t session = 0;
-        std::string area;
-        if (!(fields >> session >> area)) {
-          continue;
-        }
-        int cells = area_cells(area);
-        if (!cells || (cells & used)) {
-          BOOST_LOG(warning) << "RemoteIdd mosaic: skipping line \""sv << line << '"';
-          continue;
-        }
-        used |= cells;
-        entries.push_back({session, cells});
-      }
-      return entries;
-    }
   }  // namespace
+
+  int mosaic_area_cells(std::string_view area) {
+    constexpr std::pair<std::string_view, int> areas[] {
+      {"Full"sv, 0b1111},
+      {"Left"sv, 0b0101},
+      {"Right"sv, 0b1010},
+      {"Top"sv, 0b0011},
+      {"Bottom"sv, 0b1100},
+      {"TopLeft"sv, 0b0001},
+      {"TopRight"sv, 0b0010},
+      {"BottomLeft"sv, 0b0100},
+      {"BottomRight"sv, 0b1000},
+    };
+    for (const auto &[name, cells] : areas) {
+      if (name == area) {
+        return cells;
+      }
+    }
+    return 0;
+  }
+
+  mosaic_layout_t parse_mosaic_layout(const std::string &text) {
+    mosaic_layout_t layout;
+    int used = 0;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      if (line.empty() || line[0] == '#') {
+        continue;
+      }
+      std::istringstream fields(line);
+      std::string first;
+      std::string second;
+      if (!(fields >> first >> second)) {
+        continue;
+      }
+      if (first == "canvas") {
+        int w = 0;
+        int h = 0;
+        std::istringstream size(second);
+        if ((size >> w) && (fields >> h) && w > 0 && h > 0) {
+          layout.canvas_width = w;
+          layout.canvas_height = h;
+        }
+        continue;
+      }
+      uint32_t session = 0;
+      auto [end, ec] = std::from_chars(first.data(), first.data() + first.size(), session);
+      int cells = mosaic_area_cells(second);
+      if (ec != std::errc {} || end != first.data() + first.size() || !cells || (cells & used)) {
+        BOOST_LOG(warning) << "RemoteIdd mosaic: skipping line \""sv << line << '"';
+        continue;
+      }
+      used |= cells;
+      layout.entries.push_back({session, cells});
+    }
+    return layout;
+  }
+
+  mosaic_rect_t mosaic_rect(int cells, int canvas_width, int canvas_height) {
+    const bool left = cells & 0b0101;
+    const bool right = cells & 0b1010;
+    const bool top = cells & 0b0011;
+    const bool bottom = cells & 0b1100;
+    const int w1 = canvas_width / 2;
+    const int h1 = canvas_height / 2;
+    return {
+      left ? 0 : w1,
+      top ? 0 : h1,
+      left && right ? canvas_width : left ? w1 :
+                                            canvas_width - w1,
+      top && bottom ? canvas_height : top ? h1 :
+                                            canvas_height - h1,
+    };
+  }
 
   // Out of line: FrameConsumer is incomplete in display.h.
   display_ridd_vram_t::display_ridd_vram_t() = default;
@@ -172,12 +185,12 @@ namespace platf::dxgi {
 
     layout = read_layout();
     next_layout_check = std::chrono::steady_clock::now() + 250ms;
-    auto entries = parse_layout(layout);
-    bool listed = std::ranges::any_of(entries, [&](const mosaic_entry_t &e) {
+    auto parsed = parse_mosaic_layout(layout);
+    bool listed = std::ranges::any_of(parsed.entries, [&](const mosaic_entry_t &e) {
       return e.session == session;
     });
 
-    if (entries.size() < 2 || !listed) {
+    if (parsed.entries.size() < 2 || !listed) {
       consumer = std::make_unique<osms::ridd::FrameConsumer>(Microsoft::WRL::ComPtr<ID3D11Device>(device.get()), session, ns.c_str());
       if (!consumer->Open()) {
         BOOST_LOG(error) << "RemoteIdd: no frame slot for session "sv << session << "; is the driver running?"sv;
@@ -187,31 +200,24 @@ namespace platf::dxgi {
       return 0;
     }
 
-    // Mosaic: the stream is a canvas of the size the client asked for, split like the
-    // grid; OpenStreamMS reconnects each session to the size of its part.
-    const int canvas_w = config.width;
-    const int canvas_h = config.height;
+    // Mosaic: OpenStreamMS sets the canvas size (the host session's own resolution) and
+    // reconnects each session to the size of its part; the encoder scales the canvas to
+    // the client like any display. Without a canvas line, the stream size is used.
+    const int canvas_w = parsed.canvas_width ? parsed.canvas_width : config.width;
+    const int canvas_h = parsed.canvas_height ? parsed.canvas_height : config.height;
     if (canvas_w <= 0 || canvas_h <= 0) {
-      BOOST_LOG(error) << "RemoteIdd mosaic: invalid stream size "sv << canvas_w << 'x' << canvas_h;
+      BOOST_LOG(error) << "RemoteIdd mosaic: invalid canvas size "sv << canvas_w << 'x' << canvas_h;
       return -1;
     }
 
-    for (const auto &e : entries) {
-      // Same split as SeatMonitor.Region in OpenStreamMS: with an odd size the left/top
-      // part gets the smaller side.
-      const bool left = e.cells & 0b0101;
-      const bool right = e.cells & 0b1010;
-      const bool top = e.cells & 0b0011;
-      const bool bottom = e.cells & 0b1100;
-      const int w1 = canvas_w / 2;
-      const int h1 = canvas_h / 2;
-
+    for (const auto &e : parsed.entries) {
+      auto rect = mosaic_rect(e.cells, canvas_w, canvas_h);
       mosaic_tile_t tile;
       tile.session = e.session;
-      tile.x = left ? 0 : w1;
-      tile.width = left && right ? canvas_w : left ? w1 : canvas_w - w1;
-      tile.y = top ? 0 : h1;
-      tile.height = top && bottom ? canvas_h : top ? h1 : canvas_h - h1;
+      tile.x = rect.x;
+      tile.y = rect.y;
+      tile.width = rect.width;
+      tile.height = rect.height;
 
       if (e.session == session) {
         // Absolute mouse: the client points at the canvas, the desktop is this tile.
